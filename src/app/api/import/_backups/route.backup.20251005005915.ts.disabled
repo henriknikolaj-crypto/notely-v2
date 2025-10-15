@@ -1,0 +1,170 @@
+﻿import { NextResponse } from "next/server";
+import { createServerClient } from "@/lib/supabase/server";
+
+export const runtime = "nodejs";
+
+function readSecret(req: Request) {
+  const hdr1 = req.headers.get("x-shared-secret");
+  if (hdr1 && hdr1.trim()) return hdr1.trim();
+  const hdr2 = req.headers.get("authorization") || req.headers.get("Authorization") || "";
+  if (hdr2) {
+    const token = hdr2.replace(/^Bearer\\s+/i, "").trim();
+    if (token) return token;
+  }
+  return "";
+}
+
+type NormalFile = { md5: string; name: string; text?: string };
+type NormalPayload = {
+  email: string;
+  files: NormalFile[];
+  notes?: { title: string; content?: string | null; course_id?: string | null }[];
+  flashcards?: { front: string; back: string }[];
+  quizzes?: { title: string; questions: { question: string; choices: string[]; correctIndex: number }[] }[];
+  raw?: any;
+};
+
+function normalizePayload(body: any): NormalPayload {
+  // V1 (Hammad): { userEmail, file, ocrText, notes, flashcards, quizzes }
+  if (body?.userEmail && (body?.file || body?.ocrText || body?.notes)) {
+    const files: NormalFile[] = [];
+    if (body.file?.md5 || body.ocrText) {
+      files.push({
+        md5: String(body.file?.md5 ?? "").trim(),
+        name: String(body.file?.fileName ?? body.file?.name ?? "upload").trim(),
+        text: typeof body.ocrText === "string" ? body.ocrText : undefined,
+      });
+    }
+    return {
+      email: String(body.userEmail).trim(),
+      files,
+      notes: Array.isArray(body.notes) ? body.notes : [],
+      flashcards: Array.isArray(body.flashcards) ? body.flashcards : [],
+      quizzes: Array.isArray(body.quizzes) ? body.quizzes : [],
+      raw: body,
+    };
+  }
+
+  // Ældre/nuværende: { ownerEmail, files:[{md5,name,text}], notes:[] }
+  if (body?.ownerEmail && Array.isArray(body?.files)) {
+    const files: NormalFile[] = body.files.map((f: any) => ({
+      md5: String(f?.md5 ?? "").trim(),
+      name: String(f?.name ?? "upload").trim(),
+      text: typeof f?.text === "string" ? f.text : undefined,
+    }));
+    return {
+      email: String(body.ownerEmail).trim(),
+      files,
+      notes: Array.isArray(body.notes) ? body.notes : [],
+      raw: body,
+    };
+  }
+
+  // ukendt format
+  throw new Error("invalid payload shape");
+}
+
+export async function POST(req: Request) {
+  try {
+    const expected = (process.env.IMPORT_SHARED_SECRET || "").trim();
+    const incoming = readSecret(req);
+    if (!expected || incoming !== expected) {
+      return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    }
+
+    let raw: any;
+    try {
+      raw = await req.json();
+    } catch {
+      return NextResponse.json({ ok: false, error: "invalid json" }, { status: 400 });
+    }
+
+    let norm: NormalPayload;
+    try {
+      norm = normalizePayload(raw);
+    } catch (e: any) {
+      return NextResponse.json({ ok: false, error: e?.message ?? "invalid payload" }, { status: 400 });
+    }
+
+    if (!norm.email) {
+      return NextResponse.json({ ok: false, error: "email missing" }, { status: 400 });
+    }
+
+    const supabase = await createServerClient();
+
+    // find owner via profiles (email)
+    const { data: prof, error: pErr } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("email", norm.email)
+      .single();
+
+    if (pErr || !prof) {
+      return NextResponse.json({ ok: false, error: "owner not found" }, { status: 404 });
+    }
+    const ownerId = prof.id;
+
+    // log job started
+    const { data: job, error: jErr } = await supabase
+      .from("jobs")
+      .insert({ kind: "import", status: "started", owner_id: ownerId, payload: raw })
+      .select("id")
+      .single();
+
+    if (jErr || !job) {
+      return NextResponse.json({ ok: false, error: "job insert failed" }, { status: 500 });
+    }
+
+    try {
+      let filesInserted = 0;
+      let notesInserted = 0;
+
+      // files + ocr_texts
+      if (Array.isArray(norm.files)) {
+        for (const f of norm.files) {
+          if (!f?.md5) continue;
+          const { data: fileRow, error: fErr } = await supabase
+            .from("files")
+            .upsert({ owner_id: ownerId, md5: f.md5, name: f.name }, { onConflict: "md5" })
+            .select("id")
+            .single();
+          if (fErr || !fileRow) throw fErr;
+          filesInserted++;
+
+          if (typeof f.text === "string" && f.text.length > 0) {
+            const { error: tErr } = await supabase
+              .from("ocr_texts")
+              .insert({ owner_id: ownerId, file_id: fileRow.id, text: f.text });
+            if (tErr) throw tErr;
+          }
+        }
+      }
+
+      // notes
+      if (Array.isArray(norm.notes)) {
+        for (const n of norm.notes) {
+          if (!n?.title) continue;
+          const { error: nErr } = await supabase.from("notes").insert({
+            owner_id: ownerId,
+            title: String(n.title).slice(0, 200),
+            content: n.content ? String(n.content) : null,
+            course_id: n.course_id ?? null,
+          });
+          if (nErr) throw nErr;
+          notesInserted++;
+        }
+      }
+
+      await supabase.from("jobs").update({ status: "succeeded" }).eq("id", job.id);
+      return NextResponse.json({ ok: true, jobId: job.id, filesInserted, notesInserted });
+    } catch (e: any) {
+      await supabase
+        .from("jobs")
+        .update({ status: "failed", error: e?.message ?? "error" })
+        .eq("id", job.id);
+      return NextResponse.json({ ok: false, error: e?.message ?? "error" }, { status: 500 });
+    }
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e?.message ?? "server error" }, { status: 500 });
+  }
+}

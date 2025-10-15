@@ -1,0 +1,62 @@
+﻿{
+    "quiz":  {
+                 "questions":  [
+                                   {
+                                       "answers":  [
+                                                       {
+                                                           "is_correct":  false,
+                                                           "label":  "Role Level Security"
+                                                       },
+                                                       {
+                                                           "is_correct":  true,
+                                                           "label":  "Row Level Security"
+                                                       }
+                                                   ],
+                                       "prompt":  "RLS står for…"
+                                   },
+                                   {
+                                       "answers":  [
+                                                       {
+                                                           "is_correct":  false,
+                                                           "label":  "MySQL"
+                                                       },
+                                                       {
+                                                           "is_correct":  true,
+                                                           "label":  "Postgres"
+                                                       }
+                                                   ],
+                                       "prompt":  "Supabase bygger på…"
+                                   }
+                               ],
+                 "title":  "Kapitel 1 – Quick check"
+             },
+    "flashcards":  [
+                       {
+                           "question":  "Hvad er RLS?",
+                           "answer":  "Row Level Security"
+                       },
+                       {
+                           "front":  "Supabase",
+                           "back":  "Postgres + auth + storage"
+                       }
+                   ],
+    "requestId":  "req-a2398ffb-6444-4347-919f-a8a712bac79e",
+    "ocr_texts":  [
+                      {
+                          "text":  "Side 1 tekst",
+                          "page":  1
+                      },
+                      {
+                          "text":  "Side 2 tekst",
+                          "page":  2
+                      }
+                  ],
+    "userEmail":  "henriknikolaj@gmail.com",
+    "file":  {
+                 "size_bytes":  123456,
+                 "storage_path":  "uploads/kapitel1.pdf",
+                 "md5":  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 "original_name":  "kapitel1.pdf",
+                 "name":  "kapitel1.pdf"
+             }
+}

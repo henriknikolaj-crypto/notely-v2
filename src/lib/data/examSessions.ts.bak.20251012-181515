@@ -1,0 +1,28 @@
+﻿import { supabaseServerRSC } from "@/lib/supabase/server";
+
+export type ExamSession = {
+  id: string;
+  question: string | null;
+  score: number | null;
+  feedback: string | null;
+  created_at: string;
+};
+
+export async function getLatestExamSessions(limit = 5): Promise<ExamSession[]> {
+  const supabase = supabaseServerRSC();
+  const { data: { user }, error: userErr } = await supabase.auth.getUser();
+  if (userErr || !user) return [];
+
+  const { data, error } = await supabase
+    .from("exam_sessions")
+    .select("id, question, score, feedback, created_at")
+    .eq("owner_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("getLatestExamSessions error", error);
+    return [];
+  }
+  return data ?? [];
+}

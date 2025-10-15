@@ -1,0 +1,75 @@
+﻿"use client";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+
+export default function ClientExam() {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+
+  async function onEvaluate() {
+    if (!question.trim() || !answer.trim()) {
+      alert("Skriv både spørgsmål og svar.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await fetch("/api/evaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, answer }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Evaluate failed");
+
+      // Simpel feedback (kan skiftes til toast)
+      alert(`Vurdering gemt. Score: ${Math.round((data.score ?? 0) * 100)}%`);
+      // Nulstil felter og opfrisk serverkomponenter
+      setAnswer("");
+      // behold evt. spørgsmålet så man kan iterere
+      router.refresh();
+    } catch (e: any) {
+      alert(e.message || "Fejl under evaluering");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); onEvaluate(); }}>
+      <div>
+        <label className="block text-sm font-medium">Eksamensspørgsmål</label>
+        <input
+          type="text"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          spellCheck={false}
+          autoComplete="off"
+          className="mt-1 w-full rounded-xl border px-3 py-2"
+          placeholder="Skriv dit eksamensspørgsmål…"
+        />
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium">Dit svar</label>
+        <textarea
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          spellCheck={false}
+          autoComplete="off"
+          className="mt-1 w-full min-h-[160px] rounded-xl border px-3 py-2"
+          placeholder="Indsæt eller skriv dit svar…"
+        />
+      </div>
+
+      <button
+        type="submit"
+        disabled={loading}
+        className="rounded-xl border px-4 py-2 text-sm hover:bg-neutral-50 disabled:opacity-60"
+      >
+        {loading ? "Vurderer…" : "Kør evaluering"}
+      </button>
+    </form>
+  );
+}

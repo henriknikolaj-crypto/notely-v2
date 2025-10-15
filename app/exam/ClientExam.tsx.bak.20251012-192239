@@ -1,0 +1,91 @@
+﻿"use client";
+import { useState, useRef } from "react";
+import { useRouter } from "next/navigation";
+import Toast from "@/app/components/Toast";
+
+export default function ClientExam() {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const router = useRouter();
+  const answerRef = useRef<HTMLTextAreaElement>(null);
+
+  const MIN_LEN = 120; // minimum tegn i svar
+
+  async function onEvaluate() {
+    if (!question.trim()) {
+      setToast("Skriv et eksamensspørgsmål.");
+      return;
+    }
+    if ((answer.trim().length) < MIN_LEN) {
+      setToast(`Dit svar er meget kort. Skriv mindst ${MIN_LEN} tegn.`);
+      answerRef.current?.focus();
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await fetch("/api/evaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, answer }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Evaluate failed");
+      setToast(`Vurdering gemt · Score: ${Math.round((data.score ?? 0)*100)}%`);
+      setAnswer("");
+      router.refresh();
+      // scroll til liste
+      setTimeout(() => {
+        document.querySelector("h2.text-lg.font-semibold:nth-of-type(2)")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 250);
+    } catch (e: any) {
+      setToast(e.message || "Fejl under evaluering");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <>
+      <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); onEvaluate(); }}>
+        <div>
+          <label className="block text-sm font-medium">Eksamensspørgsmål</label>
+          <input
+            type="text"
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            spellCheck={false}
+            autoComplete="off"
+            className="mt-1 w-full rounded-xl border px-3 py-2"
+            placeholder="Skriv dit eksamensspørgsmål…"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium">Dit svar</label>
+          <textarea
+            ref={answerRef}
+            value={answer}
+            onChange={(e) => setAnswer(e.target.value)}
+            spellCheck={false}
+            autoComplete="off"
+            className="mt-1 w-full min-h-[160px] rounded-xl border px-3 py-2"
+            placeholder="Indsæt eller skriv dit svar…"
+          />
+          <p className="mt-1 text-xs text-neutral-500">{answer.trim().length}/{MIN_LEN} tegn</p>
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="rounded-xl border px-4 py-2 text-sm hover:bg-neutral-50 disabled:opacity-60"
+        >
+          {loading ? "Vurderer…" : "Kør evaluering"}
+        </button>
+      </form>
+
+      <Toast text={toast ?? ""} show={!!toast} onClose={() => setToast(null)} />
+    </>
+  );
+}
