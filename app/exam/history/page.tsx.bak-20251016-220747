@@ -1,5 +1,4 @@
-﻿import { headers as serverHeaders } from "next/headers";
-import { revalidatePath } from "next/cache";
+﻿import { revalidatePath } from "next/cache";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import Link from "next/link";
 import { cookies } from "next/headers";
@@ -88,8 +87,7 @@ export default async function HistoryPage(
               </div>
             </Link>
             <form action={delAction}>
-  <input type="hidden" name="id" value={it.id} />
-              <input type="hidden" name="id" value={it.id} />   <button className="text-sm underline" type="submit">
+              <input type="hidden" name="id" value={it.id} />`r`n  <button className="text-sm underline" type="submit">
                 Slet
               </button>
             </form>
@@ -146,6 +144,4 @@ async function delAction(formData: FormData) {
   revalidatePath("/exam/history");
   revalidatePath("/exam");
 }
-
-
 

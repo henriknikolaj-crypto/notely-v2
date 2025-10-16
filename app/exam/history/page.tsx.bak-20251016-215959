@@ -1,5 +1,3 @@
-﻿import { headers as serverHeaders } from "next/headers";
-import { revalidatePath } from "next/cache";
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import Link from "next/link";
 import { cookies } from "next/headers";
@@ -87,9 +85,8 @@ export default async function HistoryPage(
                 {it.question}
               </div>
             </Link>
-            <form action={delAction}>
-  <input type="hidden" name="id" value={it.id} />
-              <input type="hidden" name="id" value={it.id} />   <button className="text-sm underline" type="submit">
+            <form action={del.bind(null, it.id)}>
+              <button className="text-sm underline" type="submit">
                 Slet
               </button>
             </form>
@@ -121,31 +118,4 @@ export default async function HistoryPage(
     </div>
   );
 }
-
-
-async function delAction(formData: FormData) {
-  "use server";
-  const id = String(formData.get("id") ?? "");
-  if (!id) return;
-
-  const h = serverHeaders();
-  const host = h.get("host") ?? "localhost:3000";
-  const proto = process.env.VERCEL ? "https" : "http";
-  const url = new URL(`/api/exam-sessions/${id}`, `${proto}://${host}`);
-
-  const res = await fetch(url, {
-    method: "DELETE",
-    headers: { cookie: h.get("cookie") ?? "" },
-  });
-
-  if (!res.ok) {
-    const msg = await res.text().catch(() => "");
-    throw new Error(`Slet fejlede (${res.status}): ${msg}`);
-  }
-
-  revalidatePath("/exam/history");
-  revalidatePath("/exam");
-}
-
-
 
