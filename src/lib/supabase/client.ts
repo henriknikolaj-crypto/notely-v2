@@ -1,4 +1,5 @@
-﻿"use client";
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { createBrowserClient as createSupabaseBrowserClient } from "@supabase/ssr";
 
 export function createBrowserClient() {

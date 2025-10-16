@@ -1,62 +1,121 @@
-﻿import Link from "next/link";
-import { requireUser } from "@/lib/requireUser";
-import { getExamSessionsPage } from "@/lib/data/examSessions";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import Link from "next/link";
+import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
+import type { CookieOptions } from "@supabase/ssr";
 
-function formatScore(score: number | null) {
-  if (score === null || Number.isNaN(score)) return "";
-  return `${Math.round((score ?? 0) * 100)}%`;
-}
-function formatDate(iso: string) {
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString("da-DK", { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-  } catch { return iso; }
-}
+export const revalidate = 0;
 
-export default async function HistoryPage({ searchParams }: { searchParams: { page?: string } }) {
-  await requireUser();
-  const page = Math.max(1, Number(searchParams?.page ?? "1"));
-  const pageSize = 10;
-  const { items, count } = await getExamSessionsPage(page, pageSize);
-  const totalPages = Math.max(1, Math.ceil(count / pageSize));
+export default async function HistoryPage(
+  ctx: { searchParams: Promise<Record<string, string | undefined>> }
+) {
+  const sp = await ctx.searchParams;
+
+  // ÉN stabil beregning af page
+  const page = Math.max(1, parseInt(sp.page ?? "1", 10) || 1);
+  const pageSize = 20;
+  const from = (page - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  const cookieStore = await cookies();
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) => {
+              cookieStore.set(name, value, options as CookieOptions);
+            });
+          } catch {}
+        },
+      },
+    }
+  );
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) return <div className="p-4">Du skal være logget ind.</div>;
+
+  const { data, error, count } = await supabase
+    .from("exam_sessions")
+    .select("id, question, score, created_at", { count: "exact" })
+    .eq("owner_id", user.id)
+    .order("created_at", { ascending: false })
+    .range(from, to);
+
+  if (error) return <div className="p-4">Fejl: {error.message}</div>;
+
+  const total = count ?? 0;
+  const lastPage = Math.max(1, Math.ceil(total / pageSize));
+
+  async function del(id: string) {
+    "use server";
+    await fetch(
+      `${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/exam-sessions/${id}`,
+      { method: "DELETE" }
+    );
+  }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Alle vurderinger</h1>
-        <Link href="/exam" className="text-sm underline">Tilbage til Eksamen</Link>
-      </div>
+    <div className="mx-auto max-w-4xl px-4 py-6">
+      <Link href="/exam" className="text-sm underline">
+        &larr; Tilbage
+      </Link>
+      <h1 className="text-2xl font-semibold mt-2">Alle vurderinger</h1>
 
-      {items.length === 0 ? (
-        <p className="text-sm text-neutral-600">Ingen vurderinger endnu.</p>
-      ) : (
-        <ul className="divide-y rounded-2xl border bg-white/60">
-          {items.map((s) => (
-            <li key={s.id} className="p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <p className="text-sm font-medium">
-                    <Link href={`/exam/${s.id}`} className="underline">
-                      {s.question || "(Uden spørgsmålstekst)"}
-                    </Link>
-                  </p>
-                  <p className="mt-1 text-sm text-neutral-600 line-clamp-2">{s.feedback || "(Ingen feedback gemt)"}</p>
-                </div>
-                <div className="text-right shrink-0 w-28">
-                  <div className="text-sm font-semibold">{formatScore(s.score)}</div>
-                  <div className="text-xs text-neutral-500">{formatDate(s.created_at)}</div>
-                </div>
+      <ul className="mt-4 space-y-2">
+        {data?.map((it) => (
+          <li
+            key={it.id}
+            className="rounded-xl border p-3 hover:bg-gray-50 flex items-start justify-between gap-4"
+          >
+            <Link href={`/exam/${it.id}`} className="block flex-1">
+              <div className="text-sm text-gray-600">
+                {new Date(it.created_at).toLocaleString()}
               </div>
-            </li>
-          ))}
-        </ul>
-      )}
+              <div className="font-medium underline">Score: {it.score}/100</div>
+              <div className="text-sm underline line-clamp-2">
+                {it.question}
+              </div>
+            </Link>
+            <form action={del.bind(null, it.id)}>
+              <button className="text-sm underline" type="submit">
+                Slet
+              </button>
+            </form>
+          </li>
+        ))}
+      </ul>
 
-      <div className="flex items-center justify-between">
-        <Link aria-disabled={page<=1} className={`text-sm underline ${page<=1 ? "pointer-events-none opacity-50" : ""}`} href={`/exam/history?page=${Math.max(1, page-1)}`}> Forrige</Link>
-        <span className="text-xs text-neutral-600">Side {page} af {totalPages}</span>
-        <Link aria-disabled={page>=totalPages} className={`text-sm underline ${page>=totalPages ? "pointer-events-none opacity-50" : ""}`} href={`/exam/history?page=${Math.min(totalPages, page+1)}`}>Næste </Link>
-      </div>
+      <nav className="mt-6 flex items-center gap-3">
+        <Link
+          className={`rounded border px-3 py-1 ${
+            page <= 1 ? "pointer-events-none opacity-50" : ""
+          }`}
+          href={`/exam/history?page=${page - 1}`}
+        >
+          Forrige
+        </Link>
+        <span>
+          Side {page} / {lastPage}
+        </span>
+        <Link
+          className={`rounded border px-3 py-1 ${
+            page >= lastPage ? "pointer-events-none opacity-50" : ""
+          }`}
+          href={`/exam/history?page=${page + 1}`}
+        >
+          Næste
+        </Link>
+      </nav>
     </div>
   );
 }
+

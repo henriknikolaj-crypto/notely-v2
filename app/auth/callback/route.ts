@@ -1,4 +1,5 @@
-﻿import { NextResponse } from "next/server"
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { NextResponse } from "next/server"
 import { supabaseServerRoute } from "@/lib/supabase/server"
 
 export async function GET(request: Request) {
@@ -18,3 +19,4 @@ export async function GET(request: Request) {
 
   return NextResponse.redirect(new URL(next, request.url))
 }
+

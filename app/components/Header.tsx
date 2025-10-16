@@ -1,4 +1,4 @@
-﻿import Link from "next/link";
+import Link from "next/link";
 import HeaderClient from "./HeaderClient";
 import { supabaseServerRSC } from "@/lib/supabase/server";
 
@@ -34,3 +34,4 @@ export default async function ServerHeader() {
     </HeaderClient>
   );
 }
+

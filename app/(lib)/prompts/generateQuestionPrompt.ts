@@ -1,4 +1,4 @@
-﻿export function generateQuestionPrompt(input: {
+export function generateQuestionPrompt(input: {
   topicHint?: string;
   mergedContext: string;
 }) {
@@ -28,3 +28,4 @@ Krav:
     },
   ] as const;
 }
+

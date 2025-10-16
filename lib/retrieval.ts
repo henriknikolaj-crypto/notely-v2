@@ -1,4 +1,5 @@
-﻿import { createClient } from "@supabase/supabase-js";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { createClient } from "@supabase/supabase-js";
 
 export function sbAdmin() {
   return createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -24,3 +25,4 @@ export async function collectContextForUser(ownerId: string, tokenLimit = 32000)
   }
   return ctx.trim();
 }
+

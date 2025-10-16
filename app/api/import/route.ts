@@ -1,4 +1,5 @@
-﻿import { createClient } from "@supabase/supabase-js";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { createClient } from "@supabase/supabase-js";
 import { ensureQuotaAndDecrement } from "@/app/lib/quota";
 
 export const runtime = "nodejs";
@@ -140,3 +141,4 @@ export async function POST(req: Request) {
     return Response.json({ ok:false, error: e?.message ?? "error" }, { status:500 });
   }
 }
+

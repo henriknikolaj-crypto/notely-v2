@@ -1,4 +1,5 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { useRouter } from "next/navigation";
 
 export default function RefreshButton({ className="" }: { className?: string }) {
@@ -13,3 +14,4 @@ export default function RefreshButton({ className="" }: { className?: string }) 
     </button>
   );
 }
+

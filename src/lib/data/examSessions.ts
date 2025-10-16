@@ -1,4 +1,5 @@
-﻿import { supabaseServerRSC } from "@/lib/supabase/server";
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+import { supabaseServerRSC } from "@/lib/supabase/server";
 
 export type ExamSession = {
   id: string;

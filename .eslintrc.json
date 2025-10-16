@@ -1,0 +1,30 @@
+﻿{
+    "extends":  "next/core-web-vitals",
+    "overrides":  [
+                      {
+                          "files":  [
+                                        "app/api/**/*.{ts,tsx}",
+                                        "src/app/api/**/*.{ts,tsx}",
+                                        "lib/workers/**/*.{ts,tsx}"
+                                    ],
+                          "rules":  {
+                                        "@typescript-eslint/no-unused-vars":  [
+                                                                                  "warn",
+                                                                                  {
+                                                                                      "argsIgnorePattern":  "^_"
+                                                                                  }
+                                                                              ],
+                                        "@typescript-eslint/no-explicit-any":  "off"
+                                    }
+                      },
+                      {
+                          "files":  [
+                                        "app/(components)/**/*.{ts,tsx}",
+                                        "components/**/*.{ts,tsx}"
+                                    ],
+                          "rules":  {
+                                        "@typescript-eslint/no-explicit-any":  "off"
+                                    }
+                      }
+                  ]
+}

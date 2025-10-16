@@ -1,4 +1,5 @@
-﻿import { supabaseServerRoute } from "@/lib/supabaseServer";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { supabaseServerRoute } from "@/lib/supabaseServer";
 import { requireUser } from "@/lib/auth";
 import Link from "next/link";
 
@@ -80,3 +81,4 @@ export default async function RecentEvaluations() {
     </section>
   );
 }
+

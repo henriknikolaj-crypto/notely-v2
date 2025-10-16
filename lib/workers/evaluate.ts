@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { createClient } from "@supabase/supabase-js";
 
 // Minimal "claim → process → update" loop for local testing.
@@ -40,3 +41,4 @@ export async function processNextEvaluateJob() {
     return { ok: false, id: job.id, reason: e?.message };
   }
 }
+

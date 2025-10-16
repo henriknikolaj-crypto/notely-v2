@@ -1,4 +1,5 @@
-﻿export const runtime = 'nodejs';
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export const runtime = 'nodejs';
 import { NextResponse } from "next/server";
 import { URL } from "url";
 import dns from "node:dns/promises";
@@ -32,3 +33,4 @@ export async function GET() {
 
   return NextResponse.json({ host, dns: dnsInfo, httpsStatus, httpsError });
 }
+

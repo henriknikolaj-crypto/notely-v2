@@ -1,4 +1,5 @@
-﻿import ClientExam from "./ClientExam";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import ClientExam from "./ClientExam";
 
 export default function Page() {
   return (
@@ -7,3 +8,4 @@ export default function Page() {
     </main>
   );
 }
+

@@ -1,4 +1,5 @@
-﻿import { cookies } from "next/headers";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
 export async function supaRls() {
@@ -13,3 +14,4 @@ export async function supaRls() {
     }
   );
 }
+

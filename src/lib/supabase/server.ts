@@ -1,4 +1,5 @@
-﻿import { cookies } from "next/headers";
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;

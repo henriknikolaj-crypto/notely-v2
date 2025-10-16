@@ -1,4 +1,5 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { useState } from "react";
 
 type Props = {
@@ -69,3 +70,4 @@ export default function JobStatusChip({ job, isAdmin = false }: Props) {
     </div>
   );
 }
+

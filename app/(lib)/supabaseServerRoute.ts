@@ -1,4 +1,4 @@
-﻿import { createClient } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 
 /**
  * Server-side Supabase client til Route Handlers.
@@ -25,3 +25,4 @@ export async function supabaseServerRoute() {
 
   return client;
 }
+

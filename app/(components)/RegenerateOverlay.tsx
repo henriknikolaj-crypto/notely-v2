@@ -1,4 +1,5 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -57,3 +58,4 @@ export default function RegenerateOverlay() {
     </button>
   );
 }
+

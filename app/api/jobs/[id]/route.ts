@@ -1,6 +1,8 @@
 ﻿import { headers, cookies } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
 import type { NextRequest } from "next/server";
+import { createServerClient } from "@supabase/ssr";
+import type { CookieOptions } from "@supabase/ssr";
 
 export async function GET(
   _req: NextRequest,
@@ -53,11 +55,7 @@ export async function GET(
 
   // 3) Cookie-session (UI)
   const cookieStore = await cookies();  // await cookies()
-  const supaCookie = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    { cookies: { get(name: string) { return cookieStore.get(name)?.value; } } }
-  );
+  const supaCookie = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { cookies: { getAll() { return cookieStore.getAll(); }, setAll(cookiesToSet) { try { cookiesToSet.forEach(({ name, value, options }) => { cookieStore.set(name, value, options as CookieOptions); }); } catch {} } } });
 
   const { data: u } = await supaCookie.auth.getUser();
   if (!u?.user) return new Response("Unauthorized", { status: 401 });
@@ -69,3 +67,5 @@ export async function GET(
   if (error) return new Response(error.message, { status: 404 });
   return Response.json(data);
 }
+
+

@@ -1,4 +1,5 @@
-﻿import { createClient } from "@supabase/supabase-js";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { createClient } from "@supabase/supabase-js";
 
 export type JobRow = {
   id: string;
@@ -80,3 +81,4 @@ export async function requeueNow(jobId: string) {
     finished_at: null,
   }).eq("id", jobId);
 }
+

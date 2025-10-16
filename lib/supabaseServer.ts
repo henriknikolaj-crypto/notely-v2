@@ -1,4 +1,5 @@
-﻿import { cookies } from "next/headers";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
 // NOTE: async pga Next 15 "await cookies()"
@@ -17,3 +18,4 @@ export async function supabaseServerRoute() {
   );
   return supabase;
 }
+

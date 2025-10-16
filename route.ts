@@ -1,5 +1,5 @@
 ﻿import { NextResponse } from "next/server";
-import { createServerClient } from "@/lib/supabase/server";
+import { supabaseServerRoute } from "@/lib/supabase/server";
 
 export async function POST(req: Request) {
   const secret = process.env.IMPORT_SHARED_SECRET;
@@ -8,7 +8,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  const supabase = await createServerClient();
+  const supabase = await supabaseServerRoute();
 
   // forventet payload (eksempel):
   // {

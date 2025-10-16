@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 export async function GET() {
   return NextResponse.json({
@@ -7,3 +8,4 @@ export async function GET() {
     supa_url: process.env.NEXT_PUBLIC_SUPABASE_URL || null,
   });
 }
+

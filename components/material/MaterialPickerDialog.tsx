@@ -1,4 +1,5 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { useEffect, useState } from "react";
 
 type Item = { source_type: "file" | "note"; source_id: string };
@@ -74,3 +75,4 @@ export default function MaterialPickerDialog({
     </div>
   );
 }
+

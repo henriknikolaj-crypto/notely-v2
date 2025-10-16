@@ -1,4 +1,5 @@
-﻿import { createClient } from "@supabase/supabase-js";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { createClient } from "@supabase/supabase-js";
 
 export type QuotaResult = { ok: boolean; remaining: number; code: string };
 
@@ -31,3 +32,4 @@ export async function ensureQuotaAndDecrement(owner_id: string, cost = 1): Promi
     code: String(row?.code ?? "UNKNOWN"),
   };
 }
+

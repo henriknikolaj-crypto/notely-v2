@@ -1,5 +1,0 @@
-﻿@import "tailwindcss";
-
-/* tiny global tweaks */
-html, body { height: 100%; }
-a { text-decoration: underline; }

@@ -1,160 +1,129 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
+import dynamic from "next/dynamic";
+import { useMemo, useState, useEffect } from "react";
 
-import { useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+const RecentEvaluationsClient = dynamic(() => import("./RecentEvaluationsClient"), { ssr: false });
+const MAX_CHARS = 400;
 
-// Minimal, indbygget Toast så vi undgår import-problemer
-function Toast({ text, show, onClose }: { text: string; show: boolean; onClose: () => void }) {
-  if (!show) return null;
-  return (
-    <div
-      className="fixed top-4 right-4 z-[2000] bg-black text-white px-3 py-2 rounded shadow cursor-pointer"
-      onClick={onClose}
-      role="status"
-      aria-live="polite"
-      title="Klik for at lukke"
-    >
-      {text}
-    </div>
-  );
-}
+function hash(s: string) { let h=0; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; return h.toString(); }
+
+type RefItem = { title:string; author?:string; year?:string; venue?:string; url?:string; peer_reviewed?:boolean };
 
 export default function ClientExam() {
-  const [question, setQuestion] = useState("");
+  const [question, setQuestion] = useState("Hvad er forskellen på differenskvotient og differentialkvotient?");
   const [answer, setAnswer] = useState("");
-  const [loadingGen, setLoadingGen] = useState(false);
+  const [useContext, setUseContext] = useState(false); // eneste valg for brugeren
+
+  const [score, setScore] = useState<number | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const [refs, setRefs] = useState<RefItem[]|null>(null);
   const [loadingEval, setLoadingEval] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
-  const answerRef = useRef<HTMLTextAreaElement>(null);
-  const router = useRouter();
+  const [loadingGen, setLoadingGen] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const MIN_LEN = 120;
+  const key = useMemo(() => `exam_answer:${hash(question)}`, [question]);
+  useEffect(() => { try { const s = localStorage.getItem(key); setAnswer(s ?? ""); } catch {} }, [key]);
+  useEffect(() => { try { localStorage.setItem(key, answer); } catch {} }, [key, answer]);
 
-  // (Valgfrit) Hent sidste spørgsmål, hvis rute findes – stiltiende fallback
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/api/last-question", { cache: "no-store" });
-        if (!r.ok) return;
-        const j = await r.json().catch(() => ({} as any));
-        if (j?.question && typeof j.question === "string") setQuestion(j.question);
-      } catch {}
-    })();
-  }, []);
+  const used = useMemo(() => Math.min(answer.length, MAX_CHARS), [answer]);
+  function onChangeAnswer(v: string) { if (v.length <= MAX_CHARS) setAnswer(v); }
 
-  async function onGenerate() {
-    if (loadingGen) return;
-    setLoadingGen(true);
-    try {
-      const res = await fetch("/api/generate-question", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ includeBackground: false, count: 1 }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "Kunne ikke generere spørgsmål");
-      const q = String(data?.question ?? "");
-      setQuestion(q);
-      setToast("Nyt spørgsmål genereret");
-      // router.refresh();  // slået fra for at undgå blank side                 // opdater SSR-lister
-      setTimeout(() => answerRef.current?.focus(), 50);
-    } catch (e: any) {
-      setToast(e?.message || "Fejl ved generering");
-    } finally {
-      setLoadingGen(false);
-    }
-  }
-
-  async function onEvaluate() {
-    if (!question.trim()) {
-      setToast("Skriv eller generér et eksamensspørgsmål først.");
-      return;
-    }
-    if (answer.trim().length < MIN_LEN) {
-      setToast(`Dit svar er meget kort. Skriv mindst ${MIN_LEN} tegn.`);
-      answerRef.current?.focus();
-      return;
-    }
-    setLoadingEval(true);
+  async function onEvaluateClick() {
+    setLoadingEval(true); setFeedback(null); setRefs(null); setErrorMsg(null);
     try {
       const res = await fetch("/api/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, answer }),
+        body: JSON.stringify({ question, answer, useContext }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "Evaluate failed");
-      const scoreNum = typeof data?.score === "number" ? Math.round(data.score) : 0;
-      setToast(`Vurdering gemt · Score: ${scoreNum}/100`);
-      setAnswer("");
-      // router.refresh();  // slået fra for at undgå blank side
-    } catch (e: any) {
-      setToast(e?.message || "Fejl under evaluering");
-    } finally {
-      setLoadingEval(false);
-    }
+      if (!res.ok) throw new Error("Evaluate fejlede");
+      const json = await res.json();
+      setScore(typeof json?.score === "number" ? json.score : 0);
+      setFeedback(json?.feedback ?? "Ingen feedback modtaget.");
+      setRefs(Array.isArray(json?.references) ? json.references : null);
+      try { localStorage.removeItem(key); } catch {}
+      window.dispatchEvent(new CustomEvent("eval:completed"));
+    } catch (e:any) {
+      setScore(0); setFeedback(null); setErrorMsg(e?.message ?? "Ukendt fejl under evaluering.");
+    } finally { setLoadingEval(false); }
+  }
+
+  async function onGenerateClick() {
+    setLoadingGen(true); setErrorMsg(null);
+    try {
+      const res = await fetch("/api/generate-question", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ useContext }),
+      });
+      if (!res.ok) throw new Error("Generering fejlede");
+      const json = await res.json();
+      setQuestion(json?.question ?? "Beskriv grænsebegrebet kort.");
+      setAnswer(""); setScore(null); setFeedback(null); setRefs(null);
+    } catch (e:any) {
+      setErrorMsg(e?.message ?? "Ukendt fejl under generering.");
+    } finally { setLoadingGen(false); }
   }
 
   return (
-    <>
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-bold">Eksamensspørgsmål</h2>
-          <button
-            type="button"
-            onClick={onGenerate}
-            disabled={loadingGen}
-            className="rounded-xl border px-3 py-2 text-sm font-semibold bg-black text-white disabled:opacity-60"
-            title="Generér nyt spørgsmål"
-          >
-            {loadingGen ? "Genererer…" : "Generér nyt spørgsmål"}
-          </button>
-        </div>
+    <div className="mx-auto max-w-3xl px-4 py-6">
+      {errorMsg && <div className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm">{errorMsg}</div>}
 
-        <p className="text-sm">
-          Forklar forskellen mellem differenskvotienten og differentialkvotienten, og hvordan de relaterer sig til sekantlinjen og tangenten.
-        </p>
+      <header className="mb-4 flex items-center justify-between gap-4">
+        <h1 className="text-3xl font-semibold">Eksamensspørgsmål</h1>
+        <button type="button" onClick={onGenerateClick} disabled={loadingGen}
+          className="rounded-2xl px-4 py-2 shadow-sm border hover:shadow transition disabled:opacity-60">
+          {loadingGen ? "Genererer…" : "Generér nyt spørgsmål"}
+        </button>
+      </header>
 
-        <input
-          type="text"
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          spellCheck={false}
-          autoComplete="off"
-          className="mt-1 w-full rounded-xl border px-3 py-2"
-          placeholder="Skriv eller generér et eksamensspørgsmål…"
-        />
-
-        <div>
-          <label className="block text-sm font-medium">Dit svar</label>
-          <textarea
-            ref={answerRef}
-            value={answer}
-            onChange={(e) => setAnswer(e.target.value)}
-            spellCheck={false}
-            autoComplete="off"
-            className="mt-1 w-full min-h-[160px] rounded-xl border px-3 py-2"
-            placeholder="Indsæt eller skriv dit svar…"
-          />
-          <p className="mt-1 text-xs text-neutral-500">
-            {answer.trim().length}/{MIN_LEN} tegn
-          </p>
-        </div>
-
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={onEvaluate}
-            disabled={loadingEval}
-            className="rounded-xl border px-4 py-2 text-sm hover:bg-neutral-50 disabled:opacity-60"
-          >
-            {loadingEval ? "Vurderer…" : "Evaluer mit svar"}
-          </button>
-        </div>
+      <div className="mb-3 rounded-2xl border bg-white p-3">
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={useContext} onChange={(e)=>setUseContext(e.target.checked)} />
+          Vis kilder og henvisninger i feedback
+        </label>
       </div>
 
-      <Toast text={toast ?? ""} show={!!toast} onClose={() => setToast(null)} />
-    </>
+      <section className="mb-3 rounded-2xl border bg-white p-4 shadow-sm">
+        <p className="text-lg leading-relaxed">{question}</p>
+      </section>
+
+      <label className="block text-sm font-medium mb-2">Dit svar</label>
+      <textarea className="w-full min-h-40 rounded-xl border bg-white p-3 shadow-sm focus:outline-none focus:ring-2"
+        placeholder="Indsæt eller skriv dit svar…" value={answer} onChange={(e) => onChangeAnswer(e.target.value)} />
+
+      <div className="mt-2 flex items-center justify-between text-sm text-gray-600">
+        <span>{used}/{MAX_CHARS} tegn</span>
+        <button type="button" onClick={onEvaluateClick}
+          disabled={loadingEval || answer.trim().length === 0}
+          className="rounded-2xl px-4 py-2 shadow-sm border hover:shadow transition disabled:opacity-60">
+          {loadingEval ? "Evaluerer…" : "Evaluer mit svar"}
+        </button>
+      </div>
+
+      {score !== null && (
+        <div className="mt-4 text-base">
+          <div className="font-medium">Vurdering gemt · Score: {score}/100</div>
+          {feedback && <div className="mt-1 whitespace-pre-wrap">{feedback}</div>}
+          {refs && refs.length > 0 && (
+            <div className="mt-3">
+              <div className="font-medium mb-1">Litteratur</div>
+              <ul className="list-disc pl-5 text-sm">
+                {refs.map((r, i) => (
+                  <li key={i}>
+                    {r.author ? `${r.author}: ` : ""}{r.title}{r.year ? ` (${r.year})` : ""}{r.venue ? `, ${r.venue}` : ""}{r.peer_reviewed ? " [peer-reviewed]" : ""}{r.url ? ` – ${r.url}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      <RecentEvaluationsClient />
+    </div>
   );
 }
+
 

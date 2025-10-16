@@ -1,4 +1,5 @@
-﻿import { headers } from "next/headers";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { headers } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
 
 function envNum(name: string, dflt: number) {
@@ -19,14 +20,14 @@ function randInt(min: number, max: number) {
   return Math.floor(Math.random() * (hi - lo + 1)) + lo;
 }
 
-export async function POST(req: Request) {
+export async function POST(_req: Request) {
   const hdrs = await headers();
   if (hdrs.get("x-shared-secret") !== process.env.IMPORT_SHARED_SECRET) {
     return Response.json({ ok:false, error:"Unauthorized" }, { status: 401 });
   }
 
   let id: string | undefined;
-  try { const b = await req.json(); id = b?.id; } catch {}
+  try { const b = await _req.json(); id = b?.id; } catch {}
   if (!id) return Response.json({ ok:false, error:"Missing id" }, { status: 400 });
 
   // Read simulation knobs from env
@@ -55,3 +56,5 @@ export async function POST(req: Request) {
 
   return Response.json({ ok:true, id, status, tokens_used, latency_ms, failRate });
 }
+
+

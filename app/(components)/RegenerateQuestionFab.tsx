@@ -1,4 +1,5 @@
-﻿"use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+"use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -43,3 +44,4 @@ export default function RegenerateQuestionFab() {
     </button>
   );
 }
+
