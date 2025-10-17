@@ -1,193 +1,101 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { createServerClient, type CookieOptions } from "@supabase/ssr";
+﻿export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+import { NextRequest } from "next/server";
+import { supabaseServerRoute } from "@/app/(lib)/supabaseServerRoute";
 import OpenAI from "openai";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-type EvalBody = { question: string; answer: string; useContext?: boolean };
-
-type Reference = {
-  title: string;
-  author?: string;
-  year?: string;
-  venue?: string;
-  url?: string;
-  peer_reviewed?: boolean;
-};
-
-// Straf korte/off-topic svar
-function heuristicCap(question: string, answer: string): number {
-  const a = (answer ?? "").trim();
-  if (a.length < 30) return 20;
-  const norm = (s: string) =>
-    s.toLowerCase().replace(/[^a-zæøå0-9\s]/gi, " ").split(/\s+/).filter(Boolean);
-  const q = norm(question);
-  const aSet = new Set(norm(answer));
-  const overlap = q.filter((t) => aSet.has(t)).length / Math.max(1, q.length);
-  if (overlap < 0.12) return 30;
-  return 100;
-}
-
-// Lille kvalitets-boost for troværdige domæner/venues
-function credibilityBoost(url?: string, venue?: string, title?: string): number {
-  const s = ((url || "") + " " + (venue || "") + " " + (title || "")).toLowerCase();
-  const dk = /(ku\.dk|au\.dk|sdu\.dk|ruc\.dk|aau\.dk|itu\.dk|cbs\.dk|\.dk\b|gyldendal|munksgaard)/;
-  const nordic = /\.se\b|\.no\b|\.fi\b|\.is\b/;
-  const topInt = /(doi\.org|springer|wiley|tandfonline|elsevier|sagepub|oup|cambridge|nature|science|cell|ieee|acm)/;
-  let score = 0;
-  if (dk.test(s)) score += 3;
-  if (/[æøå]/i.test(s)) score += 2; // dansk sprogindikator
-  if (nordic.test(s)) score += 1;
-  if (topInt.test(s)) score += 1;
-  return score;
-}
-
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    const { question, answer, useContext } = (await req.json()) as EvalBody;
-    const referencesEnabled = !!useContext; // toggle styrer KUN referencer
+    const { supabase, user } = await supabaseServerRoute();
+    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
-    const cookieStore = await cookies();
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          getAll: () => cookieStore.getAll(),
-          setAll: (c) => {
-            try {
-              c.forEach(({ name, value, options }) =>
-                cookieStore.set(name, value, options as CookieOptions)
-              );
-            } catch {}
-          },
-        },
-      }
-    );
+    const { question, answer, sessionId } = await req.json();
 
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    // HENT ALTID PRIVAT KONTEKST (til forståelse) — MÅ IKKE AFSLØRES
-    let context = "";
-    if (user?.id) {
-      const { data } = await supabase
-        .from("doc_chunks")
-        .select("content")
-        .eq("owner_id", user.id)
-        .order("created_at", { ascending: false })
-        .limit(10);
-      context = (data ?? []).map((d) => d.content).join("\n---\n").slice(0, 12000);
+    if (!question || !answer) {
+      return Response.json({ error: "Manglende 'question' eller 'answer'." }, { status: 400 });
     }
 
-    const sys = `Du er en erfaren universitetsunderviser.
-BRUG KUN den PRIVATE CONTEXT til at forstå problemstillingen. Du MÅ IKKE citere eller nævne den,
-medmindre references_enabled=true.
-PRIVATE CONTEXT (DO NOT DISCLOSE):
-${context || "(tom)"}
+    const { data: chunks } = await supabase
+      .from("doc_chunks")
+      .select("id, content")
+      .eq("owner_id", user.id)
+      .limit(8);
 
-Bedøm elevens svar strengt (0–100) mht. korrekthed, klarhed, præcision og relevans i forhold til spørgsmålet.
-Returnér KUN JSON i formatet:
-{
-  "score": 0-100,
-  "feedback": "2-4 korte sætninger på dansk",
-  "references": [ { "title": "", "author": "", "year": "", "venue": "", "url": "", "peer_reviewed": true|false } ] // udelad hvis references_disabled
-}`;
+    const context = (chunks ?? [])
+      .map((c) => (c?.content ?? "").trim())
+      .filter(Boolean)
+      .join("\n\n---\n\n");
 
-    const userMsg = `Spørgsmål: ${question}
-Svar: ${answer}
+    const sys = "Du er en dansk eksaminator. Du bedømmer kort, præcist, 0-100 med begrundet feedback.";
+    const usr = `Kontekst (uddrag fra elevens noter):
 
-references_enabled: ${referencesEnabled ? "true" : "false"}
-Hvis references_enabled=true: medtag 2–4 referencer. Prioritér peer-reviewed og (ved danske emner) troværdige danske kilder (dk-domæner, danske universiteter/forlag). Undgå fabrikerede kilder.`;
+${context}
 
-    const resp = await client.chat.completions.create({
+Spørgsmål: ${question}
+
+Elevens svar:
+${answer}
+
+Opgave: Bedøm svaret fra 0-100 (100 er fuldt korrekt). Returnér strengt JSON:
+{"score": <heltal 0-100>, "feedback": "<kort forklaring på dansk>"}`;
+
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.2,
       messages: [
         { role: "system", content: sys },
-        { role: "user", content: userMsg },
+        { role: "user", content: usr },
       ],
+      temperature: 0.2,
+      max_tokens: 220,
+      response_format: { type: "json_object" as const },
     });
 
-    const content = resp.choices?.[0]?.message?.content ?? "{}";
-    const match = content.match(/\{[\s\S]*\}/);
-    let parsed: { score?: unknown; feedback?: unknown; references?: unknown } = {};
-    if (match) {
-      try {
-        parsed = JSON.parse(match[0]) as typeof parsed;
-      } catch {}
-    }
+    let score = 0;
+    let feedback = "Ingen feedback.";
+    try {
+      const raw = completion.choices?.[0]?.message?.content?.trim() ?? "{}";
+      const parsed = JSON.parse(raw);
+      score = Math.max(0, Math.min(100, Number(parsed?.score ?? 0)));
+      feedback = String(parsed?.feedback ?? feedback);
+    } catch {}
 
-    // Score + cap
-    let score = Number.isFinite(parsed?.score) ? Number(parsed!.score) : 0;
-    score = Math.max(0, Math.min(100, score));
-    const cap = heuristicCap(question, answer);
-    score = Math.min(score, cap);
-
-    // Feedback
-    const feedback =
-      typeof parsed?.feedback === "string" ? parsed.feedback : "Ingen feedback.";
-
-    // Referencer – kun hvis referencesEnabled
-    let references: Reference[] = [];
-    if (referencesEnabled && Array.isArray(parsed?.references)) {
-      references = (parsed.references as unknown[])
-        .map((r) => {
-          const v = r as Partial<Reference>;
-          return {
-            title: String(v.title ?? "").trim(),
-            author: v.author ? String(v.author) : undefined,
-            year: v.year ? String(v.year) : undefined,
-            venue: v.venue ? String(v.venue) : undefined,
-            url: v.url ? String(v.url) : undefined,
-            peer_reviewed:
-              typeof v.peer_reviewed === "boolean" ? v.peer_reviewed : undefined,
-          } as Reference;
+    if (sessionId) {
+      const { error: upErr } = await supabase
+        .from("exam_sessions")
+        .update({
+          answer,
+          score,
+          feedback,
         })
-        .filter((r) => r.title.length > 0);
-    }
+        .eq("id", sessionId)
+        .eq("owner_id", user.id);
 
-    // Sortér og vægt referencer: peer_reviewed + danske kilder først
-    if (references.length) {
-      references = references
-        .map((r) => ({ r, __s: (r.peer_reviewed ? 4 : 0) + credibilityBoost(r.url, r.venue, r.title) }))
-        .sort((a, b) => b.__s - a.__s)
-        .slice(0, 4)
-        .map(({ r }) => r);
-
-      // Lille bonus hvis der findes stærke kilder
-      const strong = references.some(
-        (r) => r.peer_reviewed === true || credibilityBoost(r.url, r.venue, r.title) >= 3
-      );
-      if (strong) score = Math.min(100, Math.round(score * 1.05));
-    }
-
-    // Gem i DB
-    let saved = false;
-    let db_error: string | undefined;
-    if (user?.id) {
-      const { error } = await supabase.from("exam_sessions").insert({
+      if (upErr) return Response.json({ error: upErr.message }, { status: 500 });
+    } else {
+      const { error: insErr } = await supabase.from("exam_sessions").insert({
         owner_id: user.id,
         question,
         answer,
         score,
         feedback,
-        model: "gpt-4o-mini",
-        doc_chunk_count: context ? context.split("---").length : 0,
       });
-      saved = !error;
-      db_error = error?.message;
-    } else {
-      db_error = "Not authenticated";
+      if (insErr) return Response.json({ error: insErr.message }, { status: 500 });
     }
 
-    return NextResponse.json({ score, feedback, references, saved, db_error });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "LLM error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    try {
+      await supabase.from("jobs").insert({
+        type: "evaluate",
+        status: "succeeded",
+        owner_id: user.id,
+        meta: { session_id: sessionId ?? null, chunk_count: chunks?.length ?? 0 },
+      });
+    } catch {}
+
+    return Response.json({ ok: true, score, feedback });
+  } catch (e: any) {
+    return Response.json({ error: e?.message ?? "Ukendt fejl" }, { status: 500 });
   }
 }
-

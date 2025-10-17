@@ -1,28 +1,29 @@
-import { createClient } from "@supabase/supabase-js";
+﻿import { cookies as nextCookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 
-/**
- * Server-side Supabase client til Route Handlers.
- * Bruger SERVICE_ROLE_KEY når den findes (skriv/adm rettigheder),
- * ellers falder den tilbage til ANON (read/limited write afh. RLS).
- */
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
 export async function supabaseServerRoute() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  // Next.js 15: cookies() skal awaited
+  const cookieStore = await nextCookies();
 
-  if (!url) {
-    throw new Error("NEXT_PUBLIC_SUPABASE_URL mangler i .env.local");
-  }
-  if (!serviceKey && !anon) {
-    throw new Error("SUPABASE_SERVICE_ROLE_KEY eller NEXT_PUBLIC_SUPABASE_ANON_KEY mangler i .env.local");
-  }
-
-  const key = serviceKey ?? anon!;
-  const client = createClient(url, key, {
-    auth: { persistSession: false },
-    global: { headers: { "X-Client-Info": "notely-v2-route" } },
+  const supabase = createServerClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    cookies: {
+      get(name: string) {
+        return cookieStore.get(name)?.value;
+      },
+      set(name: string, value: string, options: any) {
+        // Next sætter via .set; options er kompatible
+        cookieStore.set({ name, value, ...options });
+      },
+      remove(name: string, options: any) {
+        cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+      },
+    },
   });
 
-  return client;
+  const { data, error } = await supabase.auth.getUser();
+  const user = data?.user ?? null;
+  return { supabase, user, error };
 }
-

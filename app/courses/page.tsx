@@ -1,10 +1,10 @@
-import PageShell from "@/app/_ui/PageShell";
-import { supabaseServerRSC } from "@/lib/supabase/server";
+﻿import PageShell from "@/app/_ui/PageShell";
+import { getSupabaseServer } from "@/lib/supabase/server";
 import { NewCourseForm, DeleteCourseBtn } from "./_actions";
 import Link from "next/link";
 
 export default async function CoursesPage() {
-  const supabase = await supabaseServerRSC();
+  const supabase = await await getSupabaseServer();
   const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) {
@@ -52,5 +52,6 @@ export default async function CoursesPage() {
     </PageShell>
   );
 }
+
 
 

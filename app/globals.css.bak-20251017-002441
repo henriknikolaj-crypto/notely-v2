@@ -1,0 +1,7 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Nordisk, rolig grundtone */
+:root { --page-bg:#f7f8f9; --ink:#0a0a0a; }
+body { background:var(--page-bg); color:var(--ink); }

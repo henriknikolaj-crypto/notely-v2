@@ -1,0 +1,63 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Nordisk, rolig grundtone */
+:root { --page-bg:#f7f8f9; --ink:#0a0a0a; }
+body { background:var(--page-bg); color:var(--ink); }
+
+/* --- Force light form controls --- */
+:root, html, body { color-scheme: light; }
+
+textarea, input, select {
+  background-color: #fff !important;
+  color: #000 !important;
+}
+
+#answerBox {
+  background-color: #fff !important;
+  color: #000 !important;
+  border: 1px solid #bdbdbd !important;
+}
+
+/* --- FORCE LIGHT FORM CONTROLS (overrides UA & dark-mode) --- */
+:root, html, body { color-scheme: light; }
+
+/* slå UA-painting fra, og sæt vores egne farver */
+textarea, input, select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: #fff !important;
+  color: #000 !important;
+  border: 1px solid #bdbdbd !important;
+}
+
+/* ekstra sikkerhed for svarkassen */
+#answerBox {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: #fff !important;
+  color: #000 !important;
+}
+@layer base {
+  /* Tving hele dokumentet til lys farveskema */
+  :root, html, body { color-scheme: light; }
+
+  /* Overstyr UA/dark-mode for inputs/textarea/select */
+  textarea, input, select,
+  .dark textarea, .dark input, .dark select {
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #fff !important;
+    color: #000 !important;
+    border: 1px solid #bdbdbd !important;
+  }
+
+  /* Ekstra sikkerhed på selve svarkassen */
+  #answerBox {
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #fff !important;
+    color: #000 !important;
+  }
+}

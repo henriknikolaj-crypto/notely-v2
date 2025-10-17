@@ -1,0 +1,105 @@
+﻿"use client";
+import { useState } from "react";
+
+export default function ClientExam() {
+  const [question, setQuestion] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [feedback, setFeedback] = useState<any>(null);
+  const [loadingGen, setLoadingGen] = useState(false);
+  const [loadingEval, setLoadingEval] = useState(false);
+  const canGenerate = !loadingGen && (!question || !!feedback);
+
+  async function onGenerate() {
+    setLoadingGen(true);
+    setFeedback(null);
+    try {
+      const res = await fetch("/api/generate-question", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Kunne ikke generere spørgsmål");
+      setQuestion(data.question);
+      setSessionId(data.sessionId ?? null);
+      setAnswer("");
+    } catch (e: any) {
+      alert(e?.message ?? "Fejl ved generering");
+    } finally {
+      setLoadingGen(false);
+    }
+  }
+
+  async function onEvaluate() {
+    if (!question || !answer.trim()) {
+      alert("Skriv et svar først.");
+      return;
+    }
+    setLoadingEval(true);
+    try {
+      const res = await fetch("/api/evaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, answer, sessionId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Kunne ikke evaluere");
+      setFeedback(data);
+    } catch (e: any) {
+      alert(e?.message ?? "Fejl ved evaluering");
+    } finally {
+      setLoadingEval(false);
+    }
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto p-6 space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Eksamensøvelse</h1>
+        <button
+          className="px-4 py-2 rounded-xl shadow disabled:opacity-50"
+          onClick={onGenerate}
+          disabled={!canGenerate}
+          title="Generér nyt spørgsmål"
+        >
+          {loadingGen ? "Genererer" : "Generér nyt spørgsmål"}
+        </button>
+      </div>
+
+      {question ? (
+        <div className="space-y-3">
+          <p className="text-base leading-relaxed">
+            <strong>Spørgsmål:</strong> {question}
+          </p>
+          <textarea
+            className="w-full min-h-[140px] p-3 rounded-xl border"
+            placeholder="Skriv dit svar her"
+            value={answer}
+            onChange={(e) => setAnswer(e.target.value)}
+          />
+          <div className="flex gap-3">
+            <button
+              className="px-4 py-2 rounded-xl shadow disabled:opacity-50"
+              onClick={onEvaluate}
+              disabled={loadingEval}
+            >
+              {loadingEval ? "Evaluerer" : "Evaluer svar"}
+            </button>
+            <button
+              className="px-4 py-2 rounded-xl shadow"
+              onClick={() => { setQuestion(null); setSessionId(null); setAnswer(""); setFeedback(null); }}
+            >
+              Ryd
+            </button>
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm opacity-80">Ingen aktiv opgave. Klik Generér nyt spørgsmål.</p>
+      )}
+
+      {feedback && (
+        <div className="p-4 rounded-xl border">
+          <h2 className="font-semibold mb-2">Feedback</h2>
+          <pre className="whitespace-pre-wrap text-sm">{JSON.stringify(feedback, null, 2)}</pre>
+        </div>
+      )}
+    </div>
+  );
+}

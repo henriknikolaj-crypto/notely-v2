@@ -1,5 +1,5 @@
 ﻿/* eslint-disable @typescript-eslint/no-explicit-any */
-import { supabaseServerRSC } from "@/lib/supabase/server";
+import { getSupabaseServer } from "@/lib/supabase/server";
 
 export type ExamSession = {
   id: string;
@@ -11,7 +11,7 @@ export type ExamSession = {
 };
 
 export async function getLatestExamSessions(limit = 5): Promise<ExamSession[]> {
-  const supabase = await supabaseServerRSC();
+  const supabase = await await getSupabaseServer();
   const { data: { user }, error: userErr } = await supabase.auth.getUser();
   if (userErr || !user) return [];
   const { data, error } = await supabase
@@ -25,7 +25,7 @@ export async function getLatestExamSessions(limit = 5): Promise<ExamSession[]> {
 }
 
 export async function getExamSessionsPage(page = 1, pageSize = 10) {
-  const supabase = await supabaseServerRSC();
+  const supabase = await await getSupabaseServer();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { items: [], count: 0 };
   const from = (page - 1) * pageSize;
@@ -41,7 +41,7 @@ export async function getExamSessionsPage(page = 1, pageSize = 10) {
 }
 
 export async function getExamSessionById(id: string) {
-  const supabase = await supabaseServerRSC();
+  const supabase = await await getSupabaseServer();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return null;
   const { data, error } = await supabase
@@ -54,3 +54,4 @@ export async function getExamSessionById(id: string) {
   const { owner_id, ...rest } = data as any;
   return rest as ExamSession;
 }
+

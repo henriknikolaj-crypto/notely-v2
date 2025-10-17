@@ -1,0 +1,108 @@
+﻿export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+import { NextRequest } from "next/server";
+import { supabaseServerRoute } from "@/app/(lib)/supabaseServerRoute";
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+export async function POST(req: NextRequest) {
+  try {
+    const { supabase, user } = await supabaseServerRoute();
+    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+    const { question, answer, sessionId } = await req.json();
+
+    if (!question || !answer) {
+      return Response.json({ error: "Manglende 'question' eller 'answer'." }, { status: 400 });
+    }
+
+    // Hent lidt kontekst fra brugerens noter
+    const { data: chunks } = await supabase
+      .from("doc_chunks")
+      .select("id, content")
+      .eq("owner_id", user.id)
+      .limit(8);
+
+    const context = (chunks ?? [])
+      .map((c) => (c?.content ?? "").trim())
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    const sys = "Du er en dansk eksaminator. Du bedømmer kort, præcist, 0-100 med begrundet feedback.";
+    const usr = `Kontekst (uddrag fra elevens noter):
+
+${context}
+
+Spørgsmål: ${question}
+
+Elevens svar:
+${answer}
+
+Opgave: Bedøm svaret fra 0-100 (100 er fuldt korrekt). Returnér strengt JSON:
+{"score": <heltal 0-100>, "feedback": "<kort forklaring på dansk>"}`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: usr },
+      ],
+      temperature: 0.2,
+      max_tokens: 220,
+      response_format: { type: "json_object" as const },
+    });
+
+    let score = 0;
+    let feedback = "Ingen feedback.";
+    try {
+      const raw = completion.choices?.[0]?.message?.content?.trim() ?? "{}";
+      const parsed = JSON.parse(raw);
+      score = Math.max(0, Math.min(100, Number(parsed?.score ?? 0)));
+      feedback = String(parsed?.feedback ?? feedback);
+    } catch {}
+
+    // Opdater eksisterende session, ellers opret ny
+    if (sessionId) {
+      const { error: upErr } = await supabase
+        .from("exam_sessions")
+        .update({
+          answer,
+          score,
+          feedback,
+          status: "evaluated",
+        })
+        .eq("id", sessionId)
+        .eq("owner_id", user.id);
+      if (upErr) return Response.json({ error: upErr.message }, { status: 500 });
+    } else {
+      const { error: insErr } = await supabase.from("exam_sessions").insert({
+        owner_id: user.id,
+        question,
+        answer,
+        score,
+        feedback,
+        status: "evaluated",
+        model: "gpt-4o-mini",
+      });
+      if (insErr) return Response.json({ error: insErr.message }, { status: 500 });
+    }
+
+    // Best-effort logging
+    try {
+      await supabase.from("jobs").insert({
+        type: "evaluate",
+        status: "succeeded",
+        owner_id: user.id,
+        meta: { session_id: sessionId ?? null, chunk_count: chunks?.length ?? 0 },
+      });
+    } catch {}
+
+    return Response.json({ ok: true, score, feedback });
+  } catch (e: any) {
+    return Response.json({ error: e?.message ?? "Ukendt fejl" }, { status: 500 });
+  }
+}
+
+
+

@@ -1,0 +1,119 @@
+﻿export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+import { NextRequest } from "next/server";
+import { supabaseServerRoute } from "@/app/(lib)/supabaseServerRoute";
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+export async function POST(req: NextRequest) {
+  try {
+    const { supabase, user } = await supabaseServerRoute();
+    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+    const body = await req.json().catch(() => ({} as any));
+    const studySetId = body?.studySetId ?? null; // (bruges evt. senere)
+
+    // 1) doc_chunks først
+    const { data: chunks, error: chunksErr } = await supabase
+      .from("doc_chunks")
+      .select("id, content")
+      .eq("owner_id", user.id)
+      .limit(8);
+
+    if (chunksErr) return Response.json({ error: chunksErr.message }, { status: 500 });
+
+    let context = "";
+    let source = "doc_chunks";
+    let sourceCount = chunks?.length ?? 0;
+
+    // 2) Fallback: notes
+    if (!chunks || chunks.length === 0) {
+      const { data: notes, error: notesErr } = await supabase
+        .from("notes")
+        .select("id, title, content")
+        .eq("owner_id", user.id)
+        .limit(6);
+
+      if (notesErr) return Response.json({ error: notesErr.message }, { status: 500 });
+
+      if (notes && notes.length > 0) {
+        context = notes
+          .map(n => ((n?.title ?? "") + "\n" + (n?.content ?? "")).trim())
+          .filter(Boolean)
+          .join("\n\n---\n\n");
+        source = "notes";
+        sourceCount = notes.length;
+      } else {
+        return Response.json(
+          { error: "Ingen materiale fundet. Upload noter først.", code: "NO_MATERIAL" },
+          { status: 400 }
+        );
+      }
+    } else {
+      context = chunks
+        .map(c => (c?.content ?? "").trim())
+        .filter(Boolean)
+        .join("\n\n---\n\n");
+    }
+
+    const sys = "Du er en dansk eksaminator. Du skriver KORTE, klare eksamensspørgsmål baseret på brugerens materiale.";
+    const usr = `Kontekst (uddrag fra brugerens egne noter):
+
+${context}
+
+Opgave: Skriv ét specifikt eksamensspørgsmål på dansk, maks 2 sætninger.
+Svar KUN med selve spørgsmålet.`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: usr },
+      ],
+      temperature: 0.4,
+      max_tokens: 120,
+    });
+
+    const question = completion.choices?.[0]?.message?.content?.trim();
+    if (!question) return Response.json({ error: "Model gav ikke noget spørgsmål" }, { status: 502 });
+
+    // Minimal INSERT, kun sikre kolonner
+    const insertRow: any = {
+      owner_id: user.id,
+      question,
+    };
+    // Hvis du senere vil gemme study_set_id og kolonnen findes, kan du tilføje den her:
+    if (studySetId) insertRow.study_set_id = studySetId;
+
+    const { data: ins, error: insErr } = await supabase
+      .from("exam_sessions")
+      .insert(insertRow)
+      .select("id")
+      .single();
+
+    if (insErr) return Response.json({ error: insErr.message }, { status: 500 });
+
+    // Best-effort logging (ignorer fejl)
+    try {
+      await supabase.from("jobs").insert({
+        type: "generate_question",
+        status: "succeeded",
+        owner_id: user.id,
+        meta: { source, sourceCount, session_id: ins?.id ?? null, question_len: question.length },
+      });
+    } catch {}
+
+    return Response.json({
+      ok: true,
+      sessionId: ins?.id ?? null,
+      question,
+      source,
+      sourceCount,
+      usedChars: context.length,
+    });
+  } catch (e: any) {
+    return Response.json({ error: e?.message ?? "Ukendt fejl" }, { status: 500 });
+  }
+}

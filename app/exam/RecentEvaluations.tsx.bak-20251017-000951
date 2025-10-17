@@ -1,0 +1,78 @@
+﻿/* server component */
+import { supabaseServerRoute } from "@/app/(lib)/supabaseServerRoute";
+import { headers, cookies } from "next/headers";
+import { revalidatePath } from "next/cache";
+
+async function delRecent(formData: FormData) {
+  "use server";
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+
+  const h = await headers();
+  const ck = (await cookies()).toString();
+  const host = h.get("host") ?? "localhost:3000";
+  const proto = process.env.VERCEL ? "https" : "http";
+  const url = `${proto}://${host}/api/exam-sessions/${id}`;
+
+  await fetch(url, {
+    method: "DELETE",
+    headers: { cookie: ck },
+    cache: "no-store",
+  }).catch(() => {});
+
+  revalidatePath("/exam");
+  revalidatePath("/exam/history");
+}
+
+export default async function RecentEvaluations() {
+  const { supabase, user } = await supabaseServerRoute();
+  if (!user) return null;
+
+  const { data, error } = await supabase
+    .from("exam_sessions")
+    .select("id, question, score, created_at")
+    .eq("owner_id", user.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (error || !data || data.length === 0) return null;
+
+  return (
+    <section className="space-y-2 mt-6">
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-xl font-semibold">Seneste vurderinger</h2>
+        <a href="/exam/history" className="underline text-sm">Se alle</a>
+      </div>
+
+      <div className="space-y-2">
+        {data.map((it) => (
+          <div
+            key={it.id}
+            className="bg-white border rounded p-2 flex items-start justify-between gap-3"
+          >
+            <div className="min-w-0">
+              {/* dato + score */}
+              <div className="text-xs opacity-70">
+                {new Date(it.created_at ?? Date.now()).toLocaleString("da-DK")}
+                {typeof it.score === "number" ? `  Score: ${it.score}/100` : ""}
+              </div>
+              {/* spørgsmålstekst  wrap altid */}
+              <a
+                href="/exam/history"
+                className="underline block"
+                style={{ wordBreak: "break-word", overflowWrap: "anywhere", whiteSpace: "normal" }}
+              >
+                {it.question ?? "(intet spørgsmål)"}
+              </a>
+            </div>
+
+            <form action={delRecent} className="shrink-0">
+              <input type="hidden" name="id" value={it.id} />
+              <button type="submit" className="text-sm underline">Slet</button>
+            </form>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}

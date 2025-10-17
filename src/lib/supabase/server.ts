@@ -6,7 +6,7 @@ const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
 /** Read-only i Server Components */
-export async function supabaseServerRSC() {
+export async function await getSupabaseServer() {
   const store = await cookies(); // <- await i Next 15.5
   return createServerClient(url, key, {
     cookies: {
@@ -32,3 +32,4 @@ export async function supabaseServerRoute() {
     },
   });
 }
+
