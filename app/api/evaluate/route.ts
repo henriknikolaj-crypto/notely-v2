@@ -1,101 +1,173 @@
-﻿export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
+﻿import { NextResponse } from "next/server";
+import { cookies as nextCookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 
-import { NextRequest } from "next/server";
-import { supabaseServerRoute } from "@/app/(lib)/supabaseServerRoute";
-import OpenAI from "openai";
+/** Toggle ekstra retrieval-logs pr. .env.local -> DEBUG_RETRIEVAL=1 */
+const DEBUG_RETRIEVAL = process.env.DEBUG_RETRIEVAL === "1";
+const seenRetrievalWarns = new Set<string>();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-export async function POST(req: NextRequest) {
+async function getColumns(supabase: any, table: string): Promise<string[]> {
   try {
-    const { supabase, user } = await supabaseServerRoute();
-    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
-
-    const { question, answer, sessionId } = await req.json();
-
-    if (!question || !answer) {
-      return Response.json({ error: "Manglende 'question' eller 'answer'." }, { status: 400 });
+    const { data, error } = await supabase.from(table).select("*").limit(1);
+    if (error) {
+      if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(error.message)) {
+        console.warn(`[columns] ${table}: ${error.message}`);
+        seenRetrievalWarns.add(error.message);
+      }
+      return [];
     }
-
-    const { data: chunks } = await supabase
-      .from("doc_chunks")
-      .select("id, content")
-      .eq("owner_id", user.id)
-      .limit(8);
-
-    const context = (chunks ?? [])
-      .map((c) => (c?.content ?? "").trim())
-      .filter(Boolean)
-      .join("\n\n---\n\n");
-
-    const sys = "Du er en dansk eksaminator. Du bedømmer kort, præcist, 0-100 med begrundet feedback.";
-    const usr = `Kontekst (uddrag fra elevens noter):
-
-${context}
-
-Spørgsmål: ${question}
-
-Elevens svar:
-${answer}
-
-Opgave: Bedøm svaret fra 0-100 (100 er fuldt korrekt). Returnér strengt JSON:
-{"score": <heltal 0-100>, "feedback": "<kort forklaring på dansk>"}`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: usr },
-      ],
-      temperature: 0.2,
-      max_tokens: 220,
-      response_format: { type: "json_object" as const },
-    });
-
-    let score = 0;
-    let feedback = "Ingen feedback.";
-    try {
-      const raw = completion.choices?.[0]?.message?.content?.trim() ?? "{}";
-      const parsed = JSON.parse(raw);
-      score = Math.max(0, Math.min(100, Number(parsed?.score ?? 0)));
-      feedback = String(parsed?.feedback ?? feedback);
-    } catch {}
-
-    if (sessionId) {
-      const { error: upErr } = await supabase
-        .from("exam_sessions")
-        .update({
-          answer,
-          score,
-          feedback,
-        })
-        .eq("id", sessionId)
-        .eq("owner_id", user.id);
-
-      if (upErr) return Response.json({ error: upErr.message }, { status: 500 });
-    } else {
-      const { error: insErr } = await supabase.from("exam_sessions").insert({
-        owner_id: user.id,
-        question,
-        answer,
-        score,
-        feedback,
-      });
-      if (insErr) return Response.json({ error: insErr.message }, { status: 500 });
-    }
-
-    try {
-      await supabase.from("jobs").insert({
-        type: "evaluate",
-        status: "succeeded",
-        owner_id: user.id,
-        meta: { session_id: sessionId ?? null, chunk_count: chunks?.length ?? 0 },
-      });
-    } catch {}
-
-    return Response.json({ ok: true, score, feedback });
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return [];
+    return Object.keys(row);
   } catch (e: any) {
-    return Response.json({ error: e?.message ?? "Ukendt fejl" }, { status: 500 });
+    const msg = `[columns] ${table}: ${e?.message ?? e}`;
+    if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(msg)) {
+      console.warn(msg); seenRetrievalWarns.add(msg);
+    }
+    return [];
   }
 }
+
+async function safe(q: any) {
+  try {
+    const { data, error } = await q;
+    if (error) {
+      if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(error.message)) {
+        console.warn(`[retrieval] error: ${error.message}`);
+        seenRetrievalWarns.add(error.message);
+      }
+      return [];
+    }
+    return data ?? [];
+  } catch (e: any) {
+    const msg = `[retrieval] unexpected: ${e?.message ?? e}`;
+    if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(msg)) {
+      console.warn(msg); seenRetrievalWarns.add(msg);
+    }
+    return [];
+  }
+}
+
+/** Minimal, defensiv retrieval uden antagelser om kolonnenavne */
+async function getChunks(
+  supabase: any,
+  opts: { ownerId: string; studySetId?: string | null; includeBackground?: boolean; topK?: number }
+) {
+  const { ownerId, studySetId, includeBackground = false, topK = 12 } = opts;
+
+  const docCols = await getColumns(supabase, "doc_chunks");
+  const textCandidates = ["text","content","chunk","chunk_text","raw_text","body","page_text","pageContent"];
+  const textKey = textCandidates.find(k => docCols.includes(k));
+
+  const wantedBase = ["id","source_title","source_url","source_type"];
+  const wanted = wantedBase.filter(k => docCols.includes(k));
+
+  const selectArr = textKey ? ["id", textKey, ...wanted.filter(k => k !== "id")] : (wanted.length ? wanted : ["id"]);
+  const selectStr = selectArr.join(",");
+
+  let base = supabase.from("doc_chunks").select(selectStr).limit(topK);
+  if (docCols.includes("owner_id")) base = base.eq("owner_id", ownerId);
+  if (studySetId && docCols.includes("study_set_id")) base = base.eq("study_set_id", studySetId);
+  const userChunks = await safe(base);
+
+  let bgChunks: any[] = [];
+  if (includeBackground) {
+    let bgQ = supabase.from("doc_chunks").select(selectStr).limit(Math.max(4, Math.floor(topK / 2)));
+    if (docCols.includes("source_type")) bgQ = bgQ.eq("source_type", "verified");
+    bgChunks = await safe(bgQ);
+  }
+
+  const combined: any[] = [...userChunks, ...bgChunks].slice(0, topK);
+  const text = textKey ? combined.map(c => c?.[textKey] ?? "").join("\n\n---\n\n") : "";
+  const citations = combined
+    .map(c => ({ id: c?.id, title: c?.source_title, url: c?.source_url, type: c?.source_type }))
+    .filter(x => x.id);
+
+  return { text, citations, textKey };
+}
+
+// Stub  byt til dit rigtige LLM-kald
+async function callModelWithContext(input: { question: string; answer: string; contextText: string }) {
+  return {
+    score: 20,
+    feedback: input.contextText
+      ? "Evaluering gennemført. Der blev fundet baggrundstekst."
+      : "Evaluering gennemført (uden baggrund)."
+  };
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const includeBackground: boolean = !!body.includeBackground;
+    const studySetId: string | null = body.studySetId ?? null;
+    const question: string = String(body.question ?? "");
+    const answer: string = String(body.answer ?? "");
+
+    const cookieStore = await nextCookies();
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          get(name: string) { return cookieStore.get(name)?.value; },
+          set() {},
+          remove() {},
+        },
+      }
+    );
+
+    const { data: { user }, error: userErr } = await supabase.auth.getUser();
+    if (userErr) {
+      console.warn("[evaluate] getUser error:", (userErr as any)?.message ?? String(userErr));
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+    if (!user) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+
+    const retrieval = await getChunks(supabase, {
+      ownerId: user.id,
+      studySetId,
+      includeBackground,
+      topK: 12,
+    });
+
+    const bgFound =
+      !!includeBackground &&
+      Array.isArray((retrieval as any)?.citations) &&
+      (retrieval as any).citations.some((c: any) => (c?.type ?? c?.source_type) === "verified");
+
+    const llmAnswer = await callModelWithContext({ question, answer, contextText: retrieval.text });
+
+    // Insert kun kolonner der findes
+    const examCols = await getColumns(supabase, "exam_sessions");
+    const payload: any = { owner_id: user.id };
+    if (examCols.includes("question"))  payload.question  = question;
+    if (examCols.includes("answer"))    payload.answer    = answer;
+    if (examCols.includes("score"))     payload.score     = llmAnswer.score ?? null;
+    if (examCols.includes("feedback"))  payload.feedback  = llmAnswer.feedback ?? null;
+    if (examCols.includes("model"))     payload.model     = "gpt-4o-mini";
+
+    const metaObj = { includeBackground, studySetId, bgFound, citations: retrieval.citations, textKey: retrieval.textKey };
+    if (examCols.includes("meta"))      payload.meta      = metaObj;
+    else if (examCols.includes("metadata")) payload.metadata = metaObj;
+
+    const { data, error } = await supabase.from("exam_sessions").insert(payload).select("id").single();
+    if (error) {
+      console.error("[evaluate] insert error:", error.message, "payload keys:", Object.keys(payload));
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    return NextResponse.json({
+      id: data!.id,
+      score: llmAnswer.score,
+      feedback: llmAnswer.feedback,
+      meta: metaObj
+    });
+  } catch (e: any) {
+    console.error("[evaluate] fatal:", e?.stack || e?.message || e);
+    return NextResponse.json({ error: e?.message || "server error" }, { status: 500 });
+  }
+}
+

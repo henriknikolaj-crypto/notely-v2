@@ -24,7 +24,7 @@ export default async function RecentEvaluations() {
     "use server";
     const id = formData.get("id") as string | null;
     if (!id) return;
-    const supa = getSupabaseServer();
+    const supa = await getSupabaseServer();
     const { data: { user: u } } = await supa.auth.getUser();
     if (!u) return;
     await supa.from("exam_sessions")
@@ -61,4 +61,6 @@ export default async function RecentEvaluations() {
     </section>
   );
 }
+
+
 
