@@ -1,173 +1,462 @@
-﻿import { NextResponse } from "next/server";
-import { cookies as nextCookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+﻿import "server-only";
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { withAutoRanking } from "@/lib/retrieval/withAutoRanking";
 
-/** Toggle ekstra retrieval-logs pr. .env.local -> DEBUG_RETRIEVAL=1 */
-const DEBUG_RETRIEVAL = process.env.DEBUG_RETRIEVAL === "1";
-const seenRetrievalWarns = new Set<string>();
-
-async function getColumns(supabase: any, table: string): Promise<string[]> {
+/**
+ * Hent bruger-id på en robust måde.
+ * 1) Prøv Supabase auth (cookie-session / rigtig login).
+ * 2) Ellers fallback til DEV_USER_ID i .env.local (lokal dev).
+ */
+async function getOwnerId(sb: any) {
   try {
-    const { data, error } = await supabase.from(table).select("*").limit(1);
-    if (error) {
-      if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(error.message)) {
-        console.warn(`[columns] ${table}: ${error.message}`);
-        seenRetrievalWarns.add(error.message);
+    if (sb?.auth?.getUser) {
+      const { data } = await sb.auth.getUser();
+      if (data?.user?.id) return data.user.id as string;
+    }
+  } catch {
+    /* ignore auth errors */
+  }
+  return process.env.DEV_USER_ID ?? null;
+}
+
+/**
+ * gradeAnswer:
+ * - Sender spørgsmål+svar til modellen.
+ * - Forventer JSON med { score, feedback }.
+ * - Hvis noget fejler (eller ingen OPENAI_API_KEY), bruger vi fallback.
+ */
+async function gradeAnswer({
+  question,
+  answer,
+}: {
+  question: string;
+  answer: string;
+}): Promise<{ score: number; feedback: string; usedFallback: boolean }> {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+
+  if (apiKey) {
+    try {
+      const chatResp = await fetch(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Du er en dansk eksaminator. Du bedømmer elevens skriftlige svar. " +
+                  "Du giver både en tal-score (0-100) og kort, konkret, pædagogisk feedback.",
+              },
+              {
+                role: "user",
+                content:
+                  "Spørgsmål:\n" +
+                  question +
+                  "\n\nElevens svar:\n" +
+                  answer +
+                  "\n\nLav JSON med præcis denne struktur:\n" +
+                  '{ "score": <tal 0-100>, "feedback": "2-4 korte sætninger med forbedringsforslag på dansk" }',
+              },
+            ],
+            temperature: 0.2,
+          }),
+        }
+      );
+
+      if (!chatResp.ok) {
+        const t = await chatResp.text();
+        throw new Error(
+          `chat.completions fejlede (${chatResp.status}): ${t ?? "(ingen body)"}`
+        );
       }
-      return [];
-    }
-    const row = Array.isArray(data) ? data[0] : data;
-    if (!row) return [];
-    return Object.keys(row);
-  } catch (e: any) {
-    const msg = `[columns] ${table}: ${e?.message ?? e}`;
-    if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(msg)) {
-      console.warn(msg); seenRetrievalWarns.add(msg);
-    }
-    return [];
-  }
-}
 
-async function safe(q: any) {
-  try {
-    const { data, error } = await q;
-    if (error) {
-      if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(error.message)) {
-        console.warn(`[retrieval] error: ${error.message}`);
-        seenRetrievalWarns.add(error.message);
+      const chatJson = (await chatResp.json()) as any;
+      const rawText =
+        chatJson?.choices?.[0]?.message?.content ??
+        JSON.stringify(chatJson, null, 2);
+
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        // fallback: prøv at fiske første {...} objekt ud af teksten
+        const match = rawText.match(/\{[\s\S]*\}/);
+        if (match) {
+          parsed = JSON.parse(match[0]);
+        }
       }
-      return [];
+
+      const scoreNum = Number(parsed.score);
+      const fbText =
+        typeof parsed.feedback === "string"
+          ? parsed.feedback
+          : "Kunne ikke udtrække feedback.";
+
+      if (!Number.isNaN(scoreNum) && fbText) {
+        return {
+          score: Math.max(0, Math.min(100, Math.round(scoreNum))),
+          feedback: fbText,
+          usedFallback: false,
+        };
+      }
+
+      throw new Error(
+        "Kunne ikke parse chat.completions-output til JSON med {score, feedback}."
+      );
+    } catch (err) {
+      console.error("OpenAI chat.completions-fejl:", err);
+      // falder igennem til fallback nedenfor
     }
-    return data ?? [];
-  } catch (e: any) {
-    const msg = `[retrieval] unexpected: ${e?.message ?? e}`;
-    if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(msg)) {
-      console.warn(msg); seenRetrievalWarns.add(msg);
-    }
-    return [];
-  }
-}
-
-/** Minimal, defensiv retrieval uden antagelser om kolonnenavne */
-async function getChunks(
-  supabase: any,
-  opts: { ownerId: string; studySetId?: string | null; includeBackground?: boolean; topK?: number }
-) {
-  const { ownerId, studySetId, includeBackground = false, topK = 12 } = opts;
-
-  const docCols = await getColumns(supabase, "doc_chunks");
-  const textCandidates = ["text","content","chunk","chunk_text","raw_text","body","page_text","pageContent"];
-  const textKey = textCandidates.find(k => docCols.includes(k));
-
-  const wantedBase = ["id","source_title","source_url","source_type"];
-  const wanted = wantedBase.filter(k => docCols.includes(k));
-
-  const selectArr = textKey ? ["id", textKey, ...wanted.filter(k => k !== "id")] : (wanted.length ? wanted : ["id"]);
-  const selectStr = selectArr.join(",");
-
-  let base = supabase.from("doc_chunks").select(selectStr).limit(topK);
-  if (docCols.includes("owner_id")) base = base.eq("owner_id", ownerId);
-  if (studySetId && docCols.includes("study_set_id")) base = base.eq("study_set_id", studySetId);
-  const userChunks = await safe(base);
-
-  let bgChunks: any[] = [];
-  if (includeBackground) {
-    let bgQ = supabase.from("doc_chunks").select(selectStr).limit(Math.max(4, Math.floor(topK / 2)));
-    if (docCols.includes("source_type")) bgQ = bgQ.eq("source_type", "verified");
-    bgChunks = await safe(bgQ);
   }
 
-  const combined: any[] = [...userChunks, ...bgChunks].slice(0, topK);
-  const text = textKey ? combined.map(c => c?.[textKey] ?? "").join("\n\n---\n\n") : "";
-  const citations = combined
-    .map(c => ({ id: c?.id, title: c?.source_title, url: c?.source_url, type: c?.source_type }))
-    .filter(x => x.id);
+  // Lokal fallback (hvis vi ikke kunne kalde modellen eller parse svaret)
+  const defaultScore = 62;
+  const defaultFb =
+    "Foreløbig vurdering: Du er på et stabilt udgangspunkt. " +
+    "Prøv at være mere præcis i dine forklaringer og brug konkrete begreber. " +
+    "Fokuser især på at binde dine pointer tydeligt til spørgsmålet.";
 
-  return { text, citations, textKey };
-}
-
-// Stub  byt til dit rigtige LLM-kald
-async function callModelWithContext(input: { question: string; answer: string; contextText: string }) {
   return {
-    score: 20,
-    feedback: input.contextText
-      ? "Evaluering gennemført. Der blev fundet baggrundstekst."
-      : "Evaluering gennemført (uden baggrund)."
+    score: defaultScore,
+    feedback: defaultFb,
+    usedFallback: true,
   };
 }
 
-export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    const includeBackground: boolean = !!body.includeBackground;
-    const studySetId: string | null = body.studySetId ?? null;
-    const question: string = String(body.question ?? "");
-    const answer: string = String(body.answer ?? "");
-
-    const cookieStore = await nextCookies();
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          get(name: string) { return cookieStore.get(name)?.value; },
-          set() {},
-          remove() {},
-        },
-      }
-    );
-
-    const { data: { user }, error: userErr } = await supabase.auth.getUser();
-    if (userErr) {
-      console.warn("[evaluate] getUser error:", (userErr as any)?.message ?? String(userErr));
-      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-    }
-    if (!user) {
-      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-    }
-
-    const retrieval = await getChunks(supabase, {
-      ownerId: user.id,
-      studySetId,
-      includeBackground,
-      topK: 12,
-    });
-
-    const bgFound =
-      !!includeBackground &&
-      Array.isArray((retrieval as any)?.citations) &&
-      (retrieval as any).citations.some((c: any) => (c?.type ?? c?.source_type) === "verified");
-
-    const llmAnswer = await callModelWithContext({ question, answer, contextText: retrieval.text });
-
-    // Insert kun kolonner der findes
-    const examCols = await getColumns(supabase, "exam_sessions");
-    const payload: any = { owner_id: user.id };
-    if (examCols.includes("question"))  payload.question  = question;
-    if (examCols.includes("answer"))    payload.answer    = answer;
-    if (examCols.includes("score"))     payload.score     = llmAnswer.score ?? null;
-    if (examCols.includes("feedback"))  payload.feedback  = llmAnswer.feedback ?? null;
-    if (examCols.includes("model"))     payload.model     = "gpt-4o-mini";
-
-    const metaObj = { includeBackground, studySetId, bgFound, citations: retrieval.citations, textKey: retrieval.textKey };
-    if (examCols.includes("meta"))      payload.meta      = metaObj;
-    else if (examCols.includes("metadata")) payload.metadata = metaObj;
-
-    const { data, error } = await supabase.from("exam_sessions").insert(payload).select("id").single();
-    if (error) {
-      console.error("[evaluate] insert error:", error.message, "payload keys:", Object.keys(payload));
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-
-    return NextResponse.json({
-      id: data!.id,
-      score: llmAnswer.score,
-      feedback: llmAnswer.feedback,
-      meta: metaObj
-    });
-  } catch (e: any) {
-    console.error("[evaluate] fatal:", e?.stack || e?.message || e);
-    return NextResponse.json({ error: e?.message || "server error" }, { status: 500 });
-  }
+/**
+ * Små helpers til citations
+ */
+function badgeForSourceType(source_type: string | null | undefined) {
+  if (!source_type) return "";
+  if (source_type === "user_note") return "Egne noter";
+  if (source_type === "official") return "Officiel kilde";
+  if (source_type === "peer_reviewed") return "Peer-reviewed";
+  return "";
 }
 
+function buildRelationText({
+  question,
+  sourceTitle,
+}: {
+  question: string;
+  sourceTitle: string;
+}) {
+  return (
+    "Understøtter dit svar på spørgsmålet '" +
+    question +
+    "' ved at uddybe eller dokumentere '" +
+    sourceTitle +
+    "'. Du kan bruge den som reference i en mundtlig eksamen for at vise, at din forklaring bygger på faglig/autoritetbaseret viden – ikke kun din egen formulering."
+  );
+}
+
+/**
+ * POST /api/evaluate
+ *
+ * Body forventes:
+ * {
+ *   folder_id?: string,
+ *   question: string,
+ *   answer: string,
+ *   includeBackground: boolean,        // eleven vil have kilder
+ *   preferAcademicSources: boolean,    // vi gemmer bare signalet
+ *   selected_note_ids?: string[]       // (fremtid)
+ * }
+ *
+ * Response:
+ * {
+ *   ok: true,
+ *   sessionId: string | null,
+ *   score: number,
+ *   feedback: string,
+ *   citations: Array<{ title: string, url: string, badge: string, relation: string }>
+ * }
+ */
+export async function POST(req: NextRequest) {
+  const startedAt = Date.now();
+  const sb = await supabaseServerRoute();
+  const ownerId = await getOwnerId(sb);
+
+  if (!ownerId) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Mangler ownerId (hverken login eller DEV_USER_ID sat).",
+      },
+      { status: 401 }
+    );
+  }
+
+  // === Læs body ===
+  let body: any = {};
+  try {
+    body = await req.json();
+  } catch {
+    /* tom/ugyldig body */
+  }
+
+  const question = typeof body.question === "string" ? body.question : "";
+  const answer = typeof body.answer === "string" ? body.answer : "";
+  const folder_id =
+    typeof body.folder_id === "string" ? body.folder_id : undefined;
+
+  // checkbox i UI
+  const includeBackground = !!body.includeBackground;
+  // vores interne signal om at vi foretrækker seriøse kilder
+  const preferAcademicSources = !!body.preferAcademicSources;
+
+  // fremtid: valgte noter
+  const selected_note_ids = Array.isArray(body.selected_note_ids)
+    ? body.selected_note_ids.filter((x: any) => typeof x === "string")
+    : [];
+
+  if (!question || !answer) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "question/answer mangler",
+      },
+      { status: 400 }
+    );
+  }
+
+  // === 1) Scor elevens svar
+  const graded = await gradeAnswer({ question, answer });
+
+  // === 2) Retrieval fra elevens eget materiale / verified sources
+  // Normaliser returnværdi fra withAutoRanking til en array
+  let rankedRaw: any = null;
+  if (includeBackground) {
+    try {
+      const TOP_K = 6;
+      rankedRaw = await withAutoRanking(
+        sb,
+        {
+          ownerId,
+          folderId: folder_id || null,
+          question,
+          preferAcademicSources,
+        },
+        TOP_K
+      );
+    } catch (retrievalErr) {
+      console.error("withAutoRanking fejl:", retrievalErr);
+      rankedRaw = null;
+    }
+  }
+
+  let rankedArray: any[] = [];
+  if (Array.isArray(rankedRaw)) {
+    rankedArray = rankedRaw;
+  } else if (rankedRaw && Array.isArray(rankedRaw.items)) {
+    rankedArray = rankedRaw.items;
+  } else if (rankedRaw && Array.isArray(rankedRaw.chunks)) {
+    rankedArray = rankedRaw.chunks;
+  }
+
+  const topChunks = rankedArray.slice(0, 3);
+
+  // citations fra brugerens eget materiale / verified sources
+  let citations: Array<{
+    title: string;
+    url: string;
+    badge: string;
+    relation: string;
+  }> = includeBackground
+    ? topChunks.map((chunk: any) => {
+        const sourceTitle =
+          chunk.source_title ||
+          chunk.title ||
+          "Kilde (uden titel)";
+
+        const sourceUrl = chunk.source_url || chunk.url || "";
+
+        const badge = badgeForSourceType(chunk.source_type);
+
+        const relation = buildRelationText({
+          question,
+          sourceTitle,
+        });
+
+        return {
+          title: sourceTitle,
+          url: sourceUrl,
+          badge,
+          relation,
+        };
+      })
+    : [];
+
+  // === 2b) Ekstern autoritativ baggrund (AI)
+  //
+  // Dette er din “jeg vil gerne lyde som 12-tals-elev til eksamen”-funktion:
+  // Vi spørger modellen om 1-2 seriøse baggrundskilder (bog eller officiel org),
+  // med forfatter/org og evt. domæne, og en kort relationstekst.
+  //
+  if (includeBackground) {
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
+    const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+
+    if (apiKey) {
+      try {
+        const fallbackResp = await fetch(
+          "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "Du hjælper en dansk elev til mundtlig eksamen. " +
+                    "Din opgave er at foreslå 1-2 autoritative baggrundskilder, " +
+                    "der kan bruges til at underbygge elevens svar fagligt. " +
+                    "Kilderne MÅ KUN være enten:\n" +
+                    "  - en anerkendt fagbog / lærebog (giv titel og evt. forfatter(e)), ELLER\n" +
+                    "  - en officiel/seriøs institutionel kilde (fx Sundhedsstyrelsen, WHO) med et kendt domæne.\n" +
+                    "Du må IKKE opfinde DOI'er, sidetal eller tilfældige artikler. " +
+                    "Hvis du ikke er sikker på et specifikt navn, brug en generisk lærebogsreference som 'standardlærebøger i human fysiologi (fx Guyton & Hall)'. " +
+                    "Brug kun domæner du med høj sikkerhed kender, fx who.int eller sundhedsstyrelsen.dk.",
+                },
+                {
+                  role: "user",
+                  content:
+                    "Spørgsmålet eleven svarer på er:\n" +
+                    question +
+                    "\n\nElevens svar var:\n" +
+                    answer +
+                    "\n\nLav et JSON-array med 1-2 elementer. Hvert element SKAL have:\n" +
+                    '{ "title": "...", "author_or_org": "...", "url": "...", "relation": "..." }\n' +
+                    "title = bogtitel ELLER emnet/navnet på den officielle kilde.\n" +
+                    "author_or_org = hvis bog: forfatter(e). Hvis officiel kilde: navnet på organisationen (fx WHO / Sundhedsstyrelsen).\n" +
+                    'url = enten tom streng "" (hvis bog), ELLER et kort domæne-link hvis det er officiel kilde (fx \"who.int\" eller \"sundhedsstyrelsen.dk\").\n' +
+                    "relation = én kort sætning der forklarer, hvordan denne kilde underbygger elevens svar fagligt til eksamen.\n" +
+                    "Ingen ekstra tekst uden for JSON.",
+                },
+              ],
+              temperature: 0.2,
+            }),
+          }
+        );
+
+        if (fallbackResp.ok) {
+          const fallbackJson = await fallbackResp.json();
+          const raw = fallbackJson?.choices?.[0]?.message?.content ?? "[]";
+
+          let parsedList: any[] = [];
+          try {
+            parsedList = JSON.parse(raw);
+          } catch {
+            const match = raw.match(/\[[\s\S]*\]/);
+            if (match) {
+              parsedList = JSON.parse(match[0]);
+            }
+          }
+
+          // læg eksterne (AI) kilder ind i citations-listen
+          for (const ext of parsedList.slice(0, 2)) {
+            const t = (ext.title || "").trim();
+            const a = (ext.author_or_org || "").trim();
+            const u = (ext.url || "").trim();
+            const r = (ext.relation || "").trim();
+
+            // vis f.eks. "Textbook of Medical Physiology (Guyton & Hall)"
+            let displayTitle = t;
+            if (a) {
+              displayTitle = `${t} (${a})`;
+            }
+
+            const displayUrl = u; // kan være "" for bøger
+
+            // undgå at duplikere samme titel to gange
+            const already = citations.find(
+              (c) =>
+                c.title.toLowerCase().trim() ===
+                displayTitle.toLowerCase().trim()
+            );
+            if (already) continue;
+
+            citations.push({
+              title: displayTitle || "Ekstern kilde",
+              url: displayUrl,
+              badge: "Ekstern baggrund (AI)",
+              relation:
+                r ||
+                "Understøtter dine pointer med anerkendt baggrundsviden.",
+            });
+          }
+        }
+      } catch (err) {
+        console.error("AI fallback citations (ekstern baggrund) fejlede:", err);
+      }
+    }
+  }
+
+  // === 3) meta til DB
+  const metaPayload = {
+    folder_id: folder_id ?? null,
+    selected_note_ids,
+    model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
+    usedFallback: graded.usedFallback,
+    latency_ms: Date.now() - startedAt,
+
+    includeBackground,
+    preferAcademicSources,
+
+    // lille snapshot af citations (uden relation-tekst) så vi kan inspicere senere
+    citationsShort: citations.map((c) => ({
+      title: c.title,
+      badge: c.badge,
+      url: c.url,
+    })),
+  };
+
+  // === 4) Gem i exam_sessions
+  let insertedId: string | null = null;
+
+  const { data: insertData, error: insertErr } = await sb
+    .from("exam_sessions")
+    .insert([
+      {
+        owner_id: ownerId,
+        question,
+        answer,
+        feedback: graded.feedback,
+        score: graded.score,
+        meta: metaPayload,
+      },
+    ])
+    .select("id")
+    .single();
+
+  if (insertErr) {
+    console.error("Kunne ikke indsætte i exam_sessions:", insertErr);
+  } else {
+    insertedId = insertData?.id ?? null;
+  }
+
+  // === 5) Svar til klient
+  return NextResponse.json(
+    {
+      ok: true,
+      sessionId: insertedId,
+      score: graded.score,
+      feedback: graded.feedback,
+      citations, // bruges i UI under "Baggrundskilder brugt i vurderingen"
+    },
+    { status: 200 }
+  );
+}

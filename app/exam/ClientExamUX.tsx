@@ -1,210 +1,444 @@
 ﻿"use client";
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { useState } from "react";
 
-type EvalResult = {
-  ok?: boolean;
-  score?: number;
-  feedback?: string;
-  references?: { title?: string; url?: string }[];
-  error?: string;
+import { useState } from "react";
+import Link from "next/link";
+import { FeedbackPanel } from "./ui/FeedbackPanel";
+
+type FolderRow = { id: string; name: string };
+type NoteRow = { id: string; title: string | null; updated_at: string | null };
+type RecentSessionRow = { id: string; when: string; score: number | null };
+
+type Citation = {
+  title: string;
+  url?: string;
+  badge?: string;
+  relation?: string; // hvorfor er denne kilde relevant ift. svaret/eksamen
 };
 
-export default function ClientExamUX() {
-  const [question, setQuestion] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [answer, setAnswer] = useState("");
-  const [includeBackground, setIncludeBackground] = useState(true);
+export default function ClientExamUX(props: {
+  ownerId: string;
+  folderId: string;
+  folderName: string;
+  folders: FolderRow[];
+  recentNotes: NoteRow[];
+  recentSessions: RecentSessionRow[];
+  initialQuestion: string;
+  initialAnswer: string;
+  initialScore: number | null;
+  initialFeedback: string;
+}) {
+  const {
+    folderId,
+    folderName,
+    folders,
+    recentNotes,
+    recentSessions,
+    initialQuestion,
+    initialAnswer,
+    initialScore,
+    initialFeedback,
+  } = props;
+
+  // === STATE ===
+  const [question, setQuestion] = useState<string>(initialQuestion);
+  const [answer, setAnswer] = useState<string>(initialAnswer);
+  const [score, setScore] = useState<number | null>(initialScore);
+  const [feedback, setFeedback] = useState<string>(initialFeedback);
+
+  const [citations, setCitations] = useState<Citation[]>([]);
+
+  // checkbox for "eksamen mode" (baggrundslitteratur og kildehenvisninger)
+  const [withBackground, setWithBackground] = useState<boolean>(false);
+
+  // akademisk kildekvalitet er altid slået til bag kulissen
+  const preferAcademicSources = true;
+
+  // UI-status
   const [loadingGen, setLoadingGen] = useState(false);
   const [loadingEval, setLoadingEval] = useState(false);
-  const [result, setResult] = useState<EvalResult | null>(null);
+  const [savingNote, setSavingNote] = useState(false);
 
-  async function generateQuestion() {
+  const [errorMsg, setErrorMsg] = useState<string>("");
+  const [noteMsg, setNoteMsg] = useState<string>("");
+
+  // === HELPERS ===
+
+  async function handleSaveNote() {
+    try {
+      setSavingNote(true);
+      setNoteMsg("");
+      setErrorMsg("");
+
+      const shortTitleBase = question.trim().replace(/\s+/g, " ");
+      const shortTitle =
+        "Feedback: " +
+        (shortTitleBase.length > 60
+          ? shortTitleBase.slice(0, 57) + "…"
+          : shortTitleBase);
+
+      // Byg note-indholdet inkl. relationer til kilder
+      let contentBlock = `Spørgsmål:\n${question}\n\nDin besvarelse:\n${answer}\n\nFeedback:\n${feedback}\n`;
+
+      if (citations.length > 0) {
+        contentBlock += "\nKilder brugt i evalueringen:\n";
+        for (const c of citations) {
+          const badgeTxt = c.badge ? ` (${c.badge})` : "";
+          contentBlock += `- ${c.title}${badgeTxt}\n`;
+          if (c.url) {
+            contentBlock += `  ${c.url}\n`;
+          }
+          if (c.relation) {
+            contentBlock += `  Relevans til eksamen: ${c.relation}\n`;
+          }
+        }
+      }
+
+      const res = await fetch("/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: shortTitle,
+          content: contentBlock,
+          source_title: folderName || "Eksamensøvelse",
+          source_url: "/exam?folder_id=" + folderId,
+        }),
+      });
+
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`notes POST fejl: ${res.status} ${t}`);
+      }
+
+      setNoteMsg("Gemt i noter ✅");
+    } catch (err: any) {
+      console.error("Fejl ved gem som note:", err);
+      setErrorMsg("Kunne ikke gemme noten.");
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  async function handleGenerateQuestion() {
     try {
       setLoadingGen(true);
-      setResult(null);
-      const res = await fetch("/api/generate-question", { method: "POST" });
-      const data = await res.json();
+      setErrorMsg("");
+      setNoteMsg("");
+
+      const res = await fetch("/api/generate-question", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          folder_id: folderId,
+          preferAcademicSources, // altid sand internt
+        }),
+      });
+
       if (!res.ok) {
-        alert(data?.error ?? "Generering fejlede");
-        return;
+        const t = await res.text();
+        throw new Error(`generate-question fejl: ${res.status} ${t}`);
       }
-      setQuestion(data.question ?? null);
-      setSessionId(data.sessionId ?? null);
-      setAnswer("");
-    } catch (e: any) {
-      console.error(e);
-      alert(e?.message ?? "Uventet fejl ved generering");
+
+      const data = await res.json();
+
+      if (data?.question) {
+        setQuestion(data.question);
+
+        // ryd session når vi starter på et nyt spørgsmål
+        setAnswer("");
+        setScore(null);
+        setFeedback("");
+        setCitations([]);
+        setNoteMsg("");
+      } else {
+        setErrorMsg("Fik ikke noget spørgsmål tilbage fra serveren.");
+      }
+    } catch (err: any) {
+      console.error("Fejl ved generér spørgsmål:", err);
+      setErrorMsg("Kunne ikke generere nyt spørgsmål.");
     } finally {
       setLoadingGen(false);
     }
   }
 
-  async function evaluate() {
-    if (!question) {
-      alert("Der er ikke noget spørgsmål endnu.");
-      return;
-    }
+  async function handleEvaluate() {
     try {
       setLoadingEval(true);
-      const body = {
-        question,
-        answer,
-        sessionId,
-        includeReferences: includeBackground,
-        withReferences: includeBackground,
-      };
+      setErrorMsg("");
+      setNoteMsg("");
+
       const res = await fetch("/api/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          folder_id: folderId,
+          question,
+          answer,
+          includeBackground: withBackground, // brugerens valg = vis kilder til eksamen
+          preferAcademicSources,            // vores faste kvalitetsfilter
+        }),
       });
-      const data = (await res.json()) as EvalResult & { error?: string };
+
       if (!res.ok) {
-        console.error("evaluate error", data);
-        alert(data?.error ?? "Evaluering fejlede");
-        return;
+        const t = await res.text();
+        throw new Error(`evaluate fejl: ${res.status} ${t}`);
       }
-      setResult({
-        ok: true,
-        score: data.score ?? 0,
-        feedback: data.feedback ?? "",
-        references: data.references ?? [],
-      });
-    } catch (e: any) {
-      console.error(e);
-      alert(e?.message ?? "Uventet fejl ved evaluering");
+
+      const data = await res.json();
+
+      // { score, feedback, citations? }
+      if (typeof data.score === "number") {
+        setScore(data.score);
+      }
+      if (typeof data.feedback === "string") {
+        setFeedback(data.feedback);
+      }
+
+      // Hvis eleven vil have baggrund + kilder, så mapper vi citations med relation
+      if (withBackground && Array.isArray(data.citations)) {
+        setCitations(
+          data.citations.map((c: any) => ({
+            title: c.title ?? "Ukendt kilde",
+            url: c.url ?? "",
+            badge: c.badge ?? "",
+            relation:
+              c.relation ??
+              c.explainer ??
+              "", // fallback hvis backend kalder det noget andet, fx "explainer"
+          }))
+        );
+      } else {
+        setCitations([]);
+      }
+    } catch (err: any) {
+      console.error("Fejl ved evaluering:", err);
+      setErrorMsg("Kunne ikke evaluere svaret.");
     } finally {
       setLoadingEval(false);
     }
   }
 
-  function resetAnswer() {
-    setAnswer("");
-    setResult(null);
-  }
+  // === UI ===
 
   return (
-    <section style={{ display: "grid", gap: 16 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h1 style={{ fontSize: 28, fontWeight: 700 }}>Eksamensøvelse</h1>
-        <button
-          onClick={generateQuestion}
-          disabled={loadingGen}
-          style={{ border: "1px solid #cbd5e1", padding: "6px 10px", borderRadius: 6, opacity: loadingGen ? .6 : 1 }}
-        >
-          {loadingGen ? "Genererer..." : "Generér nyt spørgsmål"}
-        </button>
-      </div>
+    <div className="grid gap-6 grid-cols-[260px_1fr]">
+      {/* VENSTRE SIDEBAR */}
+      <aside className="space-y-4">
+        {/* Mapper */}
+        <section className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold mb-2 flex items-center justify-between">
+            <span>Mapper ({folders.length} stk)</span>
+          </div>
 
-      <div>
-        {question ? (
-          <p><strong>Spørgsmål:</strong> {question}</p>
-        ) : (
-          <p>Ingen aktiv opgave. Klik Generér nyt spørgsmål.</p>
-        )}
-      </div>
+          <ul className="text-sm border-t border-neutral-200 pt-2">
+            {folders.map((f) => {
+              const active = f.id === folderId;
+              return (
+                <li key={f.id} className="mb-1 last:mb-0">
+                  <Link
+                    href={`/exam?folder_id=${f.id}`}
+                    className={
+                      "block rounded px-2 py-1 hover:bg-black/5 " +
+                      (active
+                        ? "font-medium text-black bg-black/5"
+                        : "text-black/70")
+                    }
+                  >
+                    {f.name}
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
 
-      {/* --- DIT SVAR (kun én hvid boks: textarea) --- */}
-      <div style={{ padding: 0, background: "transparent" }}>
-        <label htmlFor="answerBox" style={{ display: "block", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-          Dit svar
-        </label>
-        <textarea
-          id="answerBox"
-          placeholder="Skriv dit svar her"
-          value={answer}
-          onChange={(e) => setAnswer(e.target.value)}
-          style={{
-            width: "100%",
-            minHeight: 160,
-            backgroundColor: "#ffffff",
-            color: "#000",
-            border: "1px solid #cbd5e1",
-            borderRadius: 6,
-            padding: 10,
-            resize: "vertical",
-            filter: "none",
-            WebkitAppearance: "none",
-            appearance: "none",
-          }}
-        />
-        <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <label htmlFor="bgrefs" style={{ fontSize: 14, display: "inline-flex", alignItems: "center", gap: 6 }}>
+        {/* Seneste vurderinger */}
+        <section className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold mb-2">
+            Seneste vurderinger (5)
+          </div>
+          {!recentSessions.length ? (
+            <div className="text-[13px] text-black/60">
+              Ingen evalueringer endnu for denne mappe.
+            </div>
+          ) : (
+            <ul className="divide-y divide-neutral-200 text-sm">
+              {recentSessions.map((s) => (
+                <li
+                  key={s.id}
+                  className="flex items-center justify-between py-2"
+                >
+                  <div className="text-[13px] leading-tight text-black/80">
+                    <div>{s.when}</div>
+                  </div>
+                  <div className="text-[13px] font-semibold tabular-nums">
+                    {s.score ?? "—"}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {/* Seneste noter */}
+        <section className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold mb-2">Seneste noter</div>
+          {!recentNotes.length ? (
+            <div className="text-[13px] text-black/60">
+              Ingen noter endnu.
+            </div>
+          ) : (
+            <ul className="divide-y divide-neutral-200 text-sm">
+              {recentNotes.map((n) => (
+                <li key={n.id} className="py-2 leading-tight">
+                  <div className="font-medium text-[13px] text-black/90">
+                    {n.title || "Note uden titel"}
+                  </div>
+                  {n.updated_at ? (
+                    <div className="text-[11px] text-black/50">
+                      {new Date(n.updated_at).toLocaleString("da-DK", {
+                        day: "2-digit",
+                        month: "short",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {/* Admin: opret ny mappe (placeholder) */}
+        <section className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold mb-2">
+            Mapper (administration)
+          </div>
+          <div className="text-[12px] text-black/60 mb-2">
+            Opret ny mappe (ikke aktiv endnu)
+          </div>
+          <div className="flex items-center gap-2">
             <input
-              id="bgrefs"
-              type="checkbox"
-              checked={includeBackground}
-              onChange={(e) => setIncludeBackground(e.target.checked)}
+              className="flex-1 rounded border border-neutral-300 bg-white px-2 py-1 text-[13px] leading-tight text-black"
+              placeholder="Mappe-navn"
+              disabled
             />
-            Inddrag baggrundslitteratur
-          </label>
-          <div style={{ display: "flex", gap: 8 }}>
             <button
-              onClick={evaluate}
-              disabled={loadingEval || !question}
-              style={{ border: "1px solid #cbd5e1", padding: "6px 10px", borderRadius: 6, opacity: loadingEval || !question ? .6 : 1 }}
+              className="rounded border border-neutral-300 bg-white px-2 py-1 text-[12px] leading-tight text-black/70"
+              disabled
             >
-              {loadingEval ? "Evaluerer..." : "Evaluer svar"}
+              Opret
             </button>
-            <button
-              onClick={resetAnswer}
-              style={{ border: "1px solid #cbd5e1", padding: "6px 10px", borderRadius: 6 }}
-            >
-              Ryd
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* --- FEEDBACK (én ren hvid boks) --- */}
-      {result && (
-        <section style={{ display: "grid", gap: 8 }}>
-          <h2 style={{ fontSize: 20, fontWeight: 700 }}>Feedback</h2>
-
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-            <div style={{ fontSize: 28, fontWeight: 700 }}>{typeof result.score === "number" ? result.score : ""}</div>
-            <div style={{ opacity: 0.7 }}>/ 100</div>
-          </div>
-
-          <div
-            id="feedbackBox"
-            style={{
-              backgroundColor: "#ffffff",
-              color: "#000",
-              border: "1px solid #cbd5e1",
-              borderRadius: 8,
-              padding: 12,
-              whiteSpace: "pre-wrap",
-              lineHeight: 1.5,
-              filter: "none",
-              WebkitAppearance: "none",
-              appearance: "none",
-            }}
-          >
-            {result.feedback ?? ""}
-
-            {!!(result.references && result.references.length) && (
-              <div style={{ marginTop: 10 }}>
-                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>Baggrundslitteratur</div>
-                <ul style={{ paddingLeft: 18, margin: 0 }}>
-                  {result.references!.map((r, i) => (
-                    <li key={i} style={{ wordBreak: "break-word" }}>
-                      {r.url ? (
-                        <a href={r.url} target="_blank" rel="noreferrer" style={{ textDecoration: "underline" }}>
-                          {r.title || r.url}
-                        </a>
-                      ) : (
-                        <span>{r.title ?? "Ukendt"}</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
           </div>
         </section>
-      )}
-    </section>
+      </aside>
+
+      {/* HØJRE KOLONNE */}
+      <section className="space-y-6">
+        {/* Header */}
+        <header className="flex items-start justify-between flex-wrap gap-2">
+          <div>
+            <h1 className="text-xl font-semibold leading-tight">
+              {folderName}
+            </h1>
+            <p className="text-[13px] text-black/60">
+              Lav en målrettet øvelse for at løfte niveauet i dette emne.
+            </p>
+          </div>
+
+          <div className="text-right text-[13px]">
+            <Link
+              href="/overblik"
+              className="text-black/60 hover:text-black underline"
+            >
+              ← Tilbage til Overblik
+            </Link>
+          </div>
+        </header>
+
+        {/* Spørgsmål / øvelse */}
+        <div className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm space-y-3">
+          <div className="flex items-start justify-between flex-wrap gap-2">
+            <div className="text-sm font-semibold">Spørgsmål / øvelse</div>
+
+            <button
+              onClick={handleGenerateQuestion}
+              disabled={loadingGen}
+              className="rounded border border-neutral-300 bg-white px-2 py-1 text-[12px] leading-tight text-black/80 hover:bg-black/5 disabled:opacity-50"
+            >
+              {loadingGen ? "Genererer…" : "Generér nyt spørgsmål"}
+            </button>
+          </div>
+
+          <textarea
+            className="w-full rounded border border-neutral-300 bg-white p-2 text-[14px] leading-snug text-black"
+            rows={3}
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+          />
+
+          <p className="text-[11px] text-black/40">
+            Du kan rette spørgsmålet, hvis du vil træne noget mere specifikt.
+          </p>
+        </div>
+
+        {/* Dit svar */}
+        <div className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm space-y-3">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="text-sm font-semibold flex flex-col gap-2">
+              <div className="flex items-center gap-3">
+                <span>Dit svar</span>
+                <span className="text-[12px] text-black/50 flex items-center gap-1">
+                  <span className="font-semibold text-black">
+                    {typeof score === "number" ? score : "—"}
+                  </span>
+                  <span className="text-black/50">/ 100</span>
+                </span>
+              </div>
+
+              <label className="flex items-start gap-2 text-[12px] text-black/70 leading-snug">
+                <input
+                  type="checkbox"
+                  className="accent-black mt-[2px]"
+                  checked={withBackground}
+                  onChange={(e) => setWithBackground(e.target.checked)}
+                />
+                <span>
+                  Inkludér baggrundslitteratur og kildehenvisninger i
+                  evalueringen (avanceret / til eksamen)
+                </span>
+              </label>
+            </div>
+
+            <button
+              onClick={handleEvaluate}
+              disabled={loadingEval}
+              className="h-[32px] rounded border border-neutral-300 bg-white px-2 py-1 text-[12px] leading-tight text-black/80 hover:bg-black/5 disabled:opacity-50 self-start"
+            >
+              {loadingEval ? "Evaluerer…" : "Evaluer svar"}
+            </button>
+          </div>
+
+          <textarea
+            className="w-full rounded border border-neutral-300 bg-white p-2 text-[14px] leading-snug text-black min-h-[160px]"
+            value={answer}
+            onChange={(e) => setAnswer(e.target.value)}
+            placeholder="Skriv dit svar her…"
+          />
+        </div>
+
+        {/* Feedback + kilder + gem note */}
+        <FeedbackPanel
+          feedback={feedback}
+          citations={citations}
+          withBackground={withBackground} // afgør om kildesektionen vises
+          savingNote={savingNote}
+          noteMsg={noteMsg}
+          errorMsg={errorMsg}
+          onSaveNote={handleSaveNote}
+        />
+      </section>
+    </div>
   );
 }
