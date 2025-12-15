@@ -44,18 +44,19 @@ next-env.d.ts
 *.bak
 *.bak-*
 *.backup*
-backups/
-_archive/
+/backups/
+/_archive/
 
 # supabase cli temp
-supabase/.temp/
+/supabase/.temp/
 
 # local exports
-exam-history*.csv
-exam_history*.csv
+/exam-history*.csv
+/exam_history*.csv
 
-# optional: local materials/assets (uncomment if you don't want them in git)
-# Materiale/
-# __traener.html
-# *.png
-# testdata/
+# local materials/assets (ignore by default)
+#/testdata/         # uncomment if you want to ignore entire folder
+/testdata/*.pdf
+/Materiale/
+/__traener.html
+/*.png
