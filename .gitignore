@@ -39,3 +39,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# backups / scratch
+*.bak
+*.bak-*
+*.backup*
+backups/
+_archive/
+supabase/.temp/
+exam-history*.csv
+exam_history*.csv
