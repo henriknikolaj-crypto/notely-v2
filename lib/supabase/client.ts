@@ -1,12 +1,7 @@
-"use client";
+﻿import { createBrowserClient as createBrowserClientSSR } from "@supabase/ssr";
 
-import { createBrowserClient as createSSRBrowserClient } from "@supabase/ssr";
-
-/** Client-side Supabase til brug i "use client" komponenter (login mm.) */
 export function createBrowserClient() {
-  return createSSRBrowserClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  return createBrowserClientSSR(url, anonKey);
 }
-

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 import { useEffect } from "react";
 
 export default function HashAuthBridge() {
@@ -12,3 +12,4 @@ export default function HashAuthBridge() {
   }, []);
   return null;
 }
+

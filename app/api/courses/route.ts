@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";import { CourseCreateSchema } from "@/lib/validation/courses";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";import { CourseCreateSchema } from "@/lib/validation/courses";
 export async function GET() {
   try {
     const supabase = await supabaseServerRoute();
@@ -42,6 +42,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: err.message ?? "Server error" }, { status: 500 });
   }
 }
+
+
+
 
 
 

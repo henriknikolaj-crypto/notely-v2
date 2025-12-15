@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest } from "next/server";
 import { requeueNow } from "@/lib/jobs";
 
@@ -18,4 +18,5 @@ export async function POST(req: NextRequest) {
     return new Response(e?.message ?? "error", { status: 500 });
   }
 }
+
 

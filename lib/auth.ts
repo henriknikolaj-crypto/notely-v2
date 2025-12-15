@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { supabaseServerRoute } from "@/lib/supabaseServer";
 
 export async function requireUser() {
@@ -10,4 +10,5 @@ export async function requireUser() {
   if (!dev) throw new Error("Not authenticated and no DEV_USER_ID set");
   return { id: dev };
 }
+
 

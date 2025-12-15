@@ -1,17 +1,9 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { cookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+﻿// lib/supa.ts
+import "server-only";
 
-export async function supaRls() {
-  const cookieStore = await cookies();
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        get(name: string) { return cookieStore.get(name)?.value; },
-      },
-    }
-  );
-}
+export { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+export { supabaseServerRoute } from "@/lib/supabase/server-route";
 
+// Hvis du stadig bruger disse aliaser et sted:
+export { supabaseServerRSC as supaRsc } from "@/lib/supabase/server-rsc";
+export { supabaseServerRoute as supaRls } from "@/lib/supabase/server-route";

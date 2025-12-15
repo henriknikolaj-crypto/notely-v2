@@ -1,462 +1,450 @@
-﻿import "server-only";
-import { NextRequest, NextResponse } from "next/server";
+﻿// app/api/evaluate/route.ts
+import "server-only";
+import { NextResponse } from "next/server";
+import OpenAI from "openai";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
-import { withAutoRanking } from "@/lib/retrieval/withAutoRanking";
+import { ensureQuotaAndDecrement } from "@/lib/quota";
 
-/**
- * Hent bruger-id på en robust måde.
- * 1) Prøv Supabase auth (cookie-session / rigtig login).
- * 2) Ellers fallback til DEV_USER_ID i .env.local (lokal dev).
- */
-async function getOwnerId(sb: any) {
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const MAX_TRAINER_EVALS_PER_OWNER = 50;
+
+type EvalRequest = {
+  question: string;
+  answer: string;
+  includeBackground?: boolean;
+  folder_id?: string | null;
+  note_id?: string | null;
+  /** Mapper fra venstre side / scope-tjekbokse */
+  scopeFolderIds?: string[];
+  /** Valgfrit: specifik kilde-fil til kontekst (kommer senere fra Træner-UI) */
+  file_id?: string | null;
+  fileId?: string | null;
+};
+
+type EvalJson = {
+  score?: number;
+  overall?: string;
+  strengths?: string[] | string;
+  improvements?: string[] | string;
+  next_steps?: string[] | string;
+};
+
+function ensureArray(value: string[] | string | undefined | null): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  return [value];
+}
+
+async function getOwnerId(sb: any): Promise<string | null> {
   try {
     if (sb?.auth?.getUser) {
       const { data } = await sb.auth.getUser();
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {
-    /* ignore auth errors */
+    // lokal dev → fallback
   }
   return process.env.DEV_USER_ID ?? null;
 }
 
 /**
- * gradeAnswer:
- * - Sender spørgsmål+svar til modellen.
- * - Forventer JSON med { score, feedback }.
- * - Hvis noget fejler (eller ingen OPENAI_API_KEY), bruger vi fallback.
+ * Byg kontekst til evaluering.
+ *
+ * Prioritet:
+ * 1) Hvis body.file_id/fileId → brug KUN doc_chunks fra den fil.
+ * 2) Ellers: vælg ÉN tilfældig fil i scope (seneste 5 filer i mapperne)
+ *    og brug kun dens doc_chunks.
+ * 3) Fallback: ingen kontekst → tom streng (modellen bruger kun question/answer).
  */
-async function gradeAnswer({
-  question,
-  answer,
-}: {
-  question: string;
-  answer: string;
-}): Promise<{ score: number; feedback: string; usedFallback: boolean }> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+async function buildContextForEvaluation(opts: {
+  sb: any;
+  ownerId: string;
+  body: Partial<EvalRequest>;
+  maxChars?: number;
+}): Promise<{ contextText: string; usedFileId: string | null }> {
+  const { sb, ownerId, body, maxChars = 8000 } = opts;
 
-  if (apiKey) {
-    try {
-      const chatResp = await fetch(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Du er en dansk eksaminator. Du bedømmer elevens skriftlige svar. " +
-                  "Du giver både en tal-score (0-100) og kort, konkret, pædagogisk feedback.",
-              },
-              {
-                role: "user",
-                content:
-                  "Spørgsmål:\n" +
-                  question +
-                  "\n\nElevens svar:\n" +
-                  answer +
-                  "\n\nLav JSON med præcis denne struktur:\n" +
-                  '{ "score": <tal 0-100>, "feedback": "2-4 korte sætninger med forbedringsforslag på dansk" }',
-              },
-            ],
-            temperature: 0.2,
-          }),
-        }
-      );
+  type ChunkRow = {
+    id: string;
+    content: string | null;
+    file_id: string | null;
+    folder_id: string | null;
+    created_at?: string | null;
+  };
 
-      if (!chatResp.ok) {
-        const t = await chatResp.text();
-        throw new Error(
-          `chat.completions fejlede (${chatResp.status}): ${t ?? "(ingen body)"}`
-        );
-      }
+  type FileRow = {
+    id: string;
+    name: string | null;
+    original_name: string | null;
+    folder_id: string | null;
+    created_at?: string | null;
+  };
 
-      const chatJson = (await chatResp.json()) as any;
-      const rawText =
-        chatJson?.choices?.[0]?.message?.content ??
-        JSON.stringify(chatJson, null, 2);
+  const fileRaw = (body.file_id ?? body.fileId) as string | null | undefined;
+  const explicitFileId =
+    typeof fileRaw === "string" && fileRaw.trim().length > 0
+      ? fileRaw.trim()
+      : null;
 
-      let parsed: any = {};
-      try {
-        parsed = JSON.parse(rawText);
-      } catch {
-        // fallback: prøv at fiske første {...} objekt ud af teksten
-        const match = rawText.match(/\{[\s\S]*\}/);
-        if (match) {
-          parsed = JSON.parse(match[0]);
-        }
-      }
+  // Scope-mapper (fra venstre kolonne)
+  const scopeFolderIds: string[] = Array.isArray(body.scopeFolderIds)
+    ? body.scopeFolderIds.filter(
+        (x): x is string => typeof x === "string" && x.trim().length > 0,
+      )
+    : [];
 
-      const scoreNum = Number(parsed.score);
-      const fbText =
-        typeof parsed.feedback === "string"
-          ? parsed.feedback
-          : "Kunne ikke udtrække feedback.";
+  const fallbackFolder =
+    typeof body.folder_id === "string" && body.folder_id.trim().length > 0
+      ? body.folder_id.trim()
+      : null;
 
-      if (!Number.isNaN(scoreNum) && fbText) {
-        return {
-          score: Math.max(0, Math.min(100, Math.round(scoreNum))),
-          feedback: fbText,
-          usedFallback: false,
-        };
-      }
+  const effectiveFolderIds: string[] =
+    scopeFolderIds.length > 0
+      ? scopeFolderIds
+      : fallbackFolder
+      ? [fallbackFolder]
+      : [];
 
-      throw new Error(
-        "Kunne ikke parse chat.completions-output til JSON med {score, feedback}."
-      );
-    } catch (err) {
-      console.error("OpenAI chat.completions-fejl:", err);
-      // falder igennem til fallback nedenfor
+  // Lille helper til at samle tekst fra en konkret fil
+  async function buildFromFileId(fileId: string): Promise<string> {
+    const { data: chunks, error } = await sb
+      .from("doc_chunks")
+      .select("id, content, file_id, folder_id, created_at")
+      .eq("owner_id", ownerId)
+      .eq("file_id", fileId)
+      .order("created_at", { ascending: true })
+      .limit(80);
+
+    if (error) {
+      console.error("[EVALUATE] doc_chunks error (file):", error);
+      return "";
     }
+
+    const rows: ChunkRow[] = (chunks ?? []) as ChunkRow[];
+    if (!rows.length) return "";
+
+    let text = rows
+      .map((r) => r.content ?? "")
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    if (text.length > maxChars) text = text.slice(0, maxChars);
+    return text;
   }
 
-  // Lokal fallback (hvis vi ikke kunne kalde modellen eller parse svaret)
-  const defaultScore = 62;
-  const defaultFb =
-    "Foreløbig vurdering: Du er på et stabilt udgangspunkt. " +
-    "Prøv at være mere præcis i dine forklaringer og brug konkrete begreber. " +
-    "Fokuser især på at binde dine pointer tydeligt til spørgsmålet.";
+  // 1) Hvis vi har en eksplicit file_id → brug den
+  if (explicitFileId) {
+    const text = await buildFromFileId(explicitFileId);
+    return { contextText: text, usedFileId: explicitFileId };
+  }
 
-  return {
-    score: defaultScore,
-    feedback: defaultFb,
-    usedFallback: true,
-  };
-}
+  // 2) Ellers: find filer i scope, vælg én tilfældig blandt de seneste 5
+  let filesQuery = sb
+    .from("files")
+    .select("id, name, original_name, folder_id, created_at")
+    .eq("owner_id", ownerId);
 
-/**
- * Små helpers til citations
- */
-function badgeForSourceType(source_type: string | null | undefined) {
-  if (!source_type) return "";
-  if (source_type === "user_note") return "Egne noter";
-  if (source_type === "official") return "Officiel kilde";
-  if (source_type === "peer_reviewed") return "Peer-reviewed";
-  return "";
-}
+  if (effectiveFolderIds.length > 0) {
+    filesQuery = filesQuery.in("folder_id", effectiveFolderIds);
+  }
 
-function buildRelationText({
-  question,
-  sourceTitle,
-}: {
-  question: string;
-  sourceTitle: string;
-}) {
-  return (
-    "Understøtter dit svar på spørgsmålet '" +
-    question +
-    "' ved at uddybe eller dokumentere '" +
-    sourceTitle +
-    "'. Du kan bruge den som reference i en mundtlig eksamen for at vise, at din forklaring bygger på faglig/autoritetbaseret viden – ikke kun din egen formulering."
+  const { data: fileRows, error: filesError } = await filesQuery.order(
+    "created_at",
+    { ascending: false },
   );
+
+  if (filesError) {
+    console.error("[EVALUATE] files error:", filesError);
+  }
+
+  let filesInScope: FileRow[] = (fileRows ?? []) as FileRow[];
+
+  // Fallback: ingen filer i scope → kig globalt på brugerens filer
+  if (!filesInScope.length) {
+    const { data: allFiles, error: allFilesErr } = await sb
+      .from("files")
+      .select("id, name, original_name, folder_id, created_at")
+      .eq("owner_id", ownerId)
+      .order("created_at", { ascending: false });
+
+    if (allFilesErr) {
+      console.error("[EVALUATE] global files error:", allFilesErr);
+    }
+    filesInScope = (allFiles ?? []) as FileRow[];
+  }
+
+  if (!filesInScope.length) {
+    return { contextText: "", usedFileId: null };
+  }
+
+  const recentFiles = filesInScope.slice(
+    0,
+    Math.min(filesInScope.length, 5),
+  );
+  const idx = Math.floor(Math.random() * recentFiles.length);
+  const chosenFile = recentFiles[idx];
+
+  console.log("[EVALUATE] chosen file for context:", {
+    chosenFileId: chosenFile.id,
+    totalFilesInScope: filesInScope.length,
+  });
+
+  const text = await buildFromFileId(chosenFile.id);
+  return { contextText: text, usedFileId: chosenFile.id };
 }
 
-/**
- * POST /api/evaluate
- *
- * Body forventes:
- * {
- *   folder_id?: string,
- *   question: string,
- *   answer: string,
- *   includeBackground: boolean,        // eleven vil have kilder
- *   preferAcademicSources: boolean,    // vi gemmer bare signalet
- *   selected_note_ids?: string[]       // (fremtid)
- * }
- *
- * Response:
- * {
- *   ok: true,
- *   sessionId: string | null,
- *   score: number,
- *   feedback: string,
- *   citations: Array<{ title: string, url: string, badge: string, relation: string }>
- * }
- */
-export async function POST(req: NextRequest) {
-  const startedAt = Date.now();
-  const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Mangler ownerId (hverken login eller DEV_USER_ID sat).",
-      },
-      { status: 401 }
-    );
-  }
-
-  // === Læs body ===
-  let body: any = {};
+export async function POST(req: Request) {
   try {
-    body = await req.json();
-  } catch {
-    /* tom/ugyldig body */
-  }
+    const body = (await req.json()) as Partial<EvalRequest>;
 
-  const question = typeof body.question === "string" ? body.question : "";
-  const answer = typeof body.answer === "string" ? body.answer : "";
-  const folder_id =
-    typeof body.folder_id === "string" ? body.folder_id : undefined;
+    const question = (body.question ?? "").trim();
+    const answer = (body.answer ?? "").trim();
 
-  // checkbox i UI
-  const includeBackground = !!body.includeBackground;
-  // vores interne signal om at vi foretrækker seriøse kilder
-  const preferAcademicSources = !!body.preferAcademicSources;
-
-  // fremtid: valgte noter
-  const selected_note_ids = Array.isArray(body.selected_note_ids)
-    ? body.selected_note_ids.filter((x: any) => typeof x === "string")
-    : [];
-
-  if (!question || !answer) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "question/answer mangler",
-      },
-      { status: 400 }
-    );
-  }
-
-  // === 1) Scor elevens svar
-  const graded = await gradeAnswer({ question, answer });
-
-  // === 2) Retrieval fra elevens eget materiale / verified sources
-  // Normaliser returnværdi fra withAutoRanking til en array
-  let rankedRaw: any = null;
-  if (includeBackground) {
-    try {
-      const TOP_K = 6;
-      rankedRaw = await withAutoRanking(
-        sb,
-        {
-          ownerId,
-          folderId: folder_id || null,
-          question,
-          preferAcademicSources,
-        },
-        TOP_K
+    if (!question || !answer) {
+      return NextResponse.json(
+        { error: "Mangler question eller answer" },
+        { status: 400 },
       );
-    } catch (retrievalErr) {
-      console.error("withAutoRanking fejl:", retrievalErr);
-      rankedRaw = null;
     }
-  }
 
-  let rankedArray: any[] = [];
-  if (Array.isArray(rankedRaw)) {
-    rankedArray = rankedRaw;
-  } else if (rankedRaw && Array.isArray(rankedRaw.items)) {
-    rankedArray = rankedRaw.items;
-  } else if (rankedRaw && Array.isArray(rankedRaw.chunks)) {
-    rankedArray = rankedRaw.chunks;
-  }
+    const includeBackground = !!body.includeBackground;
 
-  const topChunks = rankedArray.slice(0, 3);
+    // Supabase + owner_id (bruges både til context og til exam_sessions)
+    const sb = await supabaseServerRoute();
+    const ownerId = await getOwnerId(sb);
 
-  // citations fra brugerens eget materiale / verified sources
-  let citations: Array<{
-    title: string;
-    url: string;
-    badge: string;
-    relation: string;
-  }> = includeBackground
-    ? topChunks.map((chunk: any) => {
-        const sourceTitle =
-          chunk.source_title ||
-          chunk.title ||
-          "Kilde (uden titel)";
+    // 1) Quota-check for EVALUATE
+    if (ownerId) {
+      const cost = 1; // 1 "evaluering" pr. kald
+      const quota = await ensureQuotaAndDecrement(ownerId, "evaluate", cost);
 
-        const sourceUrl = chunk.source_url || chunk.url || "";
-
-        const badge = badgeForSourceType(chunk.source_type);
-
-        const relation = buildRelationText({
-          question,
-          sourceTitle,
-        });
-
-        return {
-          title: sourceTitle,
-          url: sourceUrl,
-          badge,
-          relation,
-        };
-      })
-    : [];
-
-  // === 2b) Ekstern autoritativ baggrund (AI)
-  //
-  // Dette er din “jeg vil gerne lyde som 12-tals-elev til eksamen”-funktion:
-  // Vi spørger modellen om 1-2 seriøse baggrundskilder (bog eller officiel org),
-  // med forfatter/org og evt. domæne, og en kort relationstekst.
-  //
-  if (includeBackground) {
-    const apiKey = process.env.OPENAI_API_KEY?.trim();
-    const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
-
-    if (apiKey) {
-      try {
-        const fallbackResp = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model,
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "Du hjælper en dansk elev til mundtlig eksamen. " +
-                    "Din opgave er at foreslå 1-2 autoritative baggrundskilder, " +
-                    "der kan bruges til at underbygge elevens svar fagligt. " +
-                    "Kilderne MÅ KUN være enten:\n" +
-                    "  - en anerkendt fagbog / lærebog (giv titel og evt. forfatter(e)), ELLER\n" +
-                    "  - en officiel/seriøs institutionel kilde (fx Sundhedsstyrelsen, WHO) med et kendt domæne.\n" +
-                    "Du må IKKE opfinde DOI'er, sidetal eller tilfældige artikler. " +
-                    "Hvis du ikke er sikker på et specifikt navn, brug en generisk lærebogsreference som 'standardlærebøger i human fysiologi (fx Guyton & Hall)'. " +
-                    "Brug kun domæner du med høj sikkerhed kender, fx who.int eller sundhedsstyrelsen.dk.",
-                },
-                {
-                  role: "user",
-                  content:
-                    "Spørgsmålet eleven svarer på er:\n" +
-                    question +
-                    "\n\nElevens svar var:\n" +
-                    answer +
-                    "\n\nLav et JSON-array med 1-2 elementer. Hvert element SKAL have:\n" +
-                    '{ "title": "...", "author_or_org": "...", "url": "...", "relation": "..." }\n' +
-                    "title = bogtitel ELLER emnet/navnet på den officielle kilde.\n" +
-                    "author_or_org = hvis bog: forfatter(e). Hvis officiel kilde: navnet på organisationen (fx WHO / Sundhedsstyrelsen).\n" +
-                    'url = enten tom streng "" (hvis bog), ELLER et kort domæne-link hvis det er officiel kilde (fx \"who.int\" eller \"sundhedsstyrelsen.dk\").\n' +
-                    "relation = én kort sætning der forklarer, hvordan denne kilde underbygger elevens svar fagligt til eksamen.\n" +
-                    "Ingen ekstra tekst uden for JSON.",
-                },
-              ],
-              temperature: 0.2,
-            }),
-          }
+      if (!quota.ok) {
+        console.warn("[/api/evaluate] quota exceeded:", quota.message);
+        return NextResponse.json(
+          { error: quota.message, feature: "evaluate" },
+          { status: quota.status },
         );
+      }
 
-        if (fallbackResp.ok) {
-          const fallbackJson = await fallbackResp.json();
-          const raw = fallbackJson?.choices?.[0]?.message?.content ?? "[]";
+      console.log(
+        "[/api/evaluate] quota OK for owner",
+        ownerId,
+        "remaining approx:",
+        quota.remaining,
+      );
+    } else {
+      console.warn(
+        "[/api/evaluate] ingen ownerId – springer quota-check over (dev-only).",
+      );
+    }
 
-          let parsedList: any[] = [];
-          try {
-            parsedList = JSON.parse(raw);
-          } catch {
-            const match = raw.match(/\[[\s\S]*\]/);
-            if (match) {
-              parsedList = JSON.parse(match[0]);
-            }
-          }
+    // 2) Byg kontekst ud fra én fil i scope, hvis includeBackground = true
+    let contextText = "";
+    let usedFileId: string | null = null;
 
-          // læg eksterne (AI) kilder ind i citations-listen
-          for (const ext of parsedList.slice(0, 2)) {
-            const t = (ext.title || "").trim();
-            const a = (ext.author_or_org || "").trim();
-            const u = (ext.url || "").trim();
-            const r = (ext.relation || "").trim();
-
-            // vis f.eks. "Textbook of Medical Physiology (Guyton & Hall)"
-            let displayTitle = t;
-            if (a) {
-              displayTitle = `${t} (${a})`;
-            }
-
-            const displayUrl = u; // kan være "" for bøger
-
-            // undgå at duplikere samme titel to gange
-            const already = citations.find(
-              (c) =>
-                c.title.toLowerCase().trim() ===
-                displayTitle.toLowerCase().trim()
-            );
-            if (already) continue;
-
-            citations.push({
-              title: displayTitle || "Ekstern kilde",
-              url: displayUrl,
-              badge: "Ekstern baggrund (AI)",
-              relation:
-                r ||
-                "Understøtter dine pointer med anerkendt baggrundsviden.",
-            });
-          }
-        }
+    if (includeBackground && ownerId) {
+      try {
+        const ctx = await buildContextForEvaluation({
+          sb,
+          ownerId,
+          body,
+          maxChars: 8000,
+        });
+        contextText = ctx.contextText;
+        usedFileId = ctx.usedFileId;
       } catch (err) {
-        console.error("AI fallback citations (ekstern baggrund) fejlede:", err);
+        console.error("EVALUATE: fejl ved hentning af doc_chunks:", err);
       }
     }
-  }
 
-  // === 3) meta til DB
-  const metaPayload = {
-    folder_id: folder_id ?? null,
-    selected_note_ids,
-    model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
-    usedFallback: graded.usedFallback,
-    latency_ms: Date.now() - startedAt,
+    // 3) LLM-kald – eksplicit “pensum-smart” prompt
+    const model = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 
-    includeBackground,
-    preferAcademicSources,
+    const systemPrompt = `
+Du er dansk eksamenscensor.
 
-    // lille snapshot af citations (uden relation-tekst) så vi kan inspicere senere
-    citationsShort: citations.map((c) => ({
-      title: c.title,
-      badge: c.badge,
-      url: c.url,
-    })),
-  };
+Du får:
+- et eksamensspørgsmål ("question"),
+- et elevsvar ("answer"),
+- og evt. baggrundsmateriale ("context") fra elevens eget pensum.
 
-  // === 4) Gem i exam_sessions
-  let insertedId: string | null = null;
+“context” er uddrag (doc_chunks) fra elevens noter/pensum inden for det valgte emne.
+Du skal så vidt muligt bedømme svaret i forhold til dette materiale:
+- Identificér de vigtigste pointer, begreber og eksempler i context.
+- Vurder hvor godt elevens svar dækker disse pointer.
+- Vær eksplicit omkring vigtige begreber fra pensum, som eleven bruger godt eller mangler.
 
-  const { data: insertData, error: insertErr } = await sb
-    .from("exam_sessions")
-    .insert([
-      {
+Du skal:
+- give en score i procent (0–100) – 100% betyder at svaret dækker de centrale pointer fra context meget sikkert og præcist.
+- give kort, præcis feedback på dansk.
+
+Du SKAL svare som gyldigt JSON med PRÆCIS disse felter:
+
+{
+  "score": number,
+  "overall": string,
+  "strengths": string[],
+  "improvements": string[],
+  "next_steps": string[]
+}
+
+Alle arrays SKAL indeholde mindst ét element.
+Ingen forklarende tekst uden for JSON-objektet.
+    `.trim();
+
+    const userPayload = {
+      question,
+      answer,
+      // kan være tom streng – modellen skal stadig håndtere det
+      context: contextText,
+    };
+
+    const completion = await openai.chat.completions.create({
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        {
+          role: "user",
+          content: JSON.stringify(userPayload),
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+
+    let parsed: EvalJson;
+    try {
+      parsed = JSON.parse(raw) as EvalJson;
+    } catch (e) {
+      console.error("EVALUATE: JSON-parse fejl på raw:", raw, e);
+      parsed = {};
+    }
+
+    const scoreRaw =
+      typeof parsed.score === "number" ? parsed.score : Number(parsed.score);
+    const score = Number.isFinite(scoreRaw)
+      ? Math.max(0, Math.min(100, Math.round(scoreRaw)))
+      : 0;
+
+    const overall =
+      (parsed.overall &&
+        String(parsed.overall).trim().replace(/\s+/g, " ")) ||
+      "Overordnet et fint, men kort svar.";
+
+    const strengths = ensureArray(parsed.strengths);
+    const improvements = ensureArray(parsed.improvements);
+    const nextSteps = ensureArray(parsed.next_steps);
+
+    const feedbackLines: string[] = [
+      `Samlet vurdering: ${overall}`,
+      "",
+      "Styrker:",
+      ...(strengths.length
+        ? strengths.map((s) => `- ${s}`)
+        : ["- Ingen særlige styrker fremhævet."]),
+      "",
+      "Det kan forbedres:",
+      ...(improvements.length
+        ? improvements.map((s) => `- ${s}`)
+        : ["- Ingen konkrete forbedringspunkter angivet."]),
+      "",
+      "Forslag til næste skridt:",
+      ...(nextSteps.length
+        ? nextSteps.map((s) => `- ${s}`)
+        : ["- Arbejd videre med at uddybe og eksemplificere dine pointer."]),
+    ];
+
+    const feedbackText = feedbackLines.join("\n");
+
+    // 4) GEM I exam_sessions
+    if (!ownerId) {
+      console.warn(
+        "EVALUATE: mangler ownerId – gemmer ikke i exam_sessions (men returnerer svar).",
+      );
+    } else {
+      const { folder_id, note_id, scopeFolderIds } = body;
+
+      const insertPayload = {
         owner_id: ownerId,
         question,
         answer,
-        feedback: graded.feedback,
-        score: graded.score,
-        meta: metaPayload,
-      },
-    ])
-    .select("id")
-    .single();
+        feedback: feedbackText,
+        score,
+        folder_id: folder_id ?? null,
+        source_type: "trainer" as const,
+        meta: {
+          includeBackground,
+          scopeFolderIds: scopeFolderIds ?? [],
+          note_id: note_id ?? null,
+          file_id: usedFileId,
+          // lille snippet til debug/overblik – ikke hele konteksten
+          contextPreview: contextText ? contextText.slice(0, 400) : null,
+        },
+      };
 
-  if (insertErr) {
-    console.error("Kunne ikke indsætte i exam_sessions:", insertErr);
-  } else {
-    insertedId = insertData?.id ?? null;
+      const { error: insertError } = await sb
+        .from("exam_sessions")
+        .insert(insertPayload);
+
+      if (insertError) {
+        console.error("EVALUATE: insert i exam_sessions fejl:", insertError);
+      } else {
+        // AUTOPRUNE: behold kun de seneste 50 Træner-evalueringer pr. bruger
+        try {
+          const { data: evalRows, error: fetchError } = await sb
+            .from("exam_sessions")
+            .select("id, created_at")
+            .eq("owner_id", ownerId)
+            .eq("source_type", "trainer")
+            .order("created_at", { ascending: false });
+
+          if (fetchError) {
+            console.error("EVALUATE: cleanup fetch fejl:", fetchError);
+          } else if (
+            evalRows &&
+            evalRows.length > MAX_TRAINER_EVALS_PER_OWNER
+          ) {
+            const idsToDelete = (evalRows as any[])
+              .slice(MAX_TRAINER_EVALS_PER_OWNER)
+              .map((row) => row.id);
+
+            if (idsToDelete.length > 0) {
+              const { error: delError } = await sb
+                .from("exam_sessions")
+                .delete()
+                .eq("owner_id", ownerId)
+                .in("id", idsToDelete);
+
+              if (delError) {
+                console.error("EVALUATE: cleanup delete fejl:", delError);
+              }
+            }
+          }
+        } catch (cleanupErr) {
+          console.error("EVALUATE: cleanup unhandled fejl:", cleanupErr);
+        }
+      }
+    }
+
+    return NextResponse.json({
+      score,
+      feedback: feedbackText,
+    });
+  } catch (err) {
+    console.error("EVALUATE /api/evaluate error:", err);
+    return NextResponse.json(
+      { error: "Intern fejl i evalueringen" },
+      { status: 500 },
+    );
   }
-
-  // === 5) Svar til klient
-  return NextResponse.json(
-    {
-      ok: true,
-      sessionId: insertedId,
-      score: graded.score,
-      feedback: graded.feedback,
-      citations, // bruges i UI under "Baggrundskilder brugt i vurderingen"
-    },
-    { status: 200 }
-  );
 }

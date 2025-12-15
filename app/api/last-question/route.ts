@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/app/(lib)/requireUser";
@@ -35,4 +35,5 @@ export async function GET() {
     return NextResponse.json({ question: null });
   }
 }
+
 

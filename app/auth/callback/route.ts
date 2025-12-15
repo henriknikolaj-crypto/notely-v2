@@ -1,13 +1,14 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server"
-import { supabaseServerRoute } from "@/lib/supabase/server"
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc"
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const code = searchParams.get("code")
-  const next = searchParams.get("next") || "/exam"
+  const next = searchParams.get("next") || "/overblik";
 
-  const supabase = await supabaseServerRoute()
+
+  const supabase = await supabaseServerRSC()
 
   if (code) {
     const { error } = await supabase.auth.exchangeCodeForSession(code)
@@ -19,4 +20,8 @@ export async function GET(request: Request) {
 
   return NextResponse.redirect(new URL(next, request.url))
 }
+
+
+
+
 

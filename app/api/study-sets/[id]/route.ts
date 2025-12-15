@@ -1,5 +1,5 @@
 ﻿import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { supaRls } from "@/lib/supa";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -31,3 +31,4 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
 
   return NextResponse.json({ set, items: items ?? [] });
 }
+

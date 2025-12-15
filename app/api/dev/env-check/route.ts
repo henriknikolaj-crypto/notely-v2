@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 export async function GET() {
   return Response.json({
     DEV_USER_ID: process.env.DEV_USER_ID ?? null,
@@ -6,4 +6,5 @@ export async function GET() {
     HAS_SECRET: !!process.env.IMPORT_SHARED_SECRET
   });
 }
+
 

@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 export const runtime = 'edge';
 import { NextResponse } from "next/server";
 
@@ -14,4 +14,5 @@ export async function GET() {
     return NextResponse.json({ ok:false, name:e?.name, message:e?.message, stack:e?.stack }, { status: 500 });
   }
 }
+
 

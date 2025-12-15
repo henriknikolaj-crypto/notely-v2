@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export async function GET(req: Request) {
   try {
@@ -39,5 +39,8 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok:false, error: err.message ?? "Server error" }, { status:500 });
   }
 }
+
+
+
 
 

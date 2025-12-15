@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from "next/server";
 
 export async function GET() {
@@ -13,4 +13,5 @@ export async function GET() {
     return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
   }
 }
+
 

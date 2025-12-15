@@ -1,4 +1,4 @@
-import { z } from "zod";
+﻿import { z } from "zod";
 
 export const GenQResponse = z.object({
   question: z.string(),
@@ -17,4 +17,6 @@ export const EvaluateResponse = z.object({
   model: z.string(),
 });
 export type EvaluateResponseT = z.infer<typeof EvaluateResponse>;
+
+
 

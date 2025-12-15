@@ -1,24 +1,38 @@
-﻿import "./globals.css";
+﻿// app/layout.tsx
 import type { Metadata } from "next";
-import ServerHeader from "./components/Header";
+import "./globals.css";
+import { Inter, Birthstone } from "next/font/google";
+import { Toaster } from "sonner";
+
 export const metadata: Metadata = {
-  title: "Notely",
+  title: "Notely.",
+  description: "Studieassistent / Eksamens­træner",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+const inter = Inter({
+  subsets: ["latin"],
+  display: "swap",
+});
+
+const logo = Birthstone({
+  subsets: ["latin"],
+  weight: "400",
+  variable: "--font-logo",
+});
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="da">
-      <body className="min-h-screen bg-[#fffef9] text-neutral-900">
-        {/* Header */}
-        <ServerHeader />
-        <main className="mx-auto max-w-5xl px-4 py-8">{children}</main>
+      <body
+        className={`${inter.className} ${logo.variable} min-h-screen bg-[#fffef9] text-zinc-900 antialiased selection:bg-black selection:text-white`}
+      >
+        {children}
+        <Toaster position="top-right" richColors />
       </body>
     </html>
   );
 }
-
-
-
-
-
-

@@ -1,36 +1,80 @@
-﻿import { supabaseServerRSC } from "@/lib/supabase/server";
+﻿// app/courses/[id]/page.tsx
+import "server-only";
+
 import Link from "next/link";
-import EditCourseForm from "./_EditCourseForm";
-import { redirect } from "next/navigation";
+import { notFound } from "next/navigation";
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
-export default async function CourseDetailPage({ params }: { params: { id: string } }) {
-  const supabase = await supabaseServerRSC();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) redirect("/auth/login");
+export const dynamic = "force-dynamic";
 
-  const { data, error } = await supabase
-    .from("courses")
-    .select("id, title, description, created_at")
-    .eq("id", params.id)
-    .eq("owner_id", user.id)
-    .single();
+type PageProps = {
+  params: Promise<{ id: string }>;
+};
 
-  if (error || !data) {
+async function getOwnerId(sb: any): Promise<string | null> {
+  try {
+    if (sb?.auth?.getUser) {
+      const { data } = await sb.auth.getUser();
+      if (data?.user?.id) return data.user.id as string;
+    }
+  } catch {}
+
+  const dev = (process.env.DEV_USER_ID ?? "").trim();
+  if (process.env.NODE_ENV !== "production" && dev) return dev;
+
+  return null;
+}
+
+export default async function CoursePage({ params }: PageProps) {
+  const { id } = await params;
+
+  const sb = await supabaseServerRSC();
+  const ownerId = await getOwnerId(sb);
+
+  if (!ownerId) {
     return (
-      <div className="p-6">
-        <p className="text-red-600">Kurset blev ikke fundet.</p>
-        <Link className="underline" href="/courses">Tilbage</Link>
-      </div>
+      <main className="min-h-screen bg-[#fffef9] p-6 text-sm text-red-600">
+        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+      </main>
     );
   }
 
+  const { data: course, error } = await sb
+    .from("courses")
+    .select("id, owner_id, title, description, created_at")
+    .eq("id", id)
+    .eq("owner_id", ownerId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[courses/[id]] load error:", error);
+  }
+
+  if (!course) notFound();
+
   return (
-    <div className="p-6 max-w-2xl">
-      <div className="mb-4"><Link className="underline" href="/courses">← Tilbage til kurser</Link></div>
-      <h1 className="text-2xl font-semibold mb-2">Rediger kursus</h1>
-      <p className="text-sm text-gray-500 mb-6">Oprettet: {new Date(data.created_at).toLocaleString()}</p>
-      <EditCourseForm course={data} />
-    </div>
+    <main className="min-h-screen bg-[#fffef9]">
+      <div className="mx-auto max-w-3xl space-y-4 px-4 py-6 md:px-6">
+        <div className="flex items-center justify-between">
+          <Link
+            href="/courses"
+            className="text-sm font-medium text-zinc-700 hover:underline"
+          >
+            ← Tilbage
+          </Link>
+        </div>
+
+        <section className="rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm">
+          <h1 className="text-lg font-semibold text-zinc-900">
+            {course.title ?? "Kursus"}
+          </h1>
+          {course.description ? (
+            <p className="mt-2 text-sm text-zinc-700">{course.description}</p>
+          ) : (
+            <p className="mt-2 text-sm text-zinc-500">Ingen beskrivelse.</p>
+          )}
+        </section>
+      </div>
+    </main>
   );
 }
-

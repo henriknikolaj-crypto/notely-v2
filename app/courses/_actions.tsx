@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
@@ -64,3 +64,4 @@ export function DeleteCourseBtn({ id }: { id: string }) {
   }
   return <Button onClick={del} disabled={isPending}>{isPending ? "Sletter…" : "Slet"}</Button>;
 }
+

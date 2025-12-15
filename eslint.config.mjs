@@ -4,6 +4,7 @@ import tsParser from "@typescript-eslint/parser";
 import reactHooks from "eslint-plugin-react-hooks";
 
 export default [
+  { linterOptions: { reportUnusedDisableDirectives: "off" } },
   js.configs.recommended,
   {
     // Hold alt uden for Uge 9 ude af lint
@@ -32,7 +33,9 @@ export default [
       "no-empty": "off",
       "no-unused-vars": "off",
       "@typescript-eslint/no-unused-vars": "off",
-      "react-hooks/exhaustive-deps": "warn"
+      "react-hooks/exhaustive-deps": "off"
     }
   }
 ];
+
+

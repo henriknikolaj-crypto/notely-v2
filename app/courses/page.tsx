@@ -1,5 +1,5 @@
 ﻿import PageShell from "@/app/_ui/PageShell";
-import { getSupabaseServer } from "@/lib/supabase/server";
+import { getSupabaseServer } from "@/lib/supabase/server-rsc";
 import { NewCourseForm, DeleteCourseBtn } from "./_actions";
 import Link from "next/link";
 
@@ -52,6 +52,10 @@ export default async function CoursesPage() {
     </PageShell>
   );
 }
+
+
+
+
 
 
 

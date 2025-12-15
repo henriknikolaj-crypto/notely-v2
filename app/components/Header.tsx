@@ -1,6 +1,6 @@
 ﻿import Link from "next/link";
 import HeaderClient from "./HeaderClient";
-import { getSupabaseServer } from "@/lib/supabase/server";
+import { getSupabaseServer } from "@/lib/supabase/server-rsc";
 
 export default async function ServerHeader() {
   const supabase = await getSupabaseServer();
@@ -34,5 +34,9 @@ export default async function ServerHeader() {
     </HeaderClient>
   );
 }
+
+
+
+
 
 

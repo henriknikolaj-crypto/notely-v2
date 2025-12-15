@@ -1,8 +1,8 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿import { NextResponse } from "next/server";
+
 export async function GET() {
-  return new Response(JSON.stringify({ ok: true, route: "ping" }), {
-    headers: { "content-type": "application/json" },
+  return NextResponse.json({
+    ok: true,
+    ts: new Date().toISOString(),
   });
 }
-
-

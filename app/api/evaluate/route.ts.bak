@@ -1,0 +1,249 @@
+﻿import { NextResponse } from "next/server";
+import { cookies as nextCookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
+import { withAutoRanking } from "@/lib/retrieval/withAutoRanking";
+
+/** Debug */
+const DEBUG_RETRIEVAL = process.env.DEBUG_RETRIEVAL === "1";
+const seenRetrievalWarns = new Set<string>();
+
+/** Dev-bypass via x-shared-secret (samme som i generate-question) */
+async function getDevUserId(req: Request): Promise<string | null> {
+  if (process.env.NODE_ENV === "production") return null;
+  try {
+    const secret = req.headers.get("x-shared-secret") ?? req.headers.get("x-dev-secret");
+    if (secret && secret === process.env.IMPORT_SHARED_SECRET) {
+      return process.env.DEV_USER_ID ?? null;
+    }
+  } catch {}
+  return null;
+}
+
+/** Brugerens "vil have referencer?"-toggle */
+function wantsReferencesFromBody(body: any) {
+  const vals = [
+    body?.includeBackground,
+    body?.includeReferences,
+    body?.withReferences,
+    body?.withBackground,
+  ];
+  return vals.some((v) =>
+    typeof v === "string"
+      ? v.toLowerCase() === "true" || v === "on" || v === "1"
+      : v === true
+  );
+}
+
+async function safe(q: any) {
+  try {
+    const { data, error } = await q;
+    if (error) {
+      if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(error.message)) {
+        console.warn(`[retrieval] error: ${error.message}`);
+        seenRetrievalWarns.add(error.message);
+      }
+      return [];
+    }
+    return data ?? [];
+  } catch (e: any) {
+    const msg = `[retrieval] unexpected: ${e?.message ?? e}`;
+    if (DEBUG_RETRIEVAL && !seenRetrievalWarns.has(msg)) {
+      console.warn(msg);
+      seenRetrievalWarns.add(msg);
+    }
+    return [];
+  }
+}
+
+async function getColumns(supabase: any, table: string): Promise<string[]> {
+  try {
+    const { data, error } = await supabase.from(table).select("*").limit(1);
+    if (error) return [];
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return [];
+    return Object.keys(row);
+  } catch {
+    return [];
+  }
+}
+
+async function getChunks(
+  supabase: any,
+  opts: { ownerId: string; studySetId?: string | null; includeBackground?: boolean; topK?: number }
+) {
+  const { ownerId, studySetId, includeBackground = false, topK = 12 } = opts;
+
+  // Brug view hvis det findes, ellers tabel
+  let table = "doc_chunks_rank_ready";
+  let cols = await getColumns(supabase, table);
+  if (cols.length === 0) {
+    table = "doc_chunks";
+    cols = await getColumns(supabase, table);
+  }
+
+  const textCandidates = ["text", "content", "chunk", "chunk_text", "raw_text", "body", "page_text", "pageContent"];
+  const textKey = textCandidates.find((k) => cols.includes(k));
+
+  const wantedBase = [
+    "id",
+    "source_title",
+    "source_url",
+    "source_type",
+    "source_domain",
+    "verified_weight",
+    "manual_academic_weight",
+    "domain_boost_dk",
+    "lang_boost_da",
+    "language",
+    "lang_code",
+    "similarity",
+  ].filter((k) => cols.includes(k));
+
+  const selectArr = textKey ? ["id", textKey, ...wantedBase.filter((k) => k !== "id")] : (wantedBase.length ? wantedBase : ["id"]);
+  const selectStr = selectArr.join(",");
+
+  let base = supabase.from(table).select(selectStr).limit(topK);
+  if (cols.includes("owner_id")) base = base.eq("owner_id", ownerId);
+  if (studySetId && cols.includes("study_set_id")) base = base.eq("study_set_id", studySetId);
+  const userChunks = await safe(base);
+
+  let bgChunks: any[] = [];
+  if (includeBackground) {
+    let bgQ = supabase.from(table).select(selectStr).limit(Math.max(4, Math.floor(topK / 2)));
+    if (cols.includes("source_type")) bgQ = bgQ.eq("source_type", "verified");
+    bgChunks = await safe(bgQ);
+  }
+
+  const combined: any[] = [...userChunks, ...bgChunks].slice(0, topK);
+
+  const citations = combined
+    .map((c) => ({ id: c?.id, title: c?.source_title, url: c?.source_url, type: c?.source_type }))
+    .filter((x) => x.id);
+
+  return { citations, combined, textKey };
+}
+
+/** Meget enkel heuristik-score (stub) */
+function simpleScore(question: string, answer: string): { score: number; notes: string[] } {
+  const notes: string[] = [];
+  const qWords = (question || "").toLowerCase().split(/\W+/).filter(Boolean);
+  const a = (answer || "").toLowerCase();
+
+  let hits = 0;
+  for (const w of qWords) if (w.length > 3 && a.includes(w)) hits++;
+
+  const coverage = qWords.length ? hits / qWords.length : 0;
+  const len = answer.trim().length;
+
+  let score = Math.round(
+    0.6 * Math.min(1, len / 600) * 100 +   // længde op til ca. 600 tegn
+    0.4 * coverage * 100                   // dækning af spørgsmålstermer
+  );
+
+  score = Math.max(0, Math.min(100, score));
+
+  notes.push(`Længde/struktur (stub): besvarelsen er ${len} tegn.`);
+  notes.push(`Term-dækning (stub): ${Math.round(coverage * 100)}%.`);
+
+  return { score, notes };
+}
+
+export async function POST(req: Request) {
+  const body = await req.json().catch(() => ({} as any));
+  const includeRefs = wantsReferencesFromBody(body);
+  const question = String(body?.question ?? "");
+  const answer = String(body?.answer ?? "");
+  const studySetId: string | null = body?.studySetId ?? null;
+
+  try {
+    // Supabase med cookies (RLS)
+    const cookieStore = await nextCookies();
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          get(name: string) { return cookieStore.get(name)?.value; },
+          set() {},
+          remove() {},
+        },
+      }
+    );
+
+    const { data: { user }, error: userErr } = await supabase.auth.getUser();
+    let userId = (user as any)?.id ?? null;
+    if (!userId) {
+      const devId = await getDevUserId(req as any);
+      if (devId) userId = devId;
+    }
+    if (userErr || !userId) {
+      if (userErr) console.warn("[evaluate] getUser error:", (userErr as any)?.message ?? String(userErr));
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+
+    // Hent/autorank kontekst (til evt. citations)
+    let references: Array<{ title?: string; url?: string }> = [];
+    try {
+      const retrieved = await getChunks(supabase, {
+        ownerId: userId,
+        studySetId,
+        includeBackground: includeRefs,
+        topK: 12,
+      });
+
+      const ranked = await withAutoRanking(supabase, {
+        text: "",
+        candidates: retrieved.combined.map((c: any) => ({
+          id: c?.id,
+          text: retrieved.textKey ? (c?.[retrieved.textKey] ?? "") : "",
+          similarity: Number(c?.similarity ?? 0),
+          verified_weight: Number(c?.verified_weight ?? 0),
+          manual_academic_weight: Number(c?.manual_academic_weight ?? 0),
+          lang_boost_da: Number(c?.lang_boost_da ?? 0),
+          domain_boost_dk: Number(c?.domain_boost_dk ?? 0),
+          title: c?.source_title,
+          url: c?.source_url,
+          verified: c?.source_type === "verified",
+        })),
+        citations: [],
+        textKey: retrieved.textKey
+      } as any, 20, userId);
+
+      if (includeRefs && Array.isArray(ranked) && ranked.length) {
+        references = ranked.slice(0, 5).map((r: any) => ({
+          title: r.title ?? r.source_title ?? undefined,
+          url: r.url ?? r.source_url ?? undefined,
+        }));
+      }
+    } catch (e) {
+      // bare fortsæt uden refs
+    }
+
+    // Enkel evaluering
+    const { score, notes } = simpleScore(question, answer);
+
+    const feedback =
+`Spørgsmål: ${question || "(ukendt)"}.
+
+Længde/struktur (stub): ${notes[0]?.replace("Længde/struktur (stub): ", "")}
+Dækning (stub): ${notes[1]?.replace("Term-dækning (stub): ", "")}
+
+Baggrundslitteratur: ${includeRefs ? "er inddraget." : "er ikke inddraget."}
+Ingen verificerede kilder i kontekst.`.trim();
+
+    return NextResponse.json({
+      ok: true,
+      score,
+      feedback,
+      references: includeRefs ? references : []
+    }, { status: 200 });
+
+  } catch (e) {
+    return NextResponse.json({
+      ok: true,
+      score: 0,
+      feedback: "Internt (stub): kunne ikke evaluere svaret.",
+      references: []
+    }, { status: 200 });
+  }
+}

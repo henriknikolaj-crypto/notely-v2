@@ -1,4 +1,4 @@
-export default function Page() {
+﻿export default function Page() {
   return (
     <div className="p-6 bg-brand-50 text-brand-600 rounded-2xl prose">
       <h1>Tailwind v4 kører </h1>
@@ -10,4 +10,5 @@ export default function Page() {
     </div>
   );
 }
+
 

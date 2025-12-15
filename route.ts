@@ -1,5 +1,5 @@
 ﻿import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export async function POST(req: Request) {
   const secret = process.env.IMPORT_SHARED_SECRET;
@@ -83,3 +83,5 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok:false, error: e?.message ?? "error" }, { status:500 });
   }
 }
+
+

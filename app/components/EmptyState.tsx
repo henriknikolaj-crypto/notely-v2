@@ -1,4 +1,4 @@
-export default function EmptyState({
+﻿export default function EmptyState({
   title = "Ingen vurderinger endnu.",
   description = "Kør din første evaluering – så dukker resultaterne op her.",
   ctaHref = "#evaluate",
@@ -25,4 +25,5 @@ export default function EmptyState({
     </div>
   );
 }
+
 

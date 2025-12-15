@@ -1,0 +1,76 @@
+"use client";
+
+import Link from "next/link";
+import { usePathname, useSearchParams } from "next/navigation";
+import { useMemo } from "react";
+
+function cn(...xs: (string | false | null | undefined)[]) {
+  return xs.filter(Boolean).join(" ");
+}
+
+export default function AppShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const sp = useSearchParams();
+  const folderId = sp.get("folder_id") || "";
+
+  const tabs = useMemo(
+    () => [
+      { label: "Noter", href: "/app/noter", pro: false },
+      { label: "Multiple Choice", href: "/app/mc", pro: false },
+      { label: "Flashcards", href: "/app/flashcards", pro: false },
+      { label: "Træner", href: "/app/traener", pro: true },
+      { label: "Simulator", href: "/app/simulator", pro: true },
+    ],
+    []
+  );
+
+  function withFolder(href: string) {
+    return folderId ? `${href}?folder_id=${encodeURIComponent(folderId)}` : href;
+  }
+
+  return (
+    <div className="min-h-screen bg-neutral-50 text-black">
+      <div className="mx-auto max-w-screen-2xl px-3 py-4">
+        <div className="grid grid-cols-12 gap-4">
+          {/* Sidebar */}
+          <aside className="col-span-12 md:col-span-3 lg:col-span-2">
+            <div className="rounded-2xl border border-black/10 bg-white shadow-sm">
+              <div className="px-4 py-3 border-b border-black/10">
+                <div className="text-sm font-semibold">Overblik</div>
+              </div>
+              <nav className="p-2 text-sm">
+                <Link href={withFolder("/app")} className="block rounded-lg px-3 py-2 hover:bg-neutral-100">Dashboard</Link>
+                <Link href={withFolder("/app/traener")} className={cn("block rounded-lg px-3 py-2 hover:bg-neutral-100", pathname?.startsWith("/app/traener") && "bg-neutral-100")}>
+                  Træner <span className="ml-2 text-[11px] rounded border border-black/20 px-1 py-[1px]">Pro</span>
+                </Link>
+                <Link href={withFolder("/app/noter")} className={cn("block rounded-lg px-3 py-2 hover:bg-neutral-100", pathname?.startsWith("/app/noter") && "bg-neutral-100")}>Noter</Link>
+                <div className="h-[1px] my-2 bg-black/10" />
+                <Link href={withFolder("/app/konto")} className={cn("block rounded-lg px-3 py-2 hover:bg-neutral-100", pathname?.startsWith("/app/konto") && "bg-neutral-100")}>Konto</Link>
+              </nav>
+            </div>
+          </aside>
+
+          {/* Højre side */}
+          <div className="col-span-12 md:col-span-9 lg:col-span-10">
+            <div className="rounded-2xl border border-black/10 bg-white shadow-sm mb-4">
+              <div className="flex items-center gap-2 overflow-x-auto px-3 py-2">
+                {tabs.map(t => {
+                  const active = pathname?.startsWith(t.href);
+                  return (
+                    <Link key={t.href} href={withFolder(t.href)}
+                      className={cn("whitespace-nowrap rounded-lg px-3 py-2 text-sm border",
+                        active ? "border-black bg-black text-white" : "border-black/15 bg-white text-black hover:bg-neutral-100")}>
+                      {t.label}
+                      {t.pro && <span className={cn("ml-2 text-[11px] rounded border px-1 py-[1px]", active ? "border-white/50" : "border-black/20")}>Pro</span>}
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+            <main>{children}</main>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

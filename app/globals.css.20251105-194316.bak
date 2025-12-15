@@ -1,0 +1,59 @@
+﻿@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@source "./**/*.{ts,tsx,mdx}";
+
+/* --- Design tokens --- */
+:root { --page-bg:#f7f8f9; --ink:#0a0a0a; }
+
+/* --- Base (v4) --- */
+@layer base {
+  /* Lås hele appen til lyst farveskema */
+  html, :host, body { color-scheme: only light; }
+
+  /* Grundoverflade */
+  body {
+    background: var(--page-bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Ensartede, lyse form controls */
+  textarea, input, select {
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #fff;
+    color: #000;
+    border: 1px solid #bdbdbd;
+  }
+
+  input[type="checkbox"] {
+    -webkit-appearance: checkbox;
+    appearance: auto;
+    display: inline-block;
+  }
+
+  /* Hårdt hvide flader i eksamensflowet */
+  #answerBox,
+  #feedbackCard,
+  #feedbackCard *,
+  section:has(#feedbackCard),
+  [data-forcewhite] {
+    background: #fff !important;
+    color: #000 !important;
+    filter: none !important;
+    -webkit-appearance: none;
+    appearance: none;
+    -webkit-print-color-adjust: exact;
+    background-clip: padding-box;
+    border-color: #cfd6de;
+  }
+}
+
+/* --- Små hjælpe-utilities --- */
+@layer utilities {
+  .surface-card {
+    /* brugt til kort/boxe, hvis du vil */
+    @apply bg-white border border-neutral-200 shadow-sm rounded-2xl;
+  }
+}

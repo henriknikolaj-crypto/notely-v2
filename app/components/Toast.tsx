@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 import { useEffect, useState } from "react";
 
 export default function Toast({ text, show, onClose, duration = 2800 }: {
@@ -27,4 +27,5 @@ export default function Toast({ text, show, onClose, duration = 2800 }: {
     </div>
   );
 }
+
 

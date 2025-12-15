@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
@@ -44,4 +44,6 @@ export default function ShortcutGenerateQuestion() {
 
   return null; // usynlig – kun genvej
 }
+
+
 

@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 import { useState } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
@@ -61,4 +61,5 @@ export default function SignupPage() {
     </div>
   );
 }
+
 

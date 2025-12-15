@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 export const runtime = 'nodejs';
 import { NextResponse } from "next/server";
 import { URL } from "url";
@@ -33,4 +33,5 @@ export async function GET() {
 
   return NextResponse.json({ host, dns: dnsInfo, httpsStatus, httpsError });
 }
+
 

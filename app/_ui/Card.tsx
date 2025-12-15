@@ -1,14 +1,6 @@
-﻿import type { ReactNode, HTMLAttributes } from "react";
+﻿import { ReactNode } from "react";
+const cx = (...a: (string|false|undefined)[]) => a.filter(Boolean).join(" ");
 
-type Props = HTMLAttributes<HTMLDivElement> & {
-  className?: string;
-  children: ReactNode;
-};
-
-export default function Card({ className = "", children, ...rest }: Props) {
-  return (
-    <div {...rest} className={`bg-white border rounded-md shadow-sm ${className}`}>
-      {children}
-    </div>
-  );
+export function Card({children, className}: {children: ReactNode; className?: string}) {
+  return <section className={cx("rounded border border-black/10 bg-white shadow-sm", className)}>{children}</section>;
 }

@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from "next/server";
 import { supaRls } from "@/lib/supa";
 
@@ -29,6 +29,7 @@ export async function GET(_req: NextRequest) {
 
   return NextResponse.json({ jobs: rows });
 }
+
 
 
 

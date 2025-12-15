@@ -1,0 +1,19 @@
+﻿{
+  "extends": "./tsconfig.json",
+  "exclude": [
+    ".next/**",
+    "node_modules/**",
+
+    // Legacy/udenfor Uge 9
+    "app/exam/ClientExam.tsx",
+    "app/exam/RecentEvaluations.tsx",
+    "route.ts",
+
+    // i forvejen
+    "app/api/**",
+    "app/auth/**",
+    "app/courses/**",
+    "app/notes/**",
+    "app/study-sets/**"
+  ]
+}

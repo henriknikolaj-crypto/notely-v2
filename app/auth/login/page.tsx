@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 import { useState } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
@@ -22,7 +22,18 @@ export default function LoginPage() {
           id: data.user.id, email: data.user.email, plan: "Freemium",
         });
       }
-      location.href = "/exam";
+      // app/auth/login/page.tsx (i onPassword-success)
+if (data?.user) {
+  await supabase.from("profiles").upsert({
+    id: data.user.id,
+    email: data.user.email,
+    plan: "Freemium",
+  });
+}
+
+// send brugeren til træneren
+window.location.href = "/overblik";
+
     } catch (e:any) { setMsg(e.message ?? "Login-fejl"); }
     finally { setLoading(false); }
   }
@@ -90,4 +101,5 @@ export default function LoginPage() {
     </div>
   );
 }
+
 

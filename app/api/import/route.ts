@@ -1,144 +1,213 @@
+﻿// app/api/quota-status/route.ts
+import "server-only";
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
-import { ensureQuotaAndDecrement } from "@/app/lib/quota";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function readSecret(req: Request) {
-  const h1 = req.headers.get("x-shared-secret");
-  if (h1 && h1.trim()) return h1.trim();
-  const h2 = req.headers.get("authorization") || req.headers.get("Authorization") || "";
-  return h2.replace(/^Bearer\s+/i, "").trim();
-}
-
-export async function GET() {
-  return Response.json({ ok: true, where: "GET /api/import (alive, service-role)" });
-}
-
-export async function POST(req: Request) {
-  // 1) Shared-secret auth
-  const expected = (process.env.IMPORT_SHARED_SECRET || "").trim();
-  const incoming = readSecret(req);
-  if (!expected || incoming !== expected) {
-    return Response.json({ ok:false, error:"unauthorized" }, { status:401 });
+/**
+ * I prod: kræv login.
+ * I dev: fallback til DEV_USER_ID (så irm/curl virker uden cookies).
+ */
+async function getOwnerId(sb: any): Promise<{
+  ownerId: string | null;
+  mode: "auth" | "dev";
+}> {
+  try {
+    if (sb?.auth?.getUser) {
+      const { data } = await sb.auth.getUser();
+      const id = (data?.user?.id as string | undefined) ?? null;
+      if (id) return { ownerId: id, mode: "auth" };
+    }
+  } catch {
+    // ignore
   }
 
-  // 2) Parse body
-  let body:any=null;
-  try { body = await req.json(); }
-  catch { return Response.json({ ok:false, error:"invalid json" }, { status:400 }); }
-
-  const email = String(body?.userEmail ?? "").trim();
-
-  // 3) Admin Supabase client (bypasses RLS)
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-  const supabase = createClient(url, key, { auth: { persistSession: false } });
-
-  // 4) Resolve owner (FK-safe): by email, else DEV_USER_ID
-  let ownerId: string | undefined;
-  if (email) {
-    const { data: prof0, error: pe } =
-      await supabase.from("profiles").select("id").eq("email", email).maybeSingle();
-    if (pe) console.warn("profiles lookup error:", pe);
-    ownerId = prof0?.id;
+  const dev = (process.env.DEV_USER_ID ?? "").trim();
+  if (process.env.NODE_ENV !== "production" && dev) {
+    return { ownerId: dev, mode: "dev" };
   }
+
+  return { ownerId: null, mode: "auth" };
+}
+
+/**
+ * Månedens start/slut i Europe/Copenhagen, returneret som UTC ISO strings.
+ * (robust nok til quotas – undgår server-tz drift i prod).
+ */
+function getMonthBoundsCopenhagen(now = new Date()) {
+  const timeZone = "Europe/Copenhagen";
+
+  const dtf = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+  });
+
+  const parts = dtf.formatToParts(now).reduce((acc: any, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+
+  const year = Number(parts.year);
+  const month = Number(parts.month); // 1-12
+
+  // Helper: find offset(ms) for timezone at a given UTC instant
+  function tzOffsetMs(dateUtc: Date) {
+    const p = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })
+      .formatToParts(dateUtc)
+      .reduce((acc: any, x) => {
+        if (x.type !== "literal") acc[x.type] = x.value;
+        return acc;
+      }, {});
+
+    const asUtc = Date.UTC(
+      Number(p.year),
+      Number(p.month) - 1,
+      Number(p.day),
+      Number(p.hour),
+      Number(p.minute),
+      Number(p.second)
+    );
+
+    return asUtc - dateUtc.getTime();
+  }
+
+  // Convert "wall clock in Copenhagen" -> UTC instant (single-pass; OK for month boundaries)
+  function zonedToUtc(y: number, m1: number, d: number, hh: number, mm: number, ss: number, ms: number) {
+    const guess = new Date(Date.UTC(y, m1 - 1, d, hh, mm, ss, ms));
+    const off = tzOffsetMs(guess);
+    return new Date(guess.getTime() - off);
+  }
+
+  const monthStartUtc = zonedToUtc(year, month, 1, 0, 0, 0, 0);
+  const nextMonthUtc = month === 12
+    ? zonedToUtc(year + 1, 1, 1, 0, 0, 0, 0)
+    : zonedToUtc(year, month + 1, 1, 0, 0, 0, 0);
+
+  const monthEndUtc = new Date(nextMonthUtc.getTime() - 1);
+
+  return {
+    monthStart: monthStartUtc.toISOString(),
+    monthEnd: monthEndUtc.toISOString(),
+  };
+}
+
+export async function GET(req: NextRequest) {
+  const sb = await supabaseServerRoute();
+  const { ownerId, mode } = await getOwnerId(sb);
+
   if (!ownerId) {
-    const dev = String(process.env.DEV_USER_ID ?? "").trim();
-    if (!dev) {
-      return Response.json(
-        { ok:false, error:"no owner found and DEV_USER_ID not set" },
-        { status:400 }
-      );
-    }
-    ownerId = dev;
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  // === Phase 4: Quota check + atomic decrement ===
-  const cost = Math.max(1, Number(body?.cost ?? 1));
-  const q = await ensureQuotaAndDecrement(ownerId, cost);
-  if (!q.ok) {
-    if (q.code === "OUT_OF_CREDITS") {
-      return Response.json(
-        { ok:false, error:"Out of credits", remaining: Math.max(0, q.remaining) },
-        { status: 402 }
-      );
-    }
-    return Response.json(
-      { ok:false, error:"Quota/RPC error", code: q.code },
-      { status: 429 }
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url || !key) {
+    return NextResponse.json(
+      { ok: false, error: "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" },
+      { status: 500 }
     );
   }
 
-  // 5) Create job with enum-safe default status ("queued")
-  const { data: job, error: jErr } = await supabase
+  const admin = createClient(url, key, { auth: { persistSession: false } });
+
+  const now = new Date();
+  const { monthStart, monthEnd } = getMonthBoundsCopenhagen(now);
+
+  // Profile (plan + quota)
+  const { data: profile, error: profileErr } = await admin
+    .from("profiles")
+    .select("id, email, plan, quota, quota_renew_at")
+    .eq("id", ownerId)
+    .maybeSingle();
+
+  if (profileErr) console.error("[quota-status] profile error:", profileErr);
+
+  const plan = (profile as any)?.plan ?? "freemium";
+
+  // Plan limits
+  const { data: planLimitRows, error: planLimitErr } = await admin
+    .from("plan_limits")
+    .select("plan, feature, monthly_limit")
+    .eq("plan", plan);
+
+  if (planLimitErr) console.error("[quota-status] plan_limits error:", planLimitErr);
+
+  const planLimits = planLimitRows ?? [];
+  const importLimit =
+    planLimits.find((r: any) => r.feature === "import")?.monthly_limit ?? null;
+  const evalLimit =
+    planLimits.find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null;
+
+  // Import usage (jobs: kind=import, status=succeeded)
+  const { count: importThisMonth = 0 } = await admin
     .from("jobs")
-    .insert({ kind:"import", owner_id: ownerId, payload: body, status: "queued" })
-    .select("id")
-    .single();
-  if (jErr || !job) return Response.json({ ok:false, error:"job insert failed", detail:jErr?.message }, { status:500 });
+    .select("id", { count: "exact", head: true })
+    .eq("owner_id", ownerId)
+    .eq("kind", "import")
+    .eq("status", "succeeded")
+    .gte("queued_at", monthStart)
+    .lte("queued_at", monthEnd);
 
-  try {
-    let filesInserted = 0, notesInserted = 0;
+  const { count: importAllTime = 0 } = await admin
+    .from("jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("owner_id", ownerId)
+    .eq("kind", "import")
+    .eq("status", "succeeded");
 
-    // 6) File + OCR (ensure NOT NULL columns)
-    if (body?.file?.md5) {
-      const f = body.file as { md5:string; fileId?:string; fileName?:string; storagePath?:string };
-      const originalName = (f.fileName && String(f.fileName).trim().length > 0) ? String(f.fileName).trim() : "upload";
-      const storagePath =
-        (typeof f.storagePath === "string" && f.storagePath.length > 0)
-          ? f.storagePath
-          : `external/drive/${(f.fileId ?? f.md5)}`;
+  // Evaluate usage (exam_sessions: source_type=trainer)
+  const { count: evalThisMonth = 0, error: evalMonthErr } = await admin
+    .from("exam_sessions")
+    .select("id", { count: "exact", head: true })
+    .eq("owner_id", ownerId)
+    .eq("source_type", "trainer")
+    .gte("created_at", monthStart)
+    .lte("created_at", monthEnd);
 
-      const { data: fr, error: fErr } = await supabase
-        .from("files")
-        .upsert(
-          {
-            owner_id: ownerId,
-            md5: f.md5,
-            name: originalName,
-            original_name: originalName,    // NOT NULL
-            storage_path: storagePath       // NOT NULL
-          },
-          { onConflict: "md5" }
-        )
-        .select("id")
-        .single();
-      if (fErr || !fr) throw fErr;
-      filesInserted++;
+  if (evalMonthErr) console.error("[quota-status] eval month error:", evalMonthErr);
 
-      if (typeof body.ocrText === "string" && body.ocrText.length > 0) {
-        const { error: tErr } = await supabase
-          .from("ocr_texts")
-          .insert({ owner_id: ownerId, file_id: fr.id, text: body.ocrText });
-        if (tErr) throw tErr;
-      }
-    }
+  const { count: evalAllTime = 0, error: evalAllErr } = await admin
+    .from("exam_sessions")
+    .select("id", { count: "exact", head: true })
+    .eq("owner_id", ownerId)
+    .eq("source_type", "trainer");
 
-    // 7) Notes
-    if (Array.isArray(body?.notes)) {
-      for (const n of body.notes) {
-        if (!n?.title) continue;
-        const { error: nErr } = await supabase.from("notes").insert({
-          owner_id: ownerId,
-          title: String(n.title).slice(0,200),
-          content: n.content ? String(n.content) : null,
-          course_id: n.course_id ?? null,
-        });
-        if (nErr) throw nErr;
-        notesInserted++;
-      }
-    }
+  if (evalAllErr) console.error("[quota-status] eval all-time error:", evalAllErr);
 
-    // Success → status "succeeded"
-    await supabase.from("jobs").update({ status:"succeeded" }).eq("id", job.id);
-    return Response.json({ ok:true, jobId: job.id, filesInserted, notesInserted });
-
-  } catch (e:any) {
-    // Failure → status "failed"
-    await supabase.from("jobs").update({ status:"failed" }).eq("id", job.id);
-    return Response.json({ ok:false, error: e?.message ?? "error" }, { status:500 });
-  }
+  return NextResponse.json({
+    ok: true,
+    mode,
+    ownerId,
+    now: now.toISOString(),
+    monthStart,
+    monthEnd,
+    plan,
+    profile,
+    import: {
+      usedThisMonth: importThisMonth,
+      totalAllTime: importAllTime,
+      limitPerMonth: importLimit,
+    },
+    evaluate: {
+      usedThisMonth: evalThisMonth,
+      totalAllTime: evalAllTime,
+      limitPerMonth: evalLimit,
+    },
+    planLimits,
+  });
 }
-

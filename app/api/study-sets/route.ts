@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { supaRls } from "@/lib/supa";
 
 type Item = { source_type: "file" | "note"; source_id: string };
@@ -78,4 +78,7 @@ export async function GET() {
 
   return NextResponse.json({ sets: data ?? [] });
 }
+
+
+
 

@@ -1,5 +1,5 @@
-import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server";
+﻿import { NextResponse } from "next/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export async function POST(req: Request) {
   try {
@@ -23,5 +23,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }
 }
+
+
+
+
+
+
 
 

@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿/* eslint-disable @typescript-eslint/no-explicit-any */
 import { headers } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
 
@@ -56,5 +56,6 @@ export async function POST(_req: Request) {
 
   return Response.json({ ok:true, id, status, tokens_used, latency_ms, failRate });
 }
+
 
 

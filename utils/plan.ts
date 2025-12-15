@@ -1,4 +1,4 @@
-export type Plan = "free" | "basic" | "pro";
+﻿export type Plan = "free" | "basic" | "pro";
 
 export function canUseEvaluate(
   plan: Plan,
@@ -13,3 +13,4 @@ export function canUseEvaluate(
   const remaining = Math.max(0, limit - usageToday);
   return { ok: remaining > 0, remaining, limit };
 }
+

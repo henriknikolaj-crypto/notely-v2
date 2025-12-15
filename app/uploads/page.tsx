@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 import { useEffect, useState } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
 
@@ -49,4 +49,5 @@ export default function UploadsPage() {
     </div>
   );
 }
+
 
