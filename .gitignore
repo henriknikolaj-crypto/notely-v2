@@ -46,6 +46,16 @@ next-env.d.ts
 *.backup*
 backups/
 _archive/
+
+# supabase cli temp
 supabase/.temp/
+
+# local exports
 exam-history*.csv
 exam_history*.csv
+
+# optional: local materials/assets (uncomment if you don't want them in git)
+# Materiale/
+# __traener.html
+# *.png
+# testdata/
