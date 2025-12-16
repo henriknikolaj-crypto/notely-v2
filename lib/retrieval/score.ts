@@ -1,4 +1,4 @@
-﻿// /lib/retrieval/score.ts
+﻿// lib/retrieval/score.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 export type RankCandidate = {
@@ -20,6 +20,12 @@ export type RankResult = {
   rankedText: string;
 };
 
+function clamp01(x: unknown, fallback: number) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
+
 async function loadConfig(
   supabase: SupabaseClient,
   ownerId?: string | null
@@ -27,11 +33,11 @@ async function loadConfig(
   // defaults (samme som i admin-SQL)
   let alpha = 0.25;
   let beta = 0.15;
-  let mLang = 0.10;
-  let mDomain: number | null = null; // hvis null → brug beta
+
+  const mLang = 0.10;
+  const mDomain: number | null = null; // hvis null → brug beta
 
   try {
-    // owner → global
     const { data: ownerCfg } = await supabase
       .from("retrieval_config")
       .select("alpha,beta")
@@ -46,18 +52,16 @@ async function loadConfig(
       .limit(1)
       .maybeSingle();
 
-    if (ownerCfg?.alpha != null) alpha = Number(ownerCfg.alpha);
-    else if (globalCfg?.alpha != null) alpha = Number(globalCfg.alpha);
+    const rawAlpha = ownerCfg?.alpha ?? globalCfg?.alpha;
+    const rawBeta = ownerCfg?.beta ?? globalCfg?.beta;
 
-    if (ownerCfg?.beta != null) beta = Number(ownerCfg.beta);
-    else if (globalCfg?.beta != null) beta = Number(globalCfg.beta);
+    if (rawAlpha != null) alpha = clamp01(rawAlpha, alpha);
+    if (rawBeta != null) beta = clamp01(rawBeta, beta);
   } catch {
     // behold defaults
   }
 
-  // du kan evt. læse mLang/mDomain fra en tabel; for nu: mDomain = beta (matcher vores adminkørsel)
   const domainMultiplier = mDomain ?? beta;
-
   return { alpha, beta, mLang, mDomain: domainMultiplier };
 }
 
@@ -67,16 +71,20 @@ function scoreOne(
 ): number {
   const { alpha, beta, mLang, mDomain } = p;
 
-  // Samme formel som i admin-SQL
+  const sim = Number(c.similarity ?? 0) || 0;
+  const verified = Number(c.verified_weight ?? 0) || 0;
+  const manual = Number(c.manual_academic_weight ?? 0) || 0;
+  const dk = Number(c.domain_boost_dk ?? 0) || 0;
+  const da = Number(c.lang_boost_da ?? 0) || 0;
+
   // base fra semantisk lighed
-  const base = alpha * (c.similarity ?? 0);
+  const base = alpha * sim;
 
   // troværdighed: verified vs. manual
-  const trust =
-    (1 - alpha) * (beta * (c.verified_weight ?? 0) + (1 - beta) * (c.manual_academic_weight ?? 0));
+  const trust = (1 - alpha) * (beta * verified + (1 - beta) * manual);
 
   // locale boosts
-  const locale = mDomain * (c.domain_boost_dk ?? 0) + mLang * (c.lang_boost_da ?? 0);
+  const locale = mDomain * dk + mLang * da;
 
   return base + trust + locale;
 }
@@ -94,11 +102,17 @@ export async function applyAcademicDanishScoring(
     finalScore: scoreOne(c, cfg),
   }));
 
-  ranked.sort((a, b) => (b.finalScore - a.finalScore) || (b.similarity - a.similarity));
+  ranked.sort(
+    (a, b) => b.finalScore - a.finalScore || (b.similarity ?? 0) - (a.similarity ?? 0)
+  );
 
   const topN = options?.topN ?? Math.min(8, ranked.length);
   const joiner = options?.joiner ?? "\n\n---\n\n";
-  const rankedText = ranked.slice(0, topN).map((r) => r.text?.trim()).filter(Boolean).join(joiner);
+  const rankedText = ranked
+    .slice(0, topN)
+    .map((r) => r.text?.trim())
+    .filter(Boolean)
+    .join(joiner);
 
   return {
     alpha: cfg.alpha,
@@ -109,4 +123,3 @@ export async function applyAcademicDanishScoring(
     rankedText,
   };
 }
-

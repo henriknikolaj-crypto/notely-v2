@@ -8,7 +8,7 @@ function json(payload: any, status = 200) {
 }
 
 // GET: brugt af Upload-siden (og kan bruges andre steder) til at liste mapper
-export async function GET(_req: Request) {
+export async function GET() {
   try {
     const sb = await supabaseServerRoute();
 
@@ -45,6 +45,7 @@ export async function GET(_req: Request) {
 
 // POST: opret ny mappe (bruges af "+ Ny mappe" i venstre kolonne)
 export async function POST(req: Request) {
+  void req;
   try {
     const sb = await supabaseServerRoute();
 
@@ -116,3 +117,7 @@ export async function POST(req: Request) {
     );
   }
 }
+
+
+
+

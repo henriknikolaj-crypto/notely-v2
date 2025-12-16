@@ -1,6 +1,6 @@
 // app/api/import-status/route.ts
 import "server-only";
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";

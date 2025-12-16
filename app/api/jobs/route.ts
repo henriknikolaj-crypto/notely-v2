@@ -1,8 +1,9 @@
-﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿ 
 import { NextRequest, NextResponse } from "next/server";
 import { supaRls } from "@/lib/supa";
 
 export async function GET(_req: NextRequest) {
+  void _req;
   const sb = await supaRls();
   const { data: { user } } = await sb.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -29,6 +30,7 @@ export async function GET(_req: NextRequest) {
 
   return NextResponse.json({ jobs: rows });
 }
+
 
 
 

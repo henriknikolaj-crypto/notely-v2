@@ -1,6 +1,6 @@
 ﻿// app/api/quota-status/route.ts
 import "server-only";
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
@@ -106,6 +106,7 @@ function getMonthBoundsCopenhagen(now = new Date()) {
 }
 
 export async function GET(req: NextRequest) {
+  void req;
   const sb = await supabaseServerRoute();
   const { ownerId, mode } = await getOwnerId(sb);
 
@@ -211,3 +212,4 @@ export async function GET(req: NextRequest) {
     planLimits,
   });
 }
+

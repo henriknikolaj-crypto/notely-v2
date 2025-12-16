@@ -36,6 +36,9 @@ export default function ClientTrainer({
   noteId,
   selectedNoteTitle,
 }: Props) {
+  // eslint/lint: prop gemt til senere (auth/owner-scoped kald, analytics, etc.)
+  void ownerId;
+
   const router = useRouter();
 
   // 1) brug explicit folderId hvis givet
@@ -224,12 +227,8 @@ export default function ClientTrainer({
       const contentLines = [
         question ? `**Spørgsmål**\n${question}` : "",
         answer ? `\n\n**Svar**\n${answer}` : "",
-        evalResult?.score != null
-          ? `\n\n**Score**: ${evalResult.score}/100`
-          : "",
-        evalResult?.feedback
-          ? `\n\n**Feedback**\n${evalResult.feedback}`
-          : "",
+        evalResult?.score != null ? `\n\n**Score**: ${evalResult.score}/100` : "",
+        evalResult?.feedback ? `\n\n**Feedback**\n${evalResult.feedback}` : "",
         evalResult?.sources && evalResult.sources.length
           ? `\n\n**Kilder**\n${evalResult.sources
               .map((s: string) => `- ${s}`)
@@ -239,7 +238,6 @@ export default function ClientTrainer({
 
       const content = contentLines.join("");
 
-      // TODO: ryd op i note_type senere (pt. hårdkodet)
       const res = await fetch("/api/notes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -260,7 +258,6 @@ export default function ClientTrainer({
       }
 
       setNoteSavedMsg("Note gemt.");
-      // 🔄 Opdatér “Seneste noter” i venstre kolonne
       router.refresh();
     } catch (err: any) {
       setErrorMsg(err?.message || "Fejl ved gem som note.");
@@ -360,12 +357,8 @@ export default function ClientTrainer({
         <div className="text-xs text-zinc-600">
           {evalResult ? (
             <>
-              <div className="font-medium">
-                Score: {evalResult.score ?? 0}/100
-              </div>
-              <p className="mt-1 whitespace-pre-wrap">
-                {evalResult.feedback}
-              </p>
+              <div className="font-medium">Score: {evalResult.score ?? 0}/100</div>
+              <p className="mt-1 whitespace-pre-wrap">{evalResult.feedback}</p>
 
               {evalResult.sources && evalResult.sources.length > 0 && (
                 <div className="mt-2 text-[10px] text-zinc-500">
@@ -383,10 +376,7 @@ export default function ClientTrainer({
               )}
             </>
           ) : (
-            <p>
-              Ingen feedback endnu. Skriv dit svar og tryk &quot;Evaluer
-              svar&quot;.
-            </p>
+            <p>Ingen feedback endnu. Skriv dit svar og tryk &quot;Evaluer svar&quot;.</p>
           )}
         </div>
       </section>

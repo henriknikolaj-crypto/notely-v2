@@ -1,6 +1,8 @@
-﻿// app/api/folders/route.ts
+﻿import "server-only";
 import { NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+
+export const dynamic = "force-dynamic";
 
 async function getOwnerId(sb: any): Promise<string | null> {
   try {
@@ -11,13 +13,53 @@ async function getOwnerId(sb: any): Promise<string | null> {
   } catch {
     // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+
+  // DEV fallback (kun i dev)
+  if (process.env.NODE_ENV !== "production") {
+    return process.env.DEV_USER_ID ?? null;
+  }
+
+  return null;
+}
+
+export async function GET() {
+  try {
+    const sb = await supabaseServerRoute();
+    const ownerId = await getOwnerId(sb);
+
+    if (!ownerId) {
+      return NextResponse.json(
+        { error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
+        { status: 401 }
+      );
+    }
+
+    const { data, error } = await sb
+      .from("folders")
+      .select("id,name,parent_id,start_date,end_date,archived_at,created_at")
+      .eq("owner_id", ownerId)
+      .order("name", { ascending: true });
+
+    if (error) {
+      console.error("folders GET error:", error);
+      return NextResponse.json({ error: "Kunne ikke hente mapper." }, { status: 500 });
+    }
+
+    return NextResponse.json({ folders: data ?? [] }, { status: 200 });
+  } catch (err: any) {
+    console.error("folders GET uncaught error:", err);
+    return NextResponse.json(
+      { error: "Uventet fejl i hentning af mapper." },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(req: Request) {
   try {
     const sb = await supabaseServerRoute();
     const ownerId = await getOwnerId(sb);
+
     if (!ownerId) {
       return NextResponse.json(
         { error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
@@ -47,15 +89,12 @@ export async function POST(req: Request) {
         start_date: start_date || null,
         end_date: end_date || null,
       })
-      .select("id,name,start_date,end_date,parent_id,archived_at")
+      .select("id,name,parent_id,start_date,end_date,archived_at,created_at")
       .single();
 
     if (error) {
       console.error("folders POST error:", error);
-      return NextResponse.json(
-        { error: "Kunne ikke oprette mappe." },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Kunne ikke oprette mappe." }, { status: 500 });
     }
 
     return NextResponse.json({ folder: data }, { status: 200 });

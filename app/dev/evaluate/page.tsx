@@ -1,4 +1,4 @@
-﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿ 
 "use client";
 import { useState } from "react";
 import MaterialPickerDialog from "@/components/material/MaterialPickerDialog";

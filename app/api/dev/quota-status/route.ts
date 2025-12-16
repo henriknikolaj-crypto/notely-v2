@@ -1,6 +1,6 @@
 // app/api/dev/quota-status/route.ts
 import "server-only";
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 

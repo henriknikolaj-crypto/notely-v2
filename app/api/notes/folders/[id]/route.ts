@@ -1,5 +1,5 @@
 ﻿// app/api/notes/folders/[id]/route.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";

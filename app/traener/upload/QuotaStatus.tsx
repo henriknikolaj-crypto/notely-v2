@@ -1,7 +1,9 @@
-﻿"use client";
+﻿// app/traener/upload/QuotaStatus.tsx
+"use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type Props = {
   feature: "import" | "evaluate";
@@ -20,7 +22,7 @@ type QuotaResp = {
   mode?: string;
   plan?: "freemium" | "basis" | "pro" | string;
   monthEnd?: string; // sidste ms i måneden (debug)
-  resetAt?: string; // næste måneds start (det “rigtige” nulstillingstidspunkt)
+  resetAt?: string; // næste måneds start (rigtig nulstilling)
   import?: QuotaBlock;
   evaluate?: QuotaBlock;
   message?: string;
@@ -47,19 +49,14 @@ export default function QuotaStatus({
 }: Props) {
   const pathname = usePathname();
 
-  // Upload-siden har allerede ImportStatusBox (kvote + filer + seneste),
-  // så vi skjuler import-kortet her for at undgå dobbelt UI.
-  if (feature === "import" && (pathname ?? "").includes("/traener/upload")) {
-    return null;
-  }
-
   const [data, setData] = useState<QuotaResp | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       setErr(null);
+
       const res = await fetch("/api/quota-status", {
         method: "GET",
         headers: { Accept: "application/json" },
@@ -79,19 +76,39 @@ export default function QuotaStatus({
       }
 
       setData(json);
-    } catch (e: any) {
-      setErr(e?.message ?? "Kunne ikke hente kvote (ukendt fejl).");
+    } catch (e: unknown) {
+      const msg =
+        e instanceof Error ? e.message : "Kunne ikke hente kvote (ukendt fejl).";
+      setErr(msg);
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
-    void load();
-    const t = setInterval(() => void load(), Math.max(5000, refreshMs));
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feature, refreshMs]);
+    let alive = true;
+
+    const run = async () => {
+      if (!alive) return;
+      await load();
+    };
+
+    void run();
+
+    const intervalMs = Math.max(5000, Number(refreshMs || 0));
+    const t =
+      intervalMs > 0 ? setInterval(() => void run(), intervalMs) : null;
+
+    return () => {
+      alive = false;
+      if (t) clearInterval(t);
+    };
+  }, [load, refreshMs, feature]);
+
+  // Upload-siden har allerede ImportStatusBox (kvote + filer + seneste),
+  // så vi skjuler import-kortet her for at undgå dobbelt UI.
+  const hideOnUploadPage =
+    feature === "import" && (pathname ?? "").includes("/traener/upload");
 
   const planLabel = useMemo(() => {
     const p = (data?.plan ?? "freemium").toLowerCase();
@@ -102,7 +119,7 @@ export default function QuotaStatus({
 
   const block = feature === "import" ? data?.import : data?.evaluate;
   const used = Number(block?.usedThisMonth ?? 0);
-  const limit = typeof block?.limitPerMonth === "number" ? block?.limitPerMonth : null;
+  const limit = typeof block?.limitPerMonth === "number" ? block.limitPerMonth : null;
 
   const pct = useMemo(() => {
     if (!limit || limit <= 0) return 0;
@@ -116,7 +133,7 @@ export default function QuotaStatus({
 
   const subtitle =
     feature === "import"
-      ? "Gælder filer der er gjort klar til brug i Træner, Noter og Multiple Choice."
+      ? "Gælder materiale der gøres klar til brug i Træner, Noter og Multiple Choice."
       : "Træner-evalueringer (skriftlig feedback). Hver vurdering tæller som én evaluering.";
 
   const resetLabel =
@@ -126,6 +143,8 @@ export default function QuotaStatus({
     feature === "import" ? "Materiale gjort klar denne måned" : "Evalueringer denne måned";
 
   const showUpgrade = (data?.plan ?? "freemium").toLowerCase() !== "pro";
+
+  if (hideOnUploadPage) return null;
 
   if (loading) {
     return (
@@ -150,12 +169,12 @@ export default function QuotaStatus({
         </div>
 
         {showUpgrade ? (
-          <a
+          <Link
             href={upgradeHref}
             className="inline-flex items-center rounded-full bg-black px-4 py-2 text-xs font-semibold text-white hover:opacity-90"
           >
             Opgrader nu
-          </a>
+          </Link>
         ) : null}
       </div>
 
@@ -170,7 +189,10 @@ export default function QuotaStatus({
 
           {limit ? (
             <div className="mt-2 h-2 w-full rounded-full bg-zinc-100">
-              <div className="h-2 rounded-full bg-black" style={{ width: `${pct}%` }} />
+              <div
+                className="h-2 rounded-full bg-black"
+                style={{ width: `${pct}%` }}
+              />
             </div>
           ) : null}
 

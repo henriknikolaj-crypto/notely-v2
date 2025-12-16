@@ -25,7 +25,7 @@ const schema = z.object({
   reset: z.boolean().optional(),
 });
 
-export async function GET(_req: NextRequest) {
+export async function GET() {
   const supabase = await supabaseServerRoute(); // ⬅️ vigtig ændring
   const { data: auth } = await supabase.auth.getUser();
   const user = auth?.user;
@@ -51,6 +51,7 @@ export async function GET(_req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  void req;
   const supabase = await supabaseServerRoute(); // ⬅️ vigtig ændring
   const { data: auth } = await supabase.auth.getUser();
   const user = auth?.user;
@@ -109,5 +110,10 @@ export async function DELETE() {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ ok: true });
 }
+
+
+
+
+
 
 

@@ -39,6 +39,9 @@ function formatDT(iso: string | null | undefined) {
     .replace(/\.$/, "");
 }
 
+// eslint/lint: hvis funktionen ikke bruges i denne fil endnu
+void formatDT;
+
 // Kort sidebar-format: 28.11.
 function formatSidebarDate(iso: string | null | undefined) {
   if (!iso) return "";

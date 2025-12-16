@@ -12,15 +12,16 @@ export type NoteCard = {
 
 export type NoteKind = "resume" | "focus" | "evaluation" | "other";
 
-export function classifyNote(note: Pick<
-  NoteCard,
-  "title" | "sourceTitle" | "sourceUrl"
->): NoteKind {
+export function classifyNote(
+  note: Pick<NoteCard, "title" | "sourceTitle" | "sourceUrl">
+): NoteKind {
   const title = (note.title ?? "").toLowerCase();
   const srcTitle = (note.sourceTitle ?? "").toLowerCase();
   const srcUrl = (note.sourceUrl ?? "").toLowerCase();
 
   const fromTrainerNotes = srcUrl.includes("/traener/noter");
+  void fromTrainerNotes; // reserveret til senere (mere præcis scope-detektion)
+
   const fromTrainerMain =
     srcUrl === "/traener" || srcUrl === "/traener/ux" || srcUrl === "/traener";
 
@@ -67,8 +68,7 @@ export function filterNotesByScope<T extends NoteCard>(
     const kind = classifyNote(n);
 
     if (scope.startsWith("resum")) return kind === "resume";
-    if (scope.includes("fokus") || scope.includes("focus"))
-      return kind === "focus";
+    if (scope.includes("fokus") || scope.includes("focus")) return kind === "focus";
     if (scope.startsWith("eval")) return kind === "evaluation";
     return true;
   });

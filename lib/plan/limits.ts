@@ -1,7 +1,7 @@
 // lib/plan/limits.ts
 // Lille helper til at slå brugerens plan + kvoter (plan_limits) op ét sted.
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 
 export type PlanCode = "freemium" | "basis" | "pro" | string;
 

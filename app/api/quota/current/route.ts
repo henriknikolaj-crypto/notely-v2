@@ -1,6 +1,6 @@
-// app/api/quota/current/route.ts
+﻿// app/api/quota/current/route.ts
 import "server-only";
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
@@ -106,6 +106,7 @@ async function countJobs(opts: {
 }
 
 export async function GET(_req: NextRequest) {
+  void _req;
   const sb = await supabaseServerRoute();
   const ownerId = await getOwnerId(sb);
 
@@ -190,3 +191,4 @@ export async function GET(_req: NextRequest) {
     },
   });
 }
+

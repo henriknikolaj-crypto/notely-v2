@@ -1,7 +1,7 @@
 // lib/plan/importQuota.ts
 // Kvote-check til import (/api/import): maks. antal filer pr. bruger/plan.
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 
 import {
   getPlanAndLimitsForOwner,

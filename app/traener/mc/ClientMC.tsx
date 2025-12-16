@@ -1,7 +1,7 @@
 // app/traener/mc/ClientMC.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 type MCOption = {
   id: string;
@@ -126,10 +126,11 @@ type Props = {
 export default function ClientMC({ scopeFolderIds }: Props) {
   // Aktuelt spørgsmål (fra API eller fallback)
   const [currentQuestion, setCurrentQuestion] = useState<MCQuestion | null>(
-    null
+    null,
   );
 
-  const [fallbackIndex, setFallbackIndex] = useState(0);
+  // bruges kun til fallback-rotation (UI). beholdes for at kunne “rulle videre”
+  const [, setFallbackIndex] = useState(0);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [checked, setChecked] = useState(false);
@@ -146,79 +147,79 @@ export default function ClientMC({ scopeFolderIds }: Props) {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // --- Hjælper: hent nyt spørgsmål (API + fallback) ---
+  const fetchNextQuestion = useCallback(
+    async (mode: "initial" | "next") => {
+      setLoadingNext(true);
+      setLoadError(null);
 
-  async function fetchNextQuestion(mode: "initial" | "next") {
-    setLoadingNext(true);
-    setLoadError(null);
+      try {
+        const res = await fetch("/api/generate-mc-question", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            scopeFolderIds: scopeFolderIds ?? [],
+            difficulty: "medium" as const,
+            maxContextChunks: 8,
+          }),
+        });
 
-    try {
-      const res = await fetch("/api/generate-mc-question", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scopeFolderIds: scopeFolderIds ?? [],
-          difficulty: "medium" as const,
-          maxContextChunks: 8,
-        }),
-      });
+        if (!res.ok) {
+          throw new Error(`Bad status: ${res.status}`);
+        }
 
-      if (!res.ok) {
-        throw new Error(`Bad status: ${res.status}`);
+        const data = (await res.json()) as GenerateMcResponse;
+
+        const apiQuestion: MCQuestion = {
+          id: data.questionId,
+          question: data.question,
+          options: data.options,
+          explanation: data.explanation,
+          source: "api",
+        };
+
+        setCurrentQuestion(apiQuestion);
+      } catch (err) {
+        console.error("generate-mc-question error:", err);
+        setLoadError(
+          "Kunne ikke hente nyt spørgsmål – bruger demo-spørgsmål i stedet.",
+        );
+
+        // vælg næste fallback-spørgsmål
+        setFallbackIndex((prev) => {
+          const next =
+            (prev + (mode === "next" ? 1 : 0)) % FALLBACK_QUESTIONS.length;
+          setCurrentQuestion(FALLBACK_QUESTIONS[next]);
+          return next;
+        });
+      } finally {
+        setLoadingNext(false);
+        setSelectedId(null);
+        setChecked(false);
+        setSaveError(null);
+
+        if (mode === "next") {
+          setQuestionNumber((prev) => prev + 1);
+        } else {
+          setQuestionNumber(1);
+        }
       }
-
-      const data = (await res.json()) as GenerateMcResponse;
-
-      const apiQuestion: MCQuestion = {
-        id: data.questionId,
-        question: data.question,
-        options: data.options,
-        explanation: data.explanation,
-        source: "api",
-      };
-
-      setCurrentQuestion(apiQuestion);
-    } catch (err) {
-      console.error("generate-mc-question error:", err);
-      setLoadError(
-        "Kunne ikke hente nyt spørgsmål – bruger demo-spørgsmål i stedet."
-      );
-
-      // vælg næste fallback-spørgsmål
-      setFallbackIndex((prev) => {
-        const next =
-          (prev + (mode === "next" ? 1 : 0)) % FALLBACK_QUESTIONS.length;
-        setCurrentQuestion(FALLBACK_QUESTIONS[next]);
-        return next;
-      });
-    } finally {
-      setLoadingNext(false);
-      setSelectedId(null);
-      setChecked(false);
-      setSaveError(null);
-
-      if (mode === "next") {
-        setQuestionNumber((prev) => prev + 1);
-      } else {
-        setQuestionNumber(1);
-      }
-    }
-  }
+    },
+    [scopeFolderIds],
+  );
 
   // Hent første spørgsmål når komponenten mountes
   useEffect(() => {
-    fetchNextQuestion("initial");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    void fetchNextQuestion("initial");
+  }, [fetchNextQuestion]);
 
   // --- UI-helpers ---
-
   const correctOption =
     currentQuestion?.options.find((o) => o.isCorrect) || null;
 
   const isCorrect =
     checked && selectedId && currentQuestion
-      ? currentQuestion.options.find((o) => o.id === selectedId)?.isCorrect ??
-        false
+      ? (currentQuestion.options.find((o) => o.id === selectedId)?.isCorrect ??
+        false)
       : false;
 
   function handleSelect(optionId: string) {
@@ -230,7 +231,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     if (!selectedId || checked || !currentQuestion) return;
 
     const selectedOption = currentQuestion.options.find(
-      (o) => o.id === selectedId
+      (o) => o.id === selectedId,
     );
     if (!selectedOption) return;
 
@@ -342,14 +343,10 @@ export default function ClientMC({ scopeFolderIds }: Props) {
             >
               <span>{opt.text}</span>
               {showCorrect && (
-                <span className="ml-3 text-xs font-semibold">
-                  Korrekt svar
-                </span>
+                <span className="ml-3 text-xs font-semibold">Korrekt svar</span>
               )}
               {showWrong && (
-                <span className="ml-3 text-xs font-semibold">
-                  Forkert svar
-                </span>
+                <span className="ml-3 text-xs font-semibold">Forkert svar</span>
               )}
             </button>
           );
@@ -374,9 +371,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
         <div className="flex items-center gap-3">
           {saving && (
-            <span className="text-[11px] text-zinc-500">
-              Gemmer resultat …
-            </span>
+            <span className="text-[11px] text-zinc-500">Gemmer resultat …</span>
           )}
           {saveError && !saving && (
             <span className="text-[11px] text-red-600">{saveError}</span>

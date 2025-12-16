@@ -34,13 +34,20 @@ export async function POST(req: Request) {
       }
     );
 
-    const { data: { user }, error } = await supabase.auth.getUser();
-    let userId: string | null = (user as any)?.id ?? null;
-    if (!userId) {
-      const devId = await getDevUserId(req as any);
-      if (devId) userId = devId;
-    }
-    if (!userId) return NextResponse.json({ ok:false, error:"unauthorized" }, { status:401 });
+    const {
+  data: { user },
+} = await supabase.auth.getUser();
+
+let userId: string | null = user?.id ?? null;
+
+if (!userId) {
+  const devId = await getDevUserId(req as any);
+  if (devId) userId = devId;
+}
+
+if (!userId) {
+  return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+}
 
     // Prøv at skrive til user_notes (valgfri tabel)
     // Skema-antagelse: id uuid default gen_random_uuid(), owner_id uuid, content text, source text, created_at timestamptz default now()

@@ -1,4 +1,4 @@
-﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿ 
 import { createClient } from "@supabase/supabase-js";
 
 // Minimal "claim → process → update" loop for local testing.

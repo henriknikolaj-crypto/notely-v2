@@ -1,4 +1,4 @@
-﻿/* eslint-disable @typescript-eslint/no-explicit-any */
+﻿ 
 export async function GET() {
   return Response.json({
     DEV_USER_ID: process.env.DEV_USER_ID ?? null,
