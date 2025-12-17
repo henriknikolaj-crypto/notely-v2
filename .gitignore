@@ -60,3 +60,9 @@ next-env.d.ts
 /Materiale/
 /__traener.html
 /*.png
+
+# secrets / lokale filer
+.env
+.env.*
+*.local
+Subfiles.txt
