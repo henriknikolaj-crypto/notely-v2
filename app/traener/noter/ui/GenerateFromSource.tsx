@@ -1,8 +1,10 @@
-﻿// app/traener/noter/ui/GenerateFromSource.tsx
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 
 type FileOption = {
   id: string;
@@ -43,7 +45,7 @@ export default function GenerateFromSource(props: Props) {
   }, [files]);
 
   const [selectedFileId, setSelectedFileId] = useState<string>(
-    uniqueFiles[0]?.id ?? ""
+    uniqueFiles[0]?.id ?? "",
   );
   const [mode, setMode] = useState<"resume" | "golden">("resume");
   const [loading, setLoading] = useState(false);
@@ -99,7 +101,7 @@ export default function GenerateFromSource(props: Props) {
 
       if (!res.ok || !data?.ok) {
         setError(
-          data?.error || "Der opstod en fejl under genereringen. Prøv igen."
+          data?.error || "Der opstod en fejl under genereringen. Prøv igen.",
         );
         return;
       }
@@ -130,6 +132,8 @@ export default function GenerateFromSource(props: Props) {
   const noFilesMessage = !hasScope
     ? "Vælg mindst ét fag / en mappe i venstre side for at se dine filer her."
     : "Der er ingen filer i de valgte mapper endnu. Upload materiale først, og kom så tilbage hertil for at lave resumé eller fokus-noter.";
+
+  const markdownText = note?.content ?? "";
 
   return (
     <div className="space-y-4">
@@ -216,13 +220,9 @@ export default function GenerateFromSource(props: Props) {
                     : "border border-neutral-300 bg-white text-neutral-800 hover:bg-neutral-100")
                 }
               >
-                {loading
-                  ? "Genererer og gemmer…"
-                  : "Generér & gem noter"}
+                {loading ? "Genererer og gemmer…" : "Generér & gem noter"}
               </button>
-              {error && (
-                <span className="text-xs text-red-600">{error}</span>
-              )}
+              {error && <span className="text-xs text-red-600">{error}</span>}
               {!error && info && (
                 <span className="text-xs text-neutral-600">{info}</span>
               )}
@@ -244,17 +244,36 @@ export default function GenerateFromSource(props: Props) {
               </div>
             )}
           </div>
-          <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-[#fffeff] px-3 py-2 text-sm leading-relaxed text-neutral-900">
-            {note.content ? (
-              <pre className="whitespace-pre-wrap text-[13px]">
-                {note.content}
-              </pre>
+
+          <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-[#fffef9] px-4 py-3 text-sm leading-relaxed text-neutral-900">
+            {markdownText.trim() ? (
+              <div className="prose prose-sm max-w-none break-words prose-headings:mt-3 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 prose-strong:font-semibold prose-code:before:content-[''] prose-code:after:content-['']">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeSanitize]}
+                  components={{
+                    pre: ({ children }) => (
+                      <pre className="overflow-auto rounded-lg border border-neutral-200 bg-white px-3 py-2 text-[12px] leading-relaxed">
+                        {children}
+                      </pre>
+                    ),
+                    code: ({ children }) => (
+                      <code className="rounded bg-white px-1 py-0.5 text-[12px]">
+                        {children}
+                      </code>
+                    ),
+                  }}
+                >
+                  {markdownText}
+                </ReactMarkdown>
+              </div>
             ) : (
               <span className="text-xs text-neutral-500">
                 (Ingen indhold returneret fra API’et.)
               </span>
             )}
           </div>
+
           {note.created_at && (
             <p className="mt-2 text-right text-[10px] text-neutral-500">
               Gemt: {new Date(note.created_at).toLocaleString("da-DK")}

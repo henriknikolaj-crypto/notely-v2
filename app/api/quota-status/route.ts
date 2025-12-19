@@ -1,33 +1,12 @@
 ﻿// app/api/quota-status/route.ts
 import "server-only";
- 
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
+import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-async function getOwnerId(
-  sb: any,
-): Promise<{ ownerId: string | null; mode: "auth" | "dev" }> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      const id = (data?.user?.id as string | undefined) ?? null;
-      if (id) return { ownerId: id, mode: "auth" };
-    }
-  } catch {
-    // ignore
-  }
-
-  const dev = (process.env.DEV_USER_ID ?? "").trim();
-  if (process.env.NODE_ENV !== "production" && dev) {
-    return { ownerId: dev, mode: "dev" };
-  }
-
-  return { ownerId: null, mode: "auth" };
-}
 
 function errInfo(e: any) {
   try {
@@ -76,6 +55,19 @@ function n0(x: number | null | undefined) {
   return typeof x === "number" && Number.isFinite(x) ? x : 0;
 }
 
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url || !key) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
 async function countJobs(opts: {
   admin: any;
   ownerId: string;
@@ -94,17 +86,16 @@ async function countJobs(opts: {
   for (const tsCol of tsCols) {
     // 1) Forsøg med status-filter (hvis angivet)
     if (statuses?.length) {
-      const q1 = admin
+      let q1 = admin
         .from("jobs")
         .select("id", { count: "exact", head: true })
         .eq("owner_id", ownerId)
         .eq("kind", kind)
         .in("status", statuses);
 
-      const q1b =
-        tsCol && from && to ? q1.gte(tsCol, from).lt(tsCol, to) : q1;
+      if (tsCol && from && to) q1 = q1.gte(tsCol, from).lt(tsCol, to);
 
-      const r1 = await q1b;
+      const r1 = await q1;
       if (!r1.error && r1.count != null) {
         return { count: n0(r1.count), used: { tsCol, withStatus: true } };
       }
@@ -112,52 +103,46 @@ async function countJobs(opts: {
     }
 
     // 2) Fallback: uden status-filter (så quota ikke crasher pga enum/values)
-    const q2 = admin
+    let q2 = admin
       .from("jobs")
       .select("id", { count: "exact", head: true })
       .eq("owner_id", ownerId)
       .eq("kind", kind);
 
-    const q2b = tsCol && from && to ? q2.gte(tsCol, from).lt(tsCol, to) : q2;
+    if (tsCol && from && to) q2 = q2.gte(tsCol, from).lt(tsCol, to);
 
-    const r2 = await q2b;
+    const r2 = await q2;
     if (!r2.error && r2.count != null) {
       return { count: n0(r2.count), used: { tsCol, withStatus: false } };
     }
     lastErr = r2.error ?? lastErr;
   }
 
-  return { count: 0, used: null, error: lastErr };
+  return { count: 0, used: null as any, error: lastErr };
 }
 
-export async function GET(_req: NextRequest) {
-  void _req;
-  const sb = await supabaseServerRoute();
-  const { ownerId, mode } = await getOwnerId(sb);
+export async function GET(req: NextRequest) {
+  // Auth/dev-bypass via lib/auth (+ lib/auth/owner.ts)
+  let ownerId = "";
+  let mode: "auth" | "dev" = "auth";
 
-  if (!ownerId) {
-    return NextResponse.json(
-      { ok: false, error: "unauthorized" },
-      { status: 401 },
-    );
+  try {
+    const u = await requireUser(req);
+    ownerId = u.id;
+    mode = u.mode;
+  } catch {
+    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url || !key) {
+  let admin: any;
+  try {
+    admin = supabaseAdmin();
+  } catch (e: any) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
-      },
+      { ok: false, error: "Server config mangler.", details: String(e?.message ?? e) },
       { status: 500 },
     );
   }
-
-  const admin = createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
 
   const now = new Date();
   const { monthStart, resetAt, monthEnd } = getMonthBoundsUTC(now);
@@ -179,8 +164,7 @@ export async function GET(_req: NextRequest) {
     .select("plan, feature, monthly_limit")
     .eq("plan", plan);
 
-  if (planLimitErr)
-    console.error("[quota-status] plan_limits error:", errInfo(planLimitErr));
+  if (planLimitErr) console.error("[quota-status] plan_limits error:", errInfo(planLimitErr));
 
   const planLimits = planLimitRows ?? [];
   const importLimit =
@@ -188,10 +172,8 @@ export async function GET(_req: NextRequest) {
   const evalLimit =
     planLimits.find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null;
 
-  // Import usage
-  // (Hold den snæver, men tolerant: hvis status-filter fejler, falder vi tilbage uden filter)
+  // Import usage (jobs(kind=import))
   const importStatuses = ["succeeded"];
-
 
   const importMonth = await countJobs({
     admin,
@@ -202,8 +184,9 @@ export async function GET(_req: NextRequest) {
     statuses: importStatuses,
   });
 
-  if ((importMonth as any).error)
+  if ((importMonth as any).error) {
     console.error("[quota-status] import month error:", errInfo((importMonth as any).error));
+  }
 
   const importAll = await countJobs({
     admin,
@@ -212,15 +195,16 @@ export async function GET(_req: NextRequest) {
     statuses: importStatuses,
   });
 
-  if ((importAll as any).error)
+  if ((importAll as any).error) {
     console.error("[quota-status] import all-time error:", errInfo((importAll as any).error));
+  }
 
-  // Evaluate usage (trainer)
+  // Evaluate usage (trainer) — inkluder både NULL og 'trainer' (bagudkompatibelt)
   const { count: evalThisMonthRaw, error: evalMonthErr } = await admin
     .from("exam_sessions")
     .select("id", { count: "exact", head: true })
     .eq("owner_id", ownerId)
-    .eq("source_type", "trainer")
+    .or("source_type.is.null,source_type.eq.trainer")
     .gte("created_at", monthStart)
     .lt("created_at", resetAt);
 
@@ -230,7 +214,7 @@ export async function GET(_req: NextRequest) {
     .from("exam_sessions")
     .select("id", { count: "exact", head: true })
     .eq("owner_id", ownerId)
-    .eq("source_type", "trainer");
+    .or("source_type.is.null,source_type.eq.trainer");
 
   if (evalAllErr) console.error("[quota-status] eval all-time error:", errInfo(evalAllErr));
 
@@ -255,10 +239,8 @@ export async function GET(_req: NextRequest) {
       limitPerMonth: evalLimit,
     },
     planLimits,
-    // Dev-only debug (hjælper, hvis jobs-kolonner/status driller)
     ...(process.env.NODE_ENV !== "production"
       ? { _debug: { importMonthUsed: importMonth.used, importAllUsed: importAll.used } }
       : {}),
   });
 }
-

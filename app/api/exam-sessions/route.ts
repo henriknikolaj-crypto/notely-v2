@@ -1,75 +1,99 @@
 ﻿// app/api/exam-sessions/route.ts
 import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// DEV: brug DEV_USER_ID som owner_id.
-// (Senere skifter vi til rigtig auth.)
-async function getOwnerId(): Promise<string | null> {
-  return process.env.DEV_USER_ID ?? null;
+type ExamSessionRow = {
+  id: string;
+  score: number | null;
+  created_at: string | null;
+  folder_id: string | null;
+  source_type: string | null;
+};
+
+const ALLOWED_SOURCE_TYPES = new Set([
+  "trainer",
+  "mc",
+  "flashcards",
+  "simulator",
+  "notes",
+  "import",
+]);
+
+function clampInt(raw: string | null, def: number, min: number, max: number) {
+  const n = raw ? Number(raw) : def;
+  if (!Number.isFinite(n)) return def;
+  const i = Math.floor(n);
+  return Math.max(min, Math.min(max, i));
 }
 
-// GET /api/exam-sessions?limit=5&folder_id=...
+function asNonEmpty(s: string | null): string | null {
+  const v = (s ?? "").trim();
+  return v.length ? v : null;
+}
+
+function asIsoDate(s: string | null): string | null {
+  const v = asNonEmpty(s);
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+// GET /api/exam-sessions?limit=5&folder_id=...&source_type=trainer|mc|...&before=ISO
 export async function GET(req: NextRequest) {
   try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId();
+    const { sb, id: ownerId } = await requireUser(req);
 
-    if (!ownerId) {
+    const sp = req.nextUrl.searchParams;
+
+    const limit = clampInt(sp.get("limit"), 10, 1, 50);
+
+    const folderFilter = asNonEmpty(sp.get("folder_id") ?? sp.get("folderId"));
+    const sourceType = asNonEmpty(sp.get("source_type") ?? sp.get("sourceType"));
+    const before = asIsoDate(sp.get("before"));
+
+    if (sourceType && !ALLOWED_SOURCE_TYPES.has(sourceType)) {
       return NextResponse.json(
-        { error: "Unauthorized (mangler DEV_USER_ID)" },
-        { status: 401 }
+        { ok: false, error: "Invalid source_type" },
+        { status: 400 },
       );
     }
 
-    const { searchParams } = new URL(req.url);
-
-    const limRaw = searchParams.get("limit");
-    const lim = limRaw ? Number(limRaw) : 10;
-    const limit =
-      Number.isFinite(lim) && lim > 0 ? Math.min(lim, 50) : 10;
-
-    // accepter både folder_id og folderId
-    const folderFilter =
-      searchParams.get("folder_id") ??
-      searchParams.get("folderId") ??
-      null;
-
-    let query = sb
+    let q = sb
       .from("exam_sessions")
-      .select("id,score,created_at,folder_id")
+      .select("id, score, created_at, folder_id, source_type")
       .eq("owner_id", ownerId)
       .order("created_at", { ascending: false })
       .limit(limit);
 
-    if (folderFilter) {
-      query = query.eq("folder_id", folderFilter);
-    }
+    if (folderFilter) q = q.eq("folder_id", folderFilter);
+    if (sourceType) q = q.eq("source_type", sourceType);
+    if (before) q = q.lt("created_at", before);
 
-    const { data, error } = await query;
+    const { data, error } = await q;
 
     if (error) {
-      console.error("EXAM-SESSIONS select error:", error);
-      return NextResponse.json(
-        { error: "DB error" },
-        { status: 500 }
-      );
+      console.error("[exam-sessions] select error:", error);
+      return NextResponse.json({ ok: false, error: "DB error" }, { status: 500 });
     }
 
     return NextResponse.json(
-      { ok: true, sessions: data ?? [] },
-      { status: 200 }
+      { ok: true, sessions: (data ?? []) as ExamSessionRow[] },
+      { status: 200 },
     );
-  } catch (e: any) {
-    console.error("EXAM-SESSIONS route error:", e);
+  } catch (err: any) {
+    const msg = String(err?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+    if (!isAuth) console.error("[exam-sessions] route error:", err);
+
     return NextResponse.json(
-      { error: e?.message ?? "Unknown error" },
-      { status: 500 }
+      { ok: false, error: isAuth ? "Unauthorized" : (err?.message ?? "Unknown error") },
+      { status: isAuth ? 401 : 500 },
     );
   }
 }
-
-

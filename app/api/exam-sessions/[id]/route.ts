@@ -1,31 +1,16 @@
-﻿// app/api/exam-sessions/[id]/route.ts
-import "server-only";
+﻿import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { getOwnerCtx } from "@/lib/auth/owner";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ id: string }> };
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  // Prøv rigtig auth først (hvis du er logget ind)
-  try {
-    const { data } = await sb.auth.getUser?.();
-    if (data?.user?.id) return data.user.id as string;
-  } catch {
-    // ignore
-  }
-  // DEV fallback
-  return process.env.DEV_USER_ID ?? null;
-}
-
-async function deleteExamSession(id?: string) {
-  if (!id) return { ok: false as const, status: 400 as const, error: "Missing id" };
-
-  const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
-
-  // 1) Find rækken først
+async function deleteExamSession(sb: any, id: string, ownerId: string) {
+  // 1) find row (idempotent-ish)
   const { data: row, error: fetchError } = await sb
     .from("exam_sessions")
     .select("id, owner_id")
@@ -33,68 +18,86 @@ async function deleteExamSession(id?: string) {
     .maybeSingle();
 
   if (fetchError) {
-    console.error("[exam-sessions] fetch error", { id, fetchError });
+    console.error("[exam-sessions/:id] fetch error", { id, fetchError });
     return { ok: false as const, status: 500 as const, error: "DB error" };
   }
 
   if (!row) {
-    console.warn("[exam-sessions] delete: not found (lookup)", { id });
-    return { ok: false as const, status: 404 as const, error: "Not found" };
+    // idempotent: already gone
+    return { ok: true as const, status: 200 as const, alreadyDeleted: true as const };
   }
 
-  // 2) Ejer-tjek (DEV/eller auth)
-  if (ownerId && row.owner_id && row.owner_id !== ownerId) {
-    console.warn("[exam-sessions] delete: owner mismatch", {
-      id,
-      rowOwner: row.owner_id,
-      reqOwner: ownerId,
-    });
+  if (row.owner_id !== ownerId) {
     return { ok: false as const, status: 403 as const, error: "Forbidden" };
   }
 
-  // 3) Slet (med owner-filter hvis vi har en)
-  let q = sb.from("exam_sessions").delete().eq("id", id);
-  if (ownerId) q = q.eq("owner_id", ownerId);
-
-  const { error: deleteError } = await q;
+  // 2) delete with owner filter (extra safety)
+  const { error: deleteError } = await sb
+    .from("exam_sessions")
+    .delete()
+    .eq("id", id)
+    .eq("owner_id", ownerId);
 
   if (deleteError) {
-    console.error("[exam-sessions] delete error", { id, deleteError });
+    console.error("[exam-sessions/:id] delete error", { id, deleteError });
     return { ok: false as const, status: 500 as const, error: "DB delete failed" };
   }
 
-  console.log("[exam-sessions] deleted", { id });
   return { ok: true as const, status: 200 as const };
 }
 
-// Direkte DELETE (fx via fetch)
-export async function DELETE(_req: NextRequest, { params }: Ctx) {
-  const { id } = await params;
-  const result = await deleteExamSession(id);
+// Direkte DELETE (fetch)
+export async function DELETE(req: NextRequest, ctx: Ctx) {
+  const { id } = await ctx.params;
+
+  if (!id) {
+    return NextResponse.json({ ok: false, error: "Missing id" }, { status: 400 });
+  }
+
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  const result = await deleteExamSession(sb, id, owner.ownerId);
 
   if (!result.ok) {
-    return NextResponse.json({ error: result.error }, { status: result.status });
+    return NextResponse.json({ ok: false, error: result.error }, { status: result.status });
   }
-  return NextResponse.json({ ok: true }, { status: 200 });
+
+  return NextResponse.json(
+    { ok: true, id, ...(result as any).alreadyDeleted ? { alreadyDeleted: true } : {} },
+    { status: 200 },
+  );
 }
 
-// POST med _method=DELETE fra formularen på /traener/evalueringer
-export async function POST(req: NextRequest, { params }: Ctx) {
-  const { id } = await params;
+// POST med _method=DELETE (HTML form)
+export async function POST(req: NextRequest, ctx: Ctx) {
+  const { id } = await ctx.params;
 
-  const formData = await req.formData().catch(() => null);
-  const methodOverride = (formData?.get("_method") || "").toString().toUpperCase();
-
-  if (methodOverride === "DELETE") {
-    const result = await deleteExamSession(id);
-
-    if (!result.ok) {
-      return NextResponse.json({ error: result.error }, { status: result.status });
-    }
-
-    const redirectUrl = new URL("/traener/evalueringer", req.url);
-    return NextResponse.redirect(redirectUrl, 303);
+  if (!id) {
+    return NextResponse.json({ ok: false, error: "Missing id" }, { status: 400 });
   }
 
-  return NextResponse.json({ error: "Unsupported method" }, { status: 405 });
+  const formData = await req.formData().catch(() => null);
+  const methodOverride = String(formData?.get("_method") || "").toUpperCase();
+
+  if (methodOverride !== "DELETE") {
+    return NextResponse.json({ ok: false, error: "Unsupported method" }, { status: 405 });
+  }
+
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  const result = await deleteExamSession(sb, id, owner.ownerId);
+
+  if (!result.ok) {
+    return NextResponse.json({ ok: false, error: result.error }, { status: result.status });
+  }
+
+  return NextResponse.redirect(new URL("/traener/evalueringer", req.url), 303);
 }

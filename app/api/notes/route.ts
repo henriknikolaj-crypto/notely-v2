@@ -1,189 +1,109 @@
-﻿// app/api/notes/route.ts
-import "server-only";
+﻿import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { getOwnerCtx } from "@/lib/auth/owner";
 
-export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-// Max antal noter vi gemmer pr. bruger (ældste ryger først)
-const MAX_NOTES_PER_USER = 50;
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // dev-fallback
-  }
-  return process.env.DEV_USER_ID ?? null;
+function normStr(v: any): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
 }
 
-type NoteBody = {
-  title?: string | null;
-  content?: string | null;
-  note_type?: string | null;
-  source_title?: string | null;
-  source_url?: string | null;
-  // fileId/file_id er tilladt men ignoreres lige nu (notes har ingen file_id-kolonne)
-  fileId?: string | null;
-  file_id?: string | null;
-};
-
-// LIST notes (til fx “Seneste noter”)
-export async function GET(req: NextRequest) {
+async function readJson(req: NextRequest): Promise<any | null> {
   try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId(sb);
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
 
-    if (!ownerId) {
-      return NextResponse.json(
-        { error: "Unauthorized (mangler bruger-id / DEV_USER_ID)." },
-        { status: 401 },
-      );
-    }
-
-    const url = new URL(req.url);
-    const limitRaw = url.searchParams.get("limit");
-    const limit = Number.isFinite(Number(limitRaw))
-      ? Math.max(1, Math.min(100, Number(limitRaw)))
-      : 20;
-
-    const { data, error } = await sb
-      .from("notes")
-      .select(
-        "id, title, content, note_type, source_title, source_url, created_at",
-      )
-      .eq("owner_id", ownerId)
-      .order("created_at", { ascending: false })
-      .limit(limit);
-
-    if (error) {
-      console.error("NOTES GET error:", error);
-      return NextResponse.json(
-        { error: "Fejl ved hentning af noter." },
-        { status: 500 },
-      );
-    }
-
-    return NextResponse.json({ notes: data ?? [] }, { status: 200 });
-  } catch (err) {
-    console.error("NOTES GET unhandled error:", err);
+// GET /api/notes?limit=50
+export async function GET(req: NextRequest) {
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
     return NextResponse.json(
-      { error: "Ukendt serverfejl ved hentning af noter." },
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
+    );
+  }
+
+  const limitRaw = Number(req.nextUrl.searchParams.get("limit") ?? "50");
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+
+  const { data, error } = await sb
+    .from("notes")
+    .select("id, title, content, source_title, source_url, created_at")
+    .eq("owner_id", owner.ownerId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("[api/notes GET] db error", error);
+    return NextResponse.json(
+      { ok: false, code: "DB_ERROR", error: "Database-fejl." },
       { status: 500 },
     );
   }
+
+  return NextResponse.json({ ok: true, notes: data ?? [] }, { status: 200 });
 }
 
-// CREATE note (bruges bl.a. af “Gem som note” under Feedback)
+// POST /api/notes
+// Body: { title?: string, content: string, source_title?: string, source_url?: string }
 export async function POST(req: NextRequest) {
-  try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId(sb);
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
+    return NextResponse.json(
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
+    );
+  }
 
-    if (!ownerId) {
-      return NextResponse.json(
-        { error: "Unauthorized (mangler bruger-id / DEV_USER_ID)." },
-        { status: 401 },
-      );
-    }
+  const body = await readJson(req);
+  if (!body) {
+    return NextResponse.json(
+      { ok: false, code: "INVALID_JSON", error: "Ugyldigt JSON-body." },
+      { status: 400 },
+    );
+  }
 
-    const body = (await req.json().catch(() => ({}))) as NoteBody;
+  const title = normStr(body.title);
+  const content = normStr(body.content);
+  const source_title = normStr(body.source_title);
+  const source_url = normStr(body.source_url);
 
-    const title =
-      typeof body.title === "string" && body.title.trim().length > 0
-        ? body.title.trim().slice(0, 200)
-        : "Note";
+  if (!content) {
+    return NextResponse.json(
+      { ok: false, code: "INVALID_CONTENT", error: "Indhold må ikke være tomt." },
+      { status: 400 },
+    );
+  }
 
-    const content =
-      typeof body.content === "string" ? body.content : null;
-
-    const note_type =
-      typeof body.note_type === "string" ? body.note_type : null;
-
-    const source_title =
-      typeof body.source_title === "string" ? body.source_title : null;
-
-    const source_url =
-      typeof body.source_url === "string" ? body.source_url : null;
-
-    // fileId/file_id er OK at sende, men vi bruger den ikke endnu
-    // const fileIdRaw = body.file_id ?? body.fileId ?? null;
-
-    const insertPayload: any = {
-      owner_id: ownerId,
+  const { data, error } = await sb
+    .from("notes")
+    .insert({
+      owner_id: owner.ownerId,
       title,
       content,
-      note_type,
       source_title,
       source_url,
-    };
+    })
+    .select("id, title, content, source_title, source_url, created_at")
+    .maybeSingle();
 
-    const { data, error } = await sb
-      .from("notes")
-      .insert(insertPayload)
-      .select(
-        "id, title, content, note_type, source_title, source_url, created_at",
-      )
-      .single();
-
-    if (error || !data) {
-      console.error("NOTES POST insert error:", error);
-      return NextResponse.json(
-        { error: "Kunne ikke gemme noten." },
-        { status: 500 },
-      );
-    }
-
-    // --- Automatisk oprydning: behold kun de nyeste MAX_NOTES_PER_USER noter ---
-    try {
-      const { data: overflowNotes, error: overflowErr } = await sb
-        .from("notes")
-        .select("id")
-        .eq("owner_id", ownerId)
-        .order("created_at", { ascending: false })
-        // række 0-49 = de 50 nyeste → vi henter alt derefter
-        .range(MAX_NOTES_PER_USER, MAX_NOTES_PER_USER + 200);
-
-      if (overflowErr) {
-        console.error("NOTES POST cleanup select error:", overflowErr);
-      } else if (overflowNotes && overflowNotes.length > 0) {
-        const idsToDelete = overflowNotes.map((n: any) => n.id as string);
-
-        const { error: deleteErr } = await sb
-          .from("notes")
-          .delete()
-          .in("id", idsToDelete);
-
-        if (deleteErr) {
-          console.error("NOTES POST cleanup delete error:", deleteErr);
-        }
-      }
-    } catch (cleanupErr) {
-      console.error("NOTES POST cleanup unexpected error:", cleanupErr);
-    }
-    // -------------------------------------------------------------------------
-
+  if (error) {
+    console.error("[api/notes POST] db error", error);
     return NextResponse.json(
-      {
-        id: data.id,
-        title: data.title,
-        content: data.content,
-        note_type: data.note_type,
-        source_title: data.source_title,
-        source_url: data.source_url,
-        created_at: data.created_at,
-      },
-      { status: 200 },
-    );
-  } catch (err) {
-    console.error("NOTES POST unhandled error:", err);
-    return NextResponse.json(
-      { error: "Ukendt serverfejl ved oprettelse af note." },
+      { ok: false, code: "DB_INSERT_FAILED", error: "Kunne ikke oprette note." },
       { status: 500 },
     );
   }
+
+  return NextResponse.json({ ok: true, note: data }, { status: 200 });
 }

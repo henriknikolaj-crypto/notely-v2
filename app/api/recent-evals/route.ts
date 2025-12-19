@@ -1,22 +1,15 @@
 ﻿// app/api/recent-evals/route.ts
-import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import "server-only";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // falder tilbage til DEV_USER_ID i lokal dev
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
+import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 type SessionRow = {
   id: string;
-  created_at: string;
+  created_at: string | null;
   score: number | null;
   folder_id: string | null;
   source_type: string | null;
@@ -27,31 +20,24 @@ type FolderRow = {
   name: string | null;
 };
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId(sb);
-
-    if (!ownerId) {
-      return NextResponse.json(
-        { error: "Mangler owner_id (hverken login eller DEV_USER_ID sat)." },
-        { status: 401 }
-      );
-    }
+    const { sb, id: ownerId } = await requireUser(req);
 
     // 1) Hent de seneste træner-evalueringer (ikke-MC)
+    // trainer = source_type IS NULL eller 'trainer'
     const { data: sessions, error } = await sb
       .from("exam_sessions")
       .select("id, created_at, score, folder_id, source_type")
       .eq("owner_id", ownerId)
-      // trainer = source_type IS NULL eller 'trainer'
       .or("source_type.is.null,source_type.eq.trainer")
       .order("created_at", { ascending: false })
       .limit(5);
 
     if (error) {
-      console.error("recent-evals query error:", error);
-      return NextResponse.json({ items: [] }, { status: 200 });
+      console.error("[recent-evals] query error:", error);
+      // Bevidst “blød” fejl (UI kan bare vise tom liste)
+      return NextResponse.json({ ok: true, items: [] }, { status: 200 });
     }
 
     const rows = (sessions ?? []) as SessionRow[];
@@ -61,11 +47,11 @@ export async function GET() {
       new Set(
         rows
           .map((r) => r.folder_id)
-          .filter((id): id is string => typeof id === "string" && !!id)
-      )
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0),
+      ),
     );
 
-    // 3) Hent folder-navne fra training_folders (eller mapper senere hvis vi skifter tabel)
+    // 3) Hent folder-navne fra training_folders
     const folderMap = new Map<string, string | null>();
 
     if (folderIds.length > 0) {
@@ -75,15 +61,15 @@ export async function GET() {
         .in("id", folderIds);
 
       if (foldersError) {
-        console.error("recent-evals folders error:", foldersError);
+        console.error("[recent-evals] training_folders lookup error:", foldersError);
       } else {
         for (const f of (folders ?? []) as FolderRow[]) {
-          folderMap.set(f.id, f.name ?? null);
+          if (f?.id) folderMap.set(f.id, f.name ?? null);
         }
       }
     }
 
-    // 4) Byg payload til UI
+    // 4) Payload til UI
     const items = rows.map((r) => ({
       id: r.id,
       when: r.created_at,
@@ -91,12 +77,16 @@ export async function GET() {
       folder_name: r.folder_id ? folderMap.get(r.folder_id) ?? null : null,
     }));
 
-    return NextResponse.json({ items }, { status: 200 });
-  } catch (e: any) {
-    console.error("recent-evals route error:", e);
-    return NextResponse.json(
-      { error: e?.message ?? "Ukendt fejl" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: true, items }, { status: 200 });
+  } catch (err: any) {
+    const msg = String(err?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+
+    if (isAuth) {
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+
+    console.error("[recent-evals] route error:", err);
+    return NextResponse.json({ ok: false, error: "Ukendt fejl" }, { status: 500 });
   }
 }

@@ -1,144 +1,137 @@
 // app/api/files/[id]/route.ts
+import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // DEV fallback
-  }
-  return process.env.DEV_USER_ID ?? null;
+type Ctx = { params: Promise<{ id: string }> };
+
+function normStr(v: any): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+
+async function resolveOwnerId(req: NextRequest, sb: any): Promise<string | null> {
+  const owner = await getOwnerCtx(req, sb);
+  return owner?.ownerId ?? null;
 }
 
 // Flyt fil til anden mappe (bruges af dropdownen i UI)
-export async function PUT(
-  req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
-) {
+// Body: { folder_id: "<uuid|null>" }
+export async function PUT(req: NextRequest, ctx: Ctx) {
+  const { id: fileId } = await ctx.params;
+  if (!fileId) {
+    return NextResponse.json({ ok: false, error: "Missing id" }, { status: 400 });
+  }
+
   const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
+  const ownerId = await resolveOwnerId(req, sb);
 
   if (!ownerId) {
     return NextResponse.json(
-      { error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
-      { status: 401 }
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
     );
   }
 
-  const { id: fileId } = await ctx.params;
-
-  let body: any = null;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Ugyldigt JSON-body." }, { status: 400 });
-  }
-
-  const folderId = body?.folder_id as string | undefined;
-  if (!folderId) {
-    return NextResponse.json({ error: "Mangler folder_id." }, { status: 400 });
-  }
-
-  try {
-    // Opdater begge tabeller – kun den ene vil matche
-    const updates = { folder_id: folderId };
-
-    const { error: errFiles } = await sb
-      .from("files")
-      .update(updates)
-      .eq("owner_id", ownerId)
-      .eq("id", fileId);
-
-    const { error: errTraining } = await sb
-      .from("training_files")
-      .update(updates)
-      .eq("owner_id", ownerId)
-      .eq("id", fileId);
-
-    if (errFiles && errTraining) {
-      console.error("/api/files/[id] PUT fejl", errFiles, errTraining);
-      return NextResponse.json(
-        { error: "Kunne ikke opdatere filens mappe." },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({ ok: true, folder_id: folderId });
-  } catch (err) {
-    console.error("/api/files/[id] PUT uventet fejl", err);
+  const body = (await req.json().catch(() => null)) as any;
+  if (!body || !("folder_id" in body)) {
     return NextResponse.json(
-      { error: "Uventet fejl ved opdatering af fil." },
-      { status: 500 }
+      { ok: false, code: "MISSING_FOLDER_ID", error: "Mangler folder_id." },
+      { status: 400 },
     );
   }
+
+  // Tillad null (flyt ud af mappe) eller string uuid
+  const folderId = body.folder_id === null ? null : normStr(body.folder_id);
+
+  const updates = { folder_id: folderId };
+
+  // Opdater files
+  const rFiles = await sb
+    .from("files")
+    .update(updates)
+    .eq("owner_id", ownerId)
+    .eq("id", fileId);
+
+  // Opdater training_files (legacy) — OK hvis table/row ikke findes
+  const rTraining = await sb
+    .from("training_files")
+    .update(updates)
+    .eq("owner_id", ownerId)
+    .eq("id", fileId);
+
+  if (rFiles.error && rTraining.error) {
+    console.error("/api/files/[id] PUT fejl", rFiles.error, rTraining.error);
+    return NextResponse.json(
+      { ok: false, code: "DB_UPDATE_FAILED", error: "Kunne ikke opdatere filens mappe." },
+      { status: 500 },
+    );
+  }
+
+  return NextResponse.json(
+    { ok: true, file_id: fileId, folder_id: folderId },
+    { status: 200 },
+  );
 }
 
 // Slet fil (brugt af Slet-knappen)
-export async function DELETE(
-  _req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(req: NextRequest, ctx: Ctx) {
+  void req;
+
+  const { id: fileId } = await ctx.params;
+  if (!fileId) {
+    return NextResponse.json({ ok: false, error: "Missing id" }, { status: 400 });
+  }
+
   const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
+  const ownerId = await resolveOwnerId(req, sb);
 
   if (!ownerId) {
     return NextResponse.json(
-      { error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
-      { status: 401 }
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
     );
   }
 
-  const { id: fileId } = await ctx.params;
+  // 1) Slet relaterede doc_chunks først (idempotent-ish)
+  const rChunks = await sb
+    .from("doc_chunks")
+    .delete()
+    .eq("owner_id", ownerId)
+    .eq("file_id", fileId);
 
-  try {
-    // 1) Slet relaterede doc_chunks
-    const { error: chunksError } = await sb
-      .from("doc_chunks")
-      .delete()
-      .eq("owner_id", ownerId)
-      .eq("file_id", fileId);
+  if (rChunks.error) {
+    console.error("/api/files/[id] DELETE doc_chunks fejl", rChunks.error);
+    // fortsæt alligevel
+  }
 
-    if (chunksError) {
-      console.error("/api/files/[id] DELETE doc_chunks fejl", chunksError);
-      // vi fortsætter alligevel og forsøger at slette fil-records
-    }
+  // 2) Slet i files
+  const rFiles = await sb
+    .from("files")
+    .delete()
+    .eq("owner_id", ownerId)
+    .eq("id", fileId);
 
-    // 2) Slet i files
-    const { error: filesError } = await sb
-      .from("files")
-      .delete()
-      .eq("owner_id", ownerId)
-      .eq("id", fileId);
+  // 3) Slet i training_files (legacy)
+  const rTraining = await sb
+    .from("training_files")
+    .delete()
+    .eq("owner_id", ownerId)
+    .eq("id", fileId);
 
-    // 3) Slet i training_files (gamle uploads)
-    const { error: trainingError } = await sb
-      .from("training_files")
-      .delete()
-      .eq("owner_id", ownerId)
-      .eq("id", fileId);
-
-    if (filesError && trainingError) {
-      console.error("/api/files/[id] DELETE fejl", filesError, trainingError);
-      return NextResponse.json(
-        { error: "Kunne ikke slette filen." },
-        { status: 500 }
-      );
-    }
-
-    // Behandler 0 rækker som OK (samme semantik som din klient forventer)
-    return NextResponse.json({ ok: true, file_id: fileId });
-  } catch (err) {
-    console.error("/api/files/[id] DELETE uventet fejl", err);
+  if (rFiles.error && rTraining.error) {
+    console.error("/api/files/[id] DELETE fejl", rFiles.error, rTraining.error);
     return NextResponse.json(
-      { error: "Uventet fejl ved sletning af fil." },
-      { status: 500 }
+      { ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette filen." },
+      { status: 500 },
     );
   }
+
+  return NextResponse.json({ ok: true, file_id: fileId }, { status: 200 });
 }

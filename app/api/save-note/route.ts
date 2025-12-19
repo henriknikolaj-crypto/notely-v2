@@ -1,75 +1,115 @@
-﻿import { NextResponse } from "next/server";
-import { cookies as nextCookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+﻿// app/api/save-note/route.ts
+import "server-only";
 
-async function getDevUserId(req: Request): Promise<string | null> {
-  if (process.env.NODE_ENV === "production") return null;
+import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type NoteType = "resume" | "focus" | "manual" | "other";
+
+type SaveNoteRequest = {
+  // new (preferred)
+  title?: string | null;
+  content?: string | null;
+
+  sourceTitle?: string | null;
+  sourceUrl?: string | null;
+
+  folderId?: string | null;
+  noteType?: NoteType | string | null;
+
+  // backwards compat
+  text?: string | null;
+  source?: string | null;
+};
+
+function cleanStr(x: any): string | null {
+  const s = typeof x === "string" ? x.trim() : "";
+  return s.length ? s : null;
+}
+
+async function readJsonBody<T>(req: NextRequest) {
+  const raw = (await req.text()).trim();
+  if (!raw) return { ok: true as const, value: {} as T };
   try {
-    const secret = req.headers.get("x-shared-secret") ?? req.headers.get("x-dev-secret");
-    if (secret && secret === process.env.IMPORT_SHARED_SECRET) {
-      return process.env.DEV_USER_ID ?? null;
-    }
-  } catch {}
-  return null;
-}
-
-export async function POST(req: Request) {
-  const body = await req.json().catch(()=>({}));
-  const text = String(body?.text ?? "").trim();
-  const source = String(body?.source ?? "manual");
-
-  if (!text) return NextResponse.json({ ok:false, error:"empty" }, { status:400 });
-
-  try {
-    const cookieStore = await nextCookies();
-    const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      {
-        cookies: {
-          get: (name: string) => cookieStore.get(name)?.value,
-          set() {},
-          remove() {}
-        }
-      }
-    );
-
-    const {
-  data: { user },
-} = await supabase.auth.getUser();
-
-let userId: string | null = user?.id ?? null;
-
-if (!userId) {
-  const devId = await getDevUserId(req as any);
-  if (devId) userId = devId;
-}
-
-if (!userId) {
-  return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
-}
-
-    // Prøv at skrive til user_notes (valgfri tabel)
-    // Skema-antagelse: id uuid default gen_random_uuid(), owner_id uuid, content text, source text, created_at timestamptz default now()
-    const ins = await supabase
-      .from("user_notes")
-      .insert({ owner_id: userId, content: text, source })
-      .select("id")
-      .maybeSingle();
-
-    if ((ins as any)?.error && String((ins as any).error?.message ?? "").includes("does not exist")) {
-      // Tabel findes ikke -> svar OK (stub)
-      return NextResponse.json({ ok:true, saved:false, warn:"no_table" }, { status:200 });
-    }
-
-    if ((ins as any)?.error) {
-      // Anden fejl -> returnér stadig OK, men som stub
-      return NextResponse.json({ ok:true, saved:false, warn:"insert_failed" }, { status:200 });
-    }
-
-    return NextResponse.json({ ok:true, saved:true, id: (ins as any)?.data?.id ?? null }, { status:200 });
+    return { ok: true as const, value: JSON.parse(raw) as T };
   } catch {
-    return NextResponse.json({ ok:true, saved:false, warn:"server_stub" }, { status:200 });
+    return { ok: false as const, error: "Ugyldigt JSON-body." };
   }
 }
 
+function normalizeNoteType(x: any): NoteType | null {
+  const s = cleanStr(x)?.toLowerCase();
+  if (!s) return null;
+  if (s === "resume") return "resume";
+  if (s === "focus") return "focus";
+  if (s === "manual") return "manual";
+  return "other";
+}
+
+function defaultTitleFor(noteType: NoteType | null, sourceTitle: string | null) {
+  if (noteType === "focus") return sourceTitle ? `Fokus-noter – ${sourceTitle}` : "Fokus-noter";
+  if (noteType === "resume") return sourceTitle ? `Resumé – ${sourceTitle}` : "Resumé";
+  return sourceTitle ? `Note – ${sourceTitle}` : "Note";
+}
+
+export async function POST(req: NextRequest) {
+  // Auth/dev-bypass via requireUser(req)
+  let sb: any;
+  let ownerId = "";
+  try {
+    const u = await requireUser(req);
+    sb = u.sb;
+    ownerId = u.id;
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+    if (!isAuth) console.error("[save-note] requireUser crash:", e);
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  const parsed = await readJsonBody<SaveNoteRequest>(req);
+  if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
+
+  const body = parsed.value ?? {};
+
+  const content = cleanStr(body.content) ?? cleanStr(body.text);
+  if (!content) {
+    return NextResponse.json({ ok: false, error: "empty" }, { status: 400 });
+  }
+
+  const folderId = cleanStr(body.folderId);
+  const sourceTitle = cleanStr(body.sourceTitle) ?? cleanStr(body.source);
+  const sourceUrl = cleanStr(body.sourceUrl);
+
+  const noteType = normalizeNoteType(body.noteType);
+  const title = cleanStr(body.title) ?? defaultTitleFor(noteType, sourceTitle);
+
+  try {
+    const { data, error } = await sb
+      .from("notes")
+      .insert({
+        owner_id: ownerId,
+        title,
+        content,
+        folder_id: folderId,
+        note_type: noteType,
+        source_title: sourceTitle,
+        source_url: sourceUrl,
+      })
+      .select("id,title,content,created_at,folder_id,note_type,source_title,source_url")
+      .single();
+
+    if (error || !data) {
+      console.error("[save-note] insert error:", error);
+      return NextResponse.json({ ok: false, error: "INSERT_FAILED" }, { status: 500 });
+    }
+
+    return NextResponse.json({ ok: true, saved: true, note: data }, { status: 200 });
+  } catch (e: any) {
+    console.error("[save-note] handler crash:", e);
+    return NextResponse.json({ ok: false, error: "SERVER_ERROR" }, { status: 500 });
+  }
+}

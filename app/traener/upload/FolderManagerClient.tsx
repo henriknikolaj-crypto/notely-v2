@@ -2,7 +2,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 type Folder = {
   id: string;
@@ -22,13 +22,37 @@ type EditState =
   | { mode: "none" }
   | { mode: "edit"; id: string; name: string; start: string; end: string };
 
-export default function FolderManagerClient({
-  ownerId,
-  initialFolders,
-}: Props) {
+function toInputDate(iso: string | null | undefined): string {
+  if (!iso) return "";
+  return iso.slice(0, 10);
+}
+
+function formatPeriod(f: Folder): string {
+  const s = f.start_date ? f.start_date.slice(0, 10) : null;
+  const e = f.end_date ? f.end_date.slice(0, 10) : null;
+  if (!s && !e) return "Ingen periode angivet";
+  if (s && !e) return `${s} —`;
+  if (!s && e) return `— ${e}`;
+  return `${s} — ${e}`;
+}
+
+async function safeJson(res: Response): Promise<any | null> {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export default function FolderManagerClient({ ownerId, initialFolders }: Props) {
   const router = useRouter();
 
   const [folders, setFolders] = useState<Folder[]>(initialFolders);
+
+  const sortedFolders = useMemo(() => {
+    return [...folders].sort((a, b) => a.name.localeCompare(b.name, "da"));
+  }, [folders]);
+
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -43,21 +67,6 @@ export default function FolderManagerClient({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  function toInputDate(iso: string | null | undefined): string {
-    if (!iso) return "";
-    return iso.slice(0, 10);
-  }
-
-  function formatPeriod(f: Folder): string {
-    const s = f.start_date ? f.start_date.slice(0, 10) : null;
-    const e = f.end_date ? f.end_date.slice(0, 10) : null;
-    if (!s && !e) return "Ingen periode angivet";
-    if (s && !e) return `${s} —`;
-    if (!s && e) return `— ${e}`;
-    return `${s} — ${e}`;
-  }
-
-  // --- Opret mappe ---
   async function handleCreate() {
     if (!newName.trim()) {
       setCreateError("Skriv et navn til mappen.");
@@ -65,6 +74,7 @@ export default function FolderManagerClient({
     }
     setCreating(true);
     setCreateError(null);
+
     try {
       const res = await fetch("/api/folders", {
         method: "POST",
@@ -77,29 +87,26 @@ export default function FolderManagerClient({
         }),
       });
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`Bad status: ${res.status} ${txt}`);
-      }
+      const data = await safeJson(res);
 
-      const data = (await res.json()) as { folder: Folder };
+      if (!res.ok || !data?.folder) {
+        setCreateError(data?.error || "Kunne ikke oprette mappen. Prøv igen.");
+        return;
+      }
 
       setFolders((prev) => [...prev, data.folder]);
       setNewName("");
       setNewStart("");
       setNewEnd("");
-
-      // opdater venstre kolonne + dropdowns
       router.refresh();
     } catch (err) {
       console.error("create folder error", err);
-      setCreateError("Kunne ikke oprette mappen (lokal fejl).");
+      setCreateError("Kunne ikke oprette mappen. Prøv igen.");
     } finally {
       setCreating(false);
     }
   }
 
-  // --- Redigér mappe ---
   function beginEdit(f: Folder) {
     setEdit({
       mode: "edit",
@@ -122,11 +129,12 @@ export default function FolderManagerClient({
       setEditError("Navn må ikke være tomt.");
       return;
     }
+
     setSavingEdit(true);
     setEditError(null);
 
     try {
-      const res = await fetch(`/api/folders/${edit.id}`, {
+      const res = await fetch(`/api/folders/${encodeURIComponent(edit.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -136,50 +144,76 @@ export default function FolderManagerClient({
         }),
       });
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`Bad status: ${res.status} ${txt}`);
+      const data = await safeJson(res);
+
+      if (!res.ok || !data?.folder) {
+        setEditError(data?.error || "Kunne ikke gemme ændringerne. Prøv igen.");
+        return;
       }
 
-      const data = (await res.json()) as { folder: Folder };
-
-      setFolders((prev) =>
-        prev.map((f) => (f.id === data.folder.id ? data.folder : f)),
-      );
+      setFolders((prev) => prev.map((f) => (f.id === data.folder.id ? data.folder : f)));
       setEdit({ mode: "none" });
-
-      // opdater venstre kolonne + dropdowns
       router.refresh();
     } catch (err) {
       console.error("edit folder error", err);
-      setEditError("Kunne ikke gemme ændringerne (lokal fejl).");
+      setEditError("Kunne ikke gemme ændringerne. Prøv igen.");
     } finally {
       setSavingEdit(false);
     }
   }
 
-  // --- Slet mappe ---
+  async function deleteOnce(id: string, force: boolean) {
+    const url = force ? `/api/folders/${encodeURIComponent(id)}?force=1` : `/api/folders/${encodeURIComponent(id)}`;
+    return fetch(url, { method: "DELETE" });
+  }
+
   async function handleDelete(id: string) {
-    if (!window.confirm("Er du sikker på, at du vil slette denne mappe?")) {
-      return;
-    }
+    const f = folders.find((x) => x.id === id);
+    const label = f?.name ? ` "${f.name}"` : "";
+
+    if (!window.confirm(`Er du sikker på, at du vil slette mappen${label}?`)) return;
+
     setDeletingId(id);
     setDeleteError(null);
-    try {
-      const res = await fetch(`/api/folders/${id}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`Bad status: ${res.status} ${txt}`);
-      }
-      setFolders((prev) => prev.filter((f) => f.id !== id));
 
-      // opdater venstre kolonne + dropdowns
+    try {
+      const res = await deleteOnce(id, false);
+      const data = await safeJson(res);
+
+      if (res.status === 409 && data?.code === "FOLDER_NOT_EMPTY") {
+        const meta = data?.meta;
+        const filesCount = typeof meta?.filesCount === "number" ? meta.filesCount : null;
+
+        const msg =
+          filesCount != null
+            ? `Mappen indeholder ${filesCount} fil(er). Vil du slette ALT i mappen (tvangsslet)?`
+            : `Mappen indeholder materiale. Vil du slette ALT i mappen (tvangsslet)?`;
+
+        if (!window.confirm(msg)) return;
+
+        const res2 = await deleteOnce(id, true);
+        const data2 = await safeJson(res2);
+
+        if (!res2.ok) {
+          setDeleteError(data2?.error || "Kunne ikke tvangsslette mappen. Prøv igen.");
+          return;
+        }
+
+        setFolders((prev) => prev.filter((x) => x.id !== id));
+        router.refresh();
+        return;
+      }
+
+      if (!res.ok) {
+        setDeleteError(data?.error || "Kunne ikke slette mappen. Prøv igen.");
+        return;
+      }
+
+      setFolders((prev) => prev.filter((x) => x.id !== id));
       router.refresh();
     } catch (err) {
       console.error("delete folder error", err);
-      setDeleteError("Kunne ikke slette mappen (lokal fejl).");
+      setDeleteError("Kunne ikke slette mappen. Prøv igen.");
     } finally {
       setDeletingId(null);
     }
@@ -189,19 +223,16 @@ export default function FolderManagerClient({
     <section className="rounded-3xl border border-zinc-200 bg-white p-4 shadow-sm">
       <h2 className="text-sm font-semibold text-zinc-900">Mapper og perioder</h2>
       <p className="mt-1 text-xs text-zinc-600">
-        Her kan du oprette og redigere fag/mapper samt tilknytte start- og
-        slutdato. Perioder kan senere bruges til planlægning og overblik.
+        Her kan du oprette og redigere fag/mapper samt tilknytte start- og slutdato.
       </p>
 
       {/* Ny mappe */}
       <div className="mt-4 space-y-2 rounded-2xl bg-zinc-50 p-3">
-        <label className="block text-[12px] font-medium text-zinc-800">
-          Ny mappe / fag
-        </label>
+        <label className="block text-[12px] font-medium text-zinc-800">Ny mappe / fag</label>
         <input
           type="text"
           className="w-full rounded-xl border border-zinc-300 px-3 py-1.5 text-sm outline-none focus:border-zinc-900"
-          placeholder="Fx Eksamens 2025"
+          placeholder="Fx Dansk"
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
         />
@@ -227,9 +258,7 @@ export default function FolderManagerClient({
           </div>
         </div>
 
-        {createError && (
-          <p className="mt-1 text-[11px] text-red-600">{createError}</p>
-        )}
+        {createError && <p className="mt-1 text-[11px] text-red-600">{createError}</p>}
 
         <div className="mt-3">
           <button
@@ -245,17 +274,13 @@ export default function FolderManagerClient({
 
       {/* Eksisterende mapper */}
       <div className="mt-5">
-        <div className="mb-2 text-[12px] font-semibold text-zinc-800">
-          Eksisterende mapper
-        </div>
+        <div className="mb-2 text-[12px] font-semibold text-zinc-800">Eksisterende mapper</div>
 
-        {folders.length === 0 ? (
-          <p className="text-[12px] text-zinc-600">
-            Du har endnu ingen mapper. Opret den første ovenfor.
-          </p>
+        {sortedFolders.length === 0 ? (
+          <p className="text-[12px] text-zinc-600">Du har endnu ingen mapper. Opret den første ovenfor.</p>
         ) : (
           <ul className="space-y-2 text-[12px]">
-            {folders.map((f) => {
+            {sortedFolders.map((f) => {
               const isEditing = edit.mode === "edit" && edit.id === f.id;
 
               if (isEditing) {
@@ -271,12 +296,11 @@ export default function FolderManagerClient({
                         value={edit.name}
                         onChange={(e) =>
                           setEdit((prev) =>
-                            prev.mode === "edit"
-                              ? { ...prev, name: e.target.value }
-                              : prev,
+                            prev.mode === "edit" ? { ...prev, name: e.target.value } : prev,
                           )
                         }
                       />
+
                       <div className="mt-1 flex flex-col gap-2 sm:flex-row">
                         <div className="flex flex-1 flex-col gap-1">
                           <span>Startdato</span>
@@ -286,9 +310,7 @@ export default function FolderManagerClient({
                             value={edit.start}
                             onChange={(e) =>
                               setEdit((prev) =>
-                                prev.mode === "edit"
-                                  ? { ...prev, start: e.target.value }
-                                  : prev,
+                                prev.mode === "edit" ? { ...prev, start: e.target.value } : prev,
                               )
                             }
                           />
@@ -301,19 +323,14 @@ export default function FolderManagerClient({
                             value={edit.end}
                             onChange={(e) =>
                               setEdit((prev) =>
-                                prev.mode === "edit"
-                                  ? { ...prev, end: e.target.value }
-                                  : prev,
+                                prev.mode === "edit" ? { ...prev, end: e.target.value } : prev,
                               )
                             }
                           />
                         </div>
                       </div>
-                      {editError && (
-                        <p className="mt-1 text-[11px] text-red-600">
-                          {editError}
-                        </p>
-                      )}
+
+                      {editError && <p className="mt-1 text-[11px] text-red-600">{editError}</p>}
                     </div>
 
                     <div className="mt-3 flex gap-2 sm:mt-0 sm:ml-4">
@@ -343,13 +360,10 @@ export default function FolderManagerClient({
                   className="flex flex-col justify-between rounded-2xl border border-zinc-200 bg-white p-3 sm:flex-row sm:items-center"
                 >
                   <div className="flex-1">
-                    <div className="text-[13px] font-medium text-zinc-900">
-                      {f.name}
-                    </div>
-                    <div className="mt-1 text-[11px] text-zinc-600">
-                      {formatPeriod(f)}
-                    </div>
+                    <div className="text-[13px] font-medium text-zinc-900">{f.name}</div>
+                    <div className="mt-1 text-[11px] text-zinc-600">{formatPeriod(f)}</div>
                   </div>
+
                   <div className="mt-2 flex gap-2 sm:mt-0 sm:ml-4">
                     <button
                       type="button"
@@ -373,9 +387,7 @@ export default function FolderManagerClient({
           </ul>
         )}
 
-        {deleteError && (
-          <p className="mt-2 text-[11px] text-red-600">{deleteError}</p>
-        )}
+        {deleteError && <p className="mt-2 text-[11px] text-red-600">{deleteError}</p>}
       </div>
     </section>
   );

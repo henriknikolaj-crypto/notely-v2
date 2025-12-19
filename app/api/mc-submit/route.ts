@@ -1,85 +1,128 @@
 // app/api/mc-submit/route.ts
 import "server-only";
-import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+
+import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 type Body = {
-  questionId: string;
-  question: string;
-  selectedOptionId: string;
-  selectedOptionText: string;
-  isCorrect: boolean;
+  questionId?: string;
+  question?: string;
+  selectedOptionId?: string;
+  selectedOptionText?: string;
+  isCorrect?: boolean;
   scopeFolderIds?: string[] | null;
   explanation?: string | null;
 };
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore – falder tilbage til DEV_USER_ID
+function uniqTrimmed(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of ids) {
+    const s = typeof x === "string" ? x.trim() : "";
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
   }
-  return process.env.DEV_USER_ID ?? null;
+  return out;
 }
 
-export async function POST(req: Request) {
+async function readJsonBody<T>(req: NextRequest) {
+  const raw = (await req.text()).trim();
+  if (!raw) return { ok: true as const, value: {} as T };
   try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId(sb);
+    return { ok: true as const, value: JSON.parse(raw) as T };
+  } catch {
+    return { ok: false as const, error: "Ugyldigt JSON-body." };
+  }
+}
 
-    if (!ownerId) {
+export async function POST(req: NextRequest) {
+  try {
+    // Auth/dev-bypass (samme mønster som andre routes)
+    let sb: any;
+    let ownerId = "";
+    let mode: "auth" | "dev" = "auth";
+
+    try {
+      const u = await requireUser(req);
+      sb = u.sb;
+      ownerId = u.id;
+      mode = u.mode;
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      const isAuth = msg.toLowerCase().includes("unauthorized");
+      if (!isAuth) console.error("[mc-submit] requireUser crash:", e);
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+
+    const parsed = await readJsonBody<Body>(req);
+    if (!parsed.ok) {
+      return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
+    }
+
+    const body = parsed.value ?? {};
+
+    const questionId = String(body.questionId ?? "").trim();
+    const question = String(body.question ?? "").trim();
+    const selectedOptionId = String(body.selectedOptionId ?? "").trim();
+    const selectedOptionText = String(body.selectedOptionText ?? "").trim();
+    const isCorrect = !!body.isCorrect;
+
+    if (!questionId || !question || !selectedOptionId || !selectedOptionText) {
       return NextResponse.json(
-        { error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
-        { status: 401 }
+        { ok: false, error: "Manglende felter i mc-submit body." },
+        { status: 400 },
       );
     }
 
-    const body = (await req.json()) as Body;
+    const scopeFolderIds = uniqTrimmed(body.scopeFolderIds);
+    const folderId = scopeFolderIds.length ? scopeFolderIds[0] : null;
 
-    if (!body?.question || !body?.selectedOptionId || !body.selectedOptionText) {
-      return NextResponse.json(
-        { error: "Manglende felter i mc-submit body." },
-        { status: 400 }
-      );
-    }
+    const score = isCorrect ? 100 : 0;
 
-    const score = body.isCorrect ? 100 : 0;
-    const folderId =
-      Array.isArray(body.scopeFolderIds) && body.scopeFolderIds.length > 0
-        ? body.scopeFolderIds[0]
-        : null;
+    const explanation = String(body.explanation ?? "").trim();
+    const feedback =
+      explanation ||
+      (isCorrect ? "Korrekt." : "Ikke korrekt. Gennemgå forklaringen og prøv igen.");
+
+    const answerText = `${selectedOptionId}: ${selectedOptionText}`;
 
     const { error } = await sb.from("exam_sessions").insert({
       owner_id: ownerId,
-      question: body.question,
-      answer: body.selectedOptionText,
-      feedback: body.explanation ?? null,
+      question,
+      answer: answerText,
+      feedback,
       score,
-      // disse to felter kræver at vi har tilføjet kolonnerne i SQL'en nedenfor
       source_type: "mc",
       folder_id: folderId,
+      meta: {
+        mode,
+        questionId,
+        selectedOptionId,
+        selectedOptionText,
+        isCorrect,
+        scopeFolderIds,
+      },
     });
 
     if (error) {
-      console.error("mc-submit insert error:", error);
+      console.error("[mc-submit] exam_sessions insert error:", error);
       return NextResponse.json(
-        { error: "Kunne ikke gemme MC-resultat i exam_sessions." },
-        { status: 500 }
+        { ok: false, error: "Kunne ikke gemme MC-resultat i exam_sessions." },
+        { status: 500 },
       );
     }
 
-    return NextResponse.json({ ok: true });
-  } catch (err) {
-    console.error("mc-submit route error:", err);
+    return NextResponse.json({ ok: true, score }, { status: 200 });
+  } catch (err: any) {
+    console.error("[mc-submit] route error:", err);
     return NextResponse.json(
-      { error: "Uventet serverfejl i mc-submit." },
-      { status: 500 }
+      { ok: false, error: err?.message ?? "Uventet serverfejl i mc-submit." },
+      { status: 500 },
     );
   }
 }

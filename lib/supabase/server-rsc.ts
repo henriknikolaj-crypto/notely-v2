@@ -1,38 +1,35 @@
 ﻿// lib/supabase/server-rsc.ts
 import "server-only";
-
-import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
 
 export async function supabaseServerRSC() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  if (!url || !key) {
+  if (!url || !anon) {
     throw new Error(
-      "Supabase URL/key missing in env (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY)"
+      "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY",
     );
   }
 
   const cookieStore = await cookies();
 
-  return createServerClient(url, key, {
+  return createServerClient(url, anon, {
     cookies: {
       getAll() {
         return cookieStore.getAll();
       },
       setAll(cookiesToSet) {
+        // RSC kan være read-only ift cookies, så vi ignorerer evt. write-fejl
         try {
           for (const { name, value, options } of cookiesToSet) {
-            (cookieStore as any).set({ name, value, ...options });
+            cookieStore.set(name, value, options);
           }
         } catch {
-          // ignore (RSC kan ikke altid sætte cookies)
+          // ignore
         }
       },
     },
   });
 }
-
-// Backwards-compatible alias (så ældre filer stadig bygger)
-export const getSupabaseServer = supabaseServerRSC;

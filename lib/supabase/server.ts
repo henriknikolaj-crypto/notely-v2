@@ -1,5 +1,4 @@
-﻿// lib/supabase/server.ts
-import "server-only";
+﻿import "server-only";
 
-export { supabaseServerRSC, getSupabaseServer } from "./server-rsc";
+export { supabaseServerRSC } from "./server-rsc";
 export { supabaseServerRoute } from "./server-route";

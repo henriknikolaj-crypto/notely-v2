@@ -1,5 +1,0 @@
-﻿import ResetDefaultsButton from "./ResetDefaultsButton";
-
-
-{/* Auto-injected reset button */}
-<ResetDefaultsButton />

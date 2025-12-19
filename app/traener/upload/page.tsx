@@ -1,6 +1,7 @@
 ﻿// app/traener/upload/page.tsx
 import "server-only";
 
+import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import UploadClient from "./UploadClient";
 import FolderManagerClient from "./FolderManagerClient";
@@ -17,16 +18,22 @@ type FolderRow = {
   end_date?: string | null;
 };
 
-async function getOwnerId(sb: any): Promise<string | null> {
+async function getOwnerCtxRsc(sb: any): Promise<
+  | { ownerId: string; mode: "auth"; email: string | null }
+  | { ownerId: string; mode: "dev"; email: null }
+  | null
+> {
   try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
+    const { data } = await sb.auth.getUser();
+    if (data?.user?.id) return { ownerId: data.user.id as string, mode: "auth", email: data.user.email ?? null };
   } catch {
-    // ignore – falder tilbage til DEV_USER_ID
+    // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+
+  const dev = (process.env.DEV_USER_ID ?? "").trim();
+  if (dev) return { ownerId: dev, mode: "dev", email: null };
+
+  return null;
 }
 
 export default async function UploadPage({
@@ -35,15 +42,20 @@ export default async function UploadPage({
   searchParams?: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const owner = await getOwnerCtxRsc(sb);
 
-  if (!ownerId) {
+  if (!owner?.ownerId) {
     return (
-      <main className="min-h-screen bg-[#fffef9] p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+      <main className="min-h-screen bg-[#fffef9] p-6 text-sm text-zinc-800">
+        <p>Du er ikke logget ind.</p>
+        <Link href="/auth/login" className="mt-2 inline-block rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
+          Gå til login
+        </Link>
       </main>
     );
   }
+
+  const ownerId = owner.ownerId;
 
   const { data: foldersData, error: foldersError } = await sb
     .from("folders")
@@ -87,16 +99,18 @@ export default async function UploadPage({
       <div className="mx-auto max-w-6xl space-y-8 px-4 py-6 md:px-6">
         <section className="space-y-4">
           <header className="border-b border-zinc-200 pb-3">
-            <h1 className="text-lg font-semibold text-zinc-900">
-              Upload / ret materiale
-            </h1>
+            <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
             <p className="mt-1 text-sm text-zinc-600">
-              Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge
-              det på tværs af Notely.
+              Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
             </p>
+
+            {owner.mode === "dev" && (
+              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                Du kører i <b>DEV</b> (DEV_USER_ID). Log ind for at se dine egne data.
+              </div>
+            )}
           </header>
 
-          {/* Status (kvote + filer + seneste) */}
           <ImportStatusBox folderId={null} />
         </section>
 

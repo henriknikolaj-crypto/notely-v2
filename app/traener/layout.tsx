@@ -28,12 +28,11 @@ type LatestNoteRow = {
 
 async function getOwnerId(sb: any): Promise<string | null> {
   try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {}
-  return process.env.DEV_USER_ID ?? null;
+    const { data } = await sb.auth.getUser();
+    return (data?.user?.id as string) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 const TRAINER_NOTE_TYPES = ["feedback", "trainer", "trainer_feedback"];

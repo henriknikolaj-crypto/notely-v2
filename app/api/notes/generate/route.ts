@@ -1,89 +1,65 @@
 // app/api/notes/generate/route.ts
 import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { getOwnerCtx } from "@/lib/auth/owner";
 import OpenAI from "openai";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // falder igennem til DEV
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function pickMode(raw: any): "resume" | "golden" {
   return raw === "golden" ? "golden" : "resume";
 }
 
-/** Robust tekst-udtræk fra OpenAI Responses (undgår .content på tool-calls) */
-function extractResponseText(response: any): string {
-  const ot = typeof response?.output_text === "string" ? response.output_text : "";
-  if (ot.trim()) return ot.trim();
-
-  const outputs: any[] = Array.isArray(response?.output) ? response.output : [];
-  for (const item of outputs) {
-    if (!item || item.type !== "message" || !Array.isArray(item.content)) continue;
-
-    for (const part of item.content) {
-      const t =
-        (typeof part?.text === "string" && part.text) ||
-        (typeof part?.output_text === "string" && part.output_text) ||
-        "";
-      if (String(t).trim()) return String(t).trim();
-    }
+async function readJsonBody<T>(req: NextRequest) {
+  const raw = (await req.text()).trim();
+  if (!raw) return { ok: true as const, value: {} as T };
+  try {
+    return { ok: true as const, value: JSON.parse(raw) as T };
+  } catch {
+    return { ok: false as const, error: "Ugyldigt JSON-body." };
   }
-
-  return "";
 }
 
 export async function POST(req: NextRequest) {
   const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
+  const owner = await getOwnerCtx(req, sb);
 
-  if (!ownerId) {
+  if (!owner) {
     return NextResponse.json(
-      { ok: false, error: "Mangler bruger-id (login eller DEV_USER_ID)." },
-      { status: 401 }
+      { ok: false, error: "Unauthorized (login kræves)." },
+      { status: 401 },
     );
   }
 
   if (!process.env.OPENAI_API_KEY) {
     return NextResponse.json(
       { ok: false, error: "OPENAI_API_KEY mangler i .env.local." },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
-  let body: any;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ ok: false, error: "Ugyldigt JSON-body." }, { status: 400 });
-  }
+  const parsed = await readJsonBody<{ fileId?: string; mode?: string }>(req);
+  if (!parsed.ok) return NextResponse.json(parsed, { status: 400 });
 
-  const fileId = typeof body?.fileId === "string" ? body.fileId.trim() : "";
-  const mode = pickMode(body?.mode);
+  const body = parsed.value ?? {};
+  const fileId = typeof body.fileId === "string" ? body.fileId.trim() : "";
+  const mode = pickMode(body.mode);
 
   if (!fileId) {
     return NextResponse.json({ ok: false, error: "Mangler fileId." }, { status: 400 });
   }
 
-  // 1) Hent fil-oplysninger (til titel)
+  const ownerId = owner.ownerId;
+
+  // 1) Fil
   const { data: fileRow, error: fileError } = await sb
     .from("files")
-    .select("id, name, original_name, filename, file_name")
+    .select("id,name,original_name")
     .eq("owner_id", ownerId)
     .eq("id", fileId)
     .maybeSingle();
@@ -96,14 +72,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "Filen blev ikke fundet." }, { status: 404 });
   }
 
-  const fileName: string =
-    fileRow.name ||
-    fileRow.original_name ||
-    fileRow.filename ||
-    fileRow.file_name ||
-    "Ukendt filnavn";
+  const fileName: string = fileRow.name || fileRow.original_name || "Ukendt filnavn";
 
-  // 2) Hent doc_chunks for den valgte fil
+  // 2) doc_chunks
   const { data: chunks, error: chunkError } = await sb
     .from("doc_chunks")
     .select("content")
@@ -116,7 +87,7 @@ export async function POST(req: NextRequest) {
     console.error("notes/generate: chunkError", chunkError);
     return NextResponse.json(
       { ok: false, error: "Kunne ikke hente tekstuddrag (doc_chunks)." },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
@@ -124,10 +95,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        error:
-          "Der er endnu ingen tekstuddrag (doc_chunks) for den valgte fil. Tjek at upload/parse er kørt.",
+        error: "Der er endnu ingen tekstuddrag (doc_chunks) for filen. Tjek at upload/parse er kørt.",
       },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
@@ -137,77 +107,63 @@ export async function POST(req: NextRequest) {
     .join("\n\n---\n\n")
     .slice(0, 12000);
 
-  const modeLabel = mode === "golden" ? "FOKUS-NOTER" : "RESUMÉ";
-
   const systemPrompt = [
     "Du hjælper en studerende med at lave noter ud fra pensum-tekster.",
     "",
-    `Du får uddrag af en tekst (kaldet "context") og skal lave ${
-      mode === "golden"
-        ? "fokus-noter i punktform med ekstra eksamensfokus"
-        : "et kort, klart resumé i sammenhængende tekst"
-    }.`,
-    "",
     "Krav:",
     "- Arbejd KUN ud fra context-teksten.",
-    "- Brug så vidt muligt faglige begreber, navne og pointer fra teksten.",
-    "- Skriv på dansk i et niveau svarende til gymnasie/ungdomsuddannelse.",
-    "- Ingen indledning om, hvad du gør; skriv bare selve noterne.",
+    "- Brug så vidt muligt begreber, navne og pointer fra teksten.",
+    "- Skriv på dansk (gymnasie/ungdomsuddannelse).",
+    "- Ingen indledning om, hvad du gør; skriv kun selve noterne.",
   ].join("\n");
 
-  const userPrompt = [
-    `MODE: ${modeLabel}`,
-    "",
-    'Brug udelukkende teksten her som grundlag ("context"):',
-    "",
-    '"""',
-    contextText,
-    '"""',
-  ].join("\n");
+  const userPrompt =
+    mode === "golden"
+      ? `Lav fokus-noter i punktform med ekstra eksamensfokus.\n\nCONTEXT:\n"""${contextText}"""`
+      : `Lav et kort, klart resumé i sammenhængende tekst.\n\nCONTEXT:\n"""${contextText}"""`;
 
-  // 3) LLM-kald + gem note
-  try {
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-      input: `${systemPrompt}\n\n${userPrompt}`,
-    });
+  const model =
+    process.env.OPENAI_MODEL_NOTES ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4o-mini";
 
-    const noteText = extractResponseText(response);
+  const completion = await openai.chat.completions.create({
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+  });
 
-    if (!noteText) {
-      return NextResponse.json({ ok: false, error: "Modellen returnerede tomt svar." }, { status: 500 });
-    }
-
-    const titlePrefix = mode === "golden" ? "Fokus-noter – " : "Resumé – ";
-    const title = `${titlePrefix}${fileName}`;
-
-    // note_type matcher dine scopes: resume/focus
-    const note_type = mode === "golden" ? "focus" : "resume";
-
-    const { data: inserted, error: insertError } = await sb
-      .from("notes")
-      .insert({
-        owner_id: ownerId,
-        title,
-        content: noteText,
-        source_title: fileName,
-        source_url: null,
-        note_type,
-      })
-      .select("id, title, content, created_at, note_type")
-      .single();
-
-    if (insertError) {
-      console.error("notes/generate: insertError", insertError);
-      return NextResponse.json({ ok: false, error: "Kunne ikke gemme noten i databasen." }, { status: 500 });
-    }
-
-    return NextResponse.json({ ok: true, note: inserted }, { status: 200 });
-  } catch (err: any) {
-    console.error("notes/generate: LLM error", err);
+  const noteText = (completion.choices[0]?.message?.content ?? "").trim();
+  if (!noteText) {
     return NextResponse.json(
-      { ok: false, error: "Fejl fra modellen under generering. Prøv igen om lidt." },
-      { status: 500 }
+      { ok: false, error: "Modellen returnerede tomt svar." },
+      { status: 500 },
     );
   }
+
+  const titlePrefix = mode === "golden" ? "Fokus-noter – " : "Resumé – ";
+  const title = `${titlePrefix}${fileName}`;
+  const note_type = mode === "golden" ? "focus" : "resume";
+
+  const { data: inserted, error: insertError } = await sb
+    .from("notes")
+    .insert({
+      owner_id: ownerId,
+      title,
+      content: noteText,
+      source_title: fileName,
+      source_url: null,
+      note_type,
+    })
+    .select("id,title,content,created_at,note_type")
+    .single();
+
+  if (insertError) {
+    console.error("notes/generate: insertError", insertError);
+    return NextResponse.json({ ok: false, error: "Kunne ikke gemme noten." }, { status: 500 });
+  }
+
+  return NextResponse.json({ ok: true, note: inserted }, { status: 200 });
 }

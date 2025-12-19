@@ -1,71 +1,42 @@
-﻿import { headers, cookies } from "next/headers";
-import { createClient } from "@supabase/supabase-js";
-import type { NextRequest } from "next/server";
-import { createServerClient } from "@supabase/ssr";
-import type { CookieOptions } from "@supabase/ssr";
+﻿// app/api/jobs/[id]/route.ts
+import "server-only";
 
-export async function GET(
-  _req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }   // Next 15: params er en Promise
-) {
-  const { id } = await ctx.params;           // await params
-  const hdrs = await headers();              // await headers()
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
-  // Bearer fra scripts
-  const auth = hdrs.get("authorization") || "";
-  const token = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7) : "";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-  const supaWithBearer = (t: string) =>
-    createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-      { global: { headers: { Authorization: `Bearer ${t}` } } }
-    );
+type Ctx = { params: Promise<{ id: string }> };
 
-  const supaService = () =>
-    createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!
-    );
+// GET /api/jobs/:id  (read job status)
+export async function GET(_req: NextRequest, ctx: Ctx) {
+  const { id } = await ctx.params;
+  if (!id) return NextResponse.json({ ok: false, error: "Missing id" }, { status: 400 });
 
-  // 1) Bearer (fra PowerShell-scripts)
-  if (token) {
-    const supa = supaWithBearer(token);
-    const { data: u } = await supa.auth.getUser();
-    if (!u?.user) return new Response("Unauthorized", { status: 401 });
+  const sb = await supabaseServerRoute();
+  const { data: userRes } = await sb.auth.getUser();
+  const userId = userRes?.user?.id ?? null;
 
-    const { data, error } = await supa
-      .from("jobs").select("*")
-      .eq("id", id).eq("owner_id", u.user.id).single();
-
-    if (error) return new Response(error.message, { status: 404 });
-    return Response.json(data);
+  if (!userId) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
-  // 2) Dev fallback (x-shared-secret)
-  if (hdrs.get("x-shared-secret") === process.env.IMPORT_SHARED_SECRET) {
-    const supa = supaService();
-    const { data, error } = await supa
-      .from("jobs").select("*")
-      .eq("id", id).single();
+  const { data, error } = await sb
+    .from("jobs")
+    .select("*")
+    .eq("id", id)
+    .eq("owner_id", userId)
+    .maybeSingle();
 
-    if (error) return new Response(error.message, { status: 404 });
-    return Response.json(data);
+  if (error) {
+    console.error("[jobs/:id GET] db error", error);
+    return NextResponse.json({ ok: false, error: "DB error" }, { status: 500 });
   }
 
-  // 3) Cookie-session (UI)
-  const cookieStore = await cookies();  // await cookies()
-  const supaCookie = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { cookies: { getAll() { return cookieStore.getAll(); }, setAll(cookiesToSet) { try { cookiesToSet.forEach(({ name, value, options }) => { cookieStore.set(name, value, options as CookieOptions); }); } catch {} } } });
+  if (!data) {
+    return NextResponse.json({ ok: false, error: "Not found" }, { status: 404 });
+  }
 
-  const { data: u } = await supaCookie.auth.getUser();
-  if (!u?.user) return new Response("Unauthorized", { status: 401 });
-
-  const { data, error } = await supaCookie
-    .from("jobs").select("*")
-    .eq("id", id).eq("owner_id", u.user.id).single();
-
-  if (error) return new Response(error.message, { status: 404 });
-  return Response.json(data);
+  return NextResponse.json({ ok: true, job: data }, { status: 200 });
 }
-
-

@@ -1,7 +1,8 @@
 ﻿// app/api/trainer/upload/route.ts
 import "server-only";
-import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+
+import { NextRequest } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { randomUUID } from "node:crypto";
 
 export const runtime = "nodejs";
@@ -13,7 +14,6 @@ const TRAINER_BUCKET = "trainer_uploads";
 const CHUNK_LEN = 1800;
 
 // Per-plan hard limits (beskytter systemet)
-// Du kan tune senere – de her er “sikre defaults”.
 const PLAN_HARD_LIMITS: Record<
   string,
   { maxBytes: number; maxPdfPages: number; maxChunks: number }
@@ -33,37 +33,11 @@ type QuotaResult = {
   usedThisMonth: number;
   monthlyLimit: number;
   monthStart: string;
-  monthEnd: string; // sidste ms i måneden (display/debug)
-  resetAt: string; // næste måneds start (exclusive)
+  monthEnd: string;
+  resetAt: string;
   blocked: boolean;
 };
 
-async function getOwnerId(
-  sb: any,
-): Promise<{ ownerId: string | null; mode: "auth" | "dev" }> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return { ownerId: data.user.id as string, mode: "auth" };
-    }
-  } catch {
-    // fall through
-  }
-
-  const dev = (process.env.DEV_USER_ID ?? "").trim();
-  if (process.env.NODE_ENV !== "production" && dev) {
-    return { ownerId: dev, mode: "dev" };
-  }
-
-  return { ownerId: null, mode: "auth" };
-}
-
-/**
- * Månedens start + næste måneds start i UTC.
- * - monthStart: inklusiv
- * - resetAt: eksklusiv
- * - monthEnd: sidste millisekund i måneden (kun til visning/debug)
- */
 function getMonthBoundsUTC(now = new Date()) {
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
@@ -103,28 +77,39 @@ async function getMonthlyLimit(sb: any, plan: string, feature: string): Promise<
   return typeof n === "number" ? n : null;
 }
 
-async function countMonthlyUsage(sb: any, ownerId: string, monthStart: string, resetAt: string) {
-  // NOTE: UI tæller “gjort klar” (= succeeded).
-  // Gating kan du senere vælge at udvide til også at inkludere queued/started,
-  // hvis du vil beskytte mod parallel uploads.
-  const { count, error } = await sb
-    .from("jobs")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", ownerId)
-    .eq("kind", "import")
-    .eq("status", "succeeded")
-    .gte("queued_at", monthStart)
-    .lt("queued_at", resetAt);
+async function countMonthlyUsage(
+  sb: any,
+  ownerId: string,
+  monthStart: string,
+  resetAt: string,
+): Promise<number> {
+  const tsCols = ["queued_at", "created_at", "inserted_at"] as const;
+  let lastErr: any = null;
 
-  if (error) throw error;
-  return Number(count ?? 0);
+  for (const tsCol of tsCols) {
+    const r = await sb
+      .from("jobs")
+      .select("id", { count: "exact", head: true })
+      .eq("owner_id", ownerId)
+      .eq("kind", "import")
+      .eq("status", "succeeded")
+      .gte(tsCol, monthStart)
+      .lt(tsCol, resetAt);
+
+    if (!r.error) {
+      const c = r.count;
+      return typeof c === "number" && Number.isFinite(c) ? c : 0;
+    }
+    lastErr = r.error;
+  }
+
+  throw lastErr ?? new Error("countMonthlyUsage failed");
 }
 
 async function assertImportQuota(sb: any, ownerId: string): Promise<QuotaResult> {
   const plan = await getUserPlan(sb, ownerId);
   const monthlyLimit = await getMonthlyLimit(sb, plan, "import");
 
-  // Fail-closed
   if (!monthlyLimit || monthlyLimit <= 0) {
     throw new Error(`PLAN_LIMITS_MISSING(import) for plan=${plan}`);
   }
@@ -161,9 +146,7 @@ async function loadPdf(buffer: Buffer) {
         ? mod.default
         : null;
 
-  if (!pdfjsLib) {
-    throw new Error("pdfjs-dist getDocument ikke fundet (server-konfiguration).");
-  }
+  if (!pdfjsLib) throw new Error("pdfjs-dist getDocument ikke fundet (server-konfiguration).");
 
   const data = new Uint8Array(buffer);
   const loadingTask = pdfjsLib.getDocument({
@@ -185,9 +168,7 @@ async function extractTextFromPdf(opts: {
   const pdf = await loadPdf(buffer);
   const pageCount = Number(pdf.numPages ?? 0);
 
-  if (pageCount <= 0) {
-    return { text: "[PDF-tekstfejl: Kunne ikke læse sider i PDF.]", pageCount: 0 };
-  }
+  if (pageCount <= 0) return { text: "[PDF-tekstfejl: Kunne ikke læse sider i PDF.]", pageCount: 0 };
 
   let fullText = "";
   const pagesToRead = Math.min(pageCount, maxPages);
@@ -231,9 +212,7 @@ function splitIntoChunks(text: string, maxLen = CHUNK_LEN): string[] {
       if (current) chunks.push(current);
 
       if (part.length > maxLen) {
-        for (let i = 0; i < part.length; i += maxLen) {
-          chunks.push(part.slice(i, i + maxLen));
-        }
+        for (let i = 0; i < part.length; i += maxLen) chunks.push(part.slice(i, i + maxLen));
         current = "";
       } else {
         current = part;
@@ -271,39 +250,37 @@ async function insertDocChunks(opts: {
 }
 
 export async function GET() {
-  return NextResponse.json(
-    { ok: true, msg: "trainer/upload route is alive" },
-    { status: 200 },
-  );
+  return Response.json({ ok: true, msg: "trainer/upload route is alive" }, { status: 200 });
 }
 
 export async function POST(req: NextRequest) {
-  const sb = await supabaseServerRoute();
-  const { ownerId, mode } = await getOwnerId(sb);
+  let sb: any;
+  let ownerId = "";
+  let mode: "auth" | "dev" = "auth";
 
-  if (!ownerId) {
-    return NextResponse.json(
-      { ok: false, error: "Mangler bruger-id (hverken login eller DEV_USER_ID sat)." },
-      { status: 401 },
-    );
+  try {
+    const u = await requireUser(req);
+    sb = u.sb;
+    ownerId = u.id;
+    mode = u.mode;
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (!msg.toLowerCase().includes("unauthorized")) console.error("[trainer/upload] requireUser crash:", e);
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
-  // 0) Parse formdata
   const formData = await req.formData();
   const file = formData.get("file");
   const folderIdRaw = formData.get("folderId") ?? formData.get("folder_id");
 
   if (!(file instanceof File)) {
-    return NextResponse.json(
-      { ok: false, error: "Ingen fil modtaget i upload." },
-      { status: 400 },
-    );
+    return Response.json({ ok: false, error: "Ingen fil modtaget i upload." }, { status: 400 });
   }
 
   const folderId =
-    typeof folderIdRaw === "string" && folderIdRaw.length > 0 ? folderIdRaw : null;
+    typeof folderIdRaw === "string" && folderIdRaw.trim().length > 0 ? folderIdRaw.trim() : null;
 
-  // 1) Quota gate (måned)
+  // 1) Quota gate
   let quota: QuotaResult;
   try {
     quota = await assertImportQuota(sb, ownerId);
@@ -311,7 +288,7 @@ export async function POST(req: NextRequest) {
     console.error("[trainer/upload] quota check failed:", e);
     const msg = String(e?.message ?? e);
     const isMissing = msg.includes("PLAN_LIMITS_MISSING");
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: isMissing ? "PLAN_LIMITS_MISSING" : "QUOTA_CHECK_FAILED",
@@ -324,7 +301,7 @@ export async function POST(req: NextRequest) {
   }
 
   if (quota.blocked) {
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "QUOTA_EXCEEDED",
@@ -340,38 +317,29 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 2) Hard limits pr. fil (MB/pages/chunks)
+  // 2) Hard limits
   const hard = limitsForPlan(quota.plan);
   const maxBytes = hard.maxBytes;
   const maxPages = hard.maxPdfPages;
   const maxChunks = hard.maxChunks;
 
-  // Type check (nu: PDF-only)
   const isPdf =
-    (file.type || "").toLowerCase().includes("pdf") ||
-    (file.name || "").toLowerCase().endsWith(".pdf");
+    (file.type || "").toLowerCase().includes("pdf") || (file.name || "").toLowerCase().endsWith(".pdf");
 
   if (!isPdf) {
-    return NextResponse.json(
-      {
-        ok: false,
-        code: "UNSUPPORTED_FILE_TYPE",
-        message: "Kun PDF-filer er understøttet lige nu.",
-      },
+    return Response.json(
+      { ok: false, code: "UNSUPPORTED_FILE_TYPE", message: "Kun PDF-filer er understøttet lige nu." },
       { status: 415 },
     );
   }
 
-  // Size check før vi læser hele filen ind
   const sizeBytes = typeof file.size === "number" ? file.size : 0;
   if (sizeBytes > maxBytes) {
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "FILE_TOO_LARGE",
-        message: `Filen er for stor til din plan (${quota.plan}). Maks ${Math.floor(
-          maxBytes / (1024 * 1024),
-        )} MB pr. fil.`,
+        message: `Filen er for stor til din plan (${quota.plan}). Maks ${Math.floor(maxBytes / (1024 * 1024))} MB pr. fil.`,
         limit: { maxBytes, maxMb: Math.floor(maxBytes / (1024 * 1024)) },
         file: { name: file.name, sizeBytes },
       },
@@ -382,26 +350,25 @@ export async function POST(req: NextRequest) {
   const safeName = file.name || "upload.pdf";
   const buffer = Buffer.from(await file.arrayBuffer());
 
-  // 3) PDF page limit (hurtig check via pdfjs)
+  // 3) Page count
   let pageCount = 0;
   try {
     const pdf = await loadPdf(buffer);
     pageCount = Number(pdf.numPages ?? 0);
   } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "PDF_READ_FAILED",
         message: "Vi kunne ikke læse PDF’en. Prøv at gemme den igen som PDF og upload på ny.",
-        details: msg,
+        details: String(e?.message ?? e),
       },
       { status: 400 },
     );
   }
 
   if (pageCount > maxPages) {
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "PDF_TOO_MANY_PAGES",
@@ -413,20 +380,18 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 4) Extract + chunk limits (måler “rigtigt” forbrug)
+  // 4) Extract + chunk
   let extractedText = "";
   try {
     const r = await extractTextFromPdf({ buffer, maxPages });
     extractedText = r.text;
-    // pageCount allerede målt ovenfor, men r.pageCount findes også
   } catch (e: any) {
-    const msg = String(e?.message ?? e);
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "PDF_TEXT_EXTRACT_FAILED",
         message: "Vi kunne ikke udtrække tekst fra PDF’en. Hvis den er scannet, prøv en tekst-baseret PDF.",
-        details: msg,
+        details: String(e?.message ?? e),
       },
       { status: 400 },
     );
@@ -434,7 +399,7 @@ export async function POST(req: NextRequest) {
 
   const chunks = splitIntoChunks(extractedText, CHUNK_LEN);
   if (chunks.length > maxChunks) {
-    return NextResponse.json(
+    return Response.json(
       {
         ok: false,
         code: "TOO_MANY_CHUNKS",
@@ -457,12 +422,8 @@ export async function POST(req: NextRequest) {
 
   if (storageError) {
     console.error("[trainer/upload] storage upload error:", storageError);
-    return NextResponse.json(
-      {
-        ok: false,
-        code: "STORAGE_UPLOAD_FAILED",
-        message: "Kunne ikke uploade filen. Tjek at storage-bucket findes og at du har adgang.",
-      },
+    return Response.json(
+      { ok: false, code: "STORAGE_UPLOAD_FAILED", message: "Kunne ikke uploade filen. Tjek bucket + adgang." },
       { status: 500 },
     );
   }
@@ -485,9 +446,8 @@ export async function POST(req: NextRequest) {
 
   if (filesError) {
     console.error("[trainer/upload] files insert error:", filesError);
-    // cleanup storage (best effort)
-    await sb.storage.from(TRAINER_BUCKET).remove([storagePath]);
-    return NextResponse.json(
+    await sb.storage.from(TRAINER_BUCKET).remove([storagePath]); // best effort cleanup
+    return Response.json(
       { ok: false, code: "FILES_INSERT_FAILED", message: "Kunne ikke gemme fil-metadata." },
       { status: 500 },
     );
@@ -496,7 +456,7 @@ export async function POST(req: NextRequest) {
   // 7) doc_chunks
   await insertDocChunks({ sb, ownerId, folderId, fileId, chunks });
 
-  // 8) registrér “gjort klar” (succeeded)
+  // 8) jobs “succeeded”
   const { error: jobErr } = await sb.from("jobs").insert({
     owner_id: ownerId,
     kind: "import",
@@ -516,7 +476,7 @@ export async function POST(req: NextRequest) {
 
   if (jobErr) console.error("[trainer/upload] jobs insert error:", jobErr);
 
-  return NextResponse.json(
+  return Response.json(
     {
       ok: true,
       fileId,
@@ -544,3 +504,4 @@ export async function POST(req: NextRequest) {
     { status: 200 },
   );
 }
+

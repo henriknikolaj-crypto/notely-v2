@@ -1,18 +1,16 @@
-﻿// lib/getOwnerId.ts
+﻿import "server-only";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export async function getOwnerIdFromServer() {
   const sb = await supabaseServerRoute();
 
   try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return { sb, ownerId: data.user.id as string };
+    const { data, error } = await sb.auth.getUser();
+    if (!error && data?.user?.id) return { sb, ownerId: data.user.id as string };
   } catch {
-    // ignore auth errors, fallback below
+    // ignore
   }
 
-  const dev = process.env.DEV_USER_ID ?? null;
-  return { sb, ownerId: dev };
+  // Ingen DEV fallback
+  return { sb, ownerId: null as string | null };
 }
-
-

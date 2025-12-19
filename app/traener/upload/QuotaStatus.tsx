@@ -1,5 +1,4 @@
-﻿// app/traener/upload/QuotaStatus.tsx
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -21,8 +20,8 @@ type QuotaResp = {
   ok: boolean;
   mode?: string;
   plan?: "freemium" | "basis" | "pro" | string;
-  monthEnd?: string; // sidste ms i måneden (debug)
-  resetAt?: string; // næste måneds start (rigtig nulstilling)
+  monthEnd?: string; // debug
+  resetAt?: string; // nulstilling (næste måned)
   import?: QuotaBlock;
   evaluate?: QuotaBlock;
   message?: string;
@@ -42,6 +41,30 @@ function fmtDaDate(iso?: string) {
   }
 }
 
+async function fetchQuota(): Promise<{ res: Response; json: QuotaResp | null }> {
+  // Primær (ny)
+  const res1 = await fetch("/api/quota/current", {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+  });
+
+  if (res1.status !== 404) {
+    const json1 = (await res1.json().catch(() => null)) as QuotaResp | null;
+    return { res: res1, json: json1 };
+  }
+
+  // Fallback (hvis du stadig har gammel route i nogle miljøer)
+  const res2 = await fetch("/api/quota-status", {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    cache: "no-store",
+  });
+
+  const json2 = (await res2.json().catch(() => null)) as QuotaResp | null;
+  return { res: res2, json: json2 };
+}
+
 export default function QuotaStatus({
   feature,
   upgradeHref = "/pricing",
@@ -57,13 +80,7 @@ export default function QuotaStatus({
     try {
       setErr(null);
 
-      const res = await fetch("/api/quota-status", {
-        method: "GET",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      });
-
-      const json = (await res.json().catch(() => null)) as QuotaResp | null;
+      const { res, json } = await fetchQuota();
 
       if (!res.ok || !json?.ok) {
         setData(json);
@@ -96,8 +113,7 @@ export default function QuotaStatus({
     void run();
 
     const intervalMs = Math.max(5000, Number(refreshMs || 0));
-    const t =
-      intervalMs > 0 ? setInterval(() => void run(), intervalMs) : null;
+    const t = intervalMs > 0 ? setInterval(() => void run(), intervalMs) : null;
 
     return () => {
       alive = false;
@@ -189,10 +205,7 @@ export default function QuotaStatus({
 
           {limit ? (
             <div className="mt-2 h-2 w-full rounded-full bg-zinc-100">
-              <div
-                className="h-2 rounded-full bg-black"
-                style={{ width: `${pct}%` }}
-              />
+              <div className="h-2 rounded-full bg-black" style={{ width: `${pct}%` }} />
             </div>
           ) : null}
 

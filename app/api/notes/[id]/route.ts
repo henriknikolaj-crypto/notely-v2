@@ -1,118 +1,99 @@
 ﻿// app/api/notes/[id]/route.ts
 import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// DEV: vi bruger DEV_USER_ID som owner
-async function getOwnerId(): Promise<string | null> {
-  return process.env.DEV_USER_ID ?? null;
-}
+type Ctx = { params: Promise<{ id: string }> };
 
-async function deleteNote(noteId: string, ownerId: string) {
-  const sb = await supabaseServerRoute();
-
-  const { error } = await sb
+async function deleteNote(sb: any, noteId: string, ownerId: string) {
+  const { data, error } = await sb
     .from("notes")
     .delete()
     .eq("id", noteId)
-    .eq("owner_id", ownerId);
+    .eq("owner_id", ownerId)
+    .select("id")
+    .maybeSingle();
 
   if (error) {
-    console.error("Failed to delete note", { noteId, error });
+    console.error("[notes/:id] delete error", { noteId, error });
     throw new Error("DB delete failed");
   }
+
+  // idempotent: 0 rækker = OK
+  return !!data;
 }
 
-// DELETE /api/notes/:id
-// Bruges til direkte API-kald (fx fetch med method: DELETE)
-export async function DELETE(
-  _req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(req: NextRequest, ctx: Ctx) {
   const { id: noteId } = await ctx.params;
-
   if (!noteId) {
     return NextResponse.json(
-      { error: "Missing note id" },
-      { status: 400 }
+      { ok: false, code: "MISSING_ID", error: "Missing note id" },
+      { status: 400 },
     );
   }
 
-  const ownerId = await getOwnerId();
-  if (!ownerId) {
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
     return NextResponse.json(
-      { error: "Unauthorized" },
-      { status: 401 }
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
     );
   }
 
   try {
-    await deleteNote(noteId, ownerId);
-    return NextResponse.json({ ok: true }, { status: 200 });
+    await deleteNote(sb, noteId, owner.ownerId);
+    return NextResponse.json({ ok: true, id: noteId }, { status: 200 });
   } catch (e: any) {
     return NextResponse.json(
-      { error: e?.message ?? "DB delete failed" },
-      { status: 500 }
+      { ok: false, code: "DB_DELETE_FAILED", error: e?.message ?? "DB delete failed" },
+      { status: 500 },
     );
   }
 }
 
-// POST /api/notes/:id med _method=DELETE
-// Bruges af HTML-formen på /traener/noter/historik
-export async function POST(
-  req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
-) {
+// POST /api/notes/:id med _method=DELETE (HTML form)
+export async function POST(req: NextRequest, ctx: Ctx) {
   const { id: noteId } = await ctx.params;
-
   if (!noteId) {
     return NextResponse.json(
-      { error: "Missing note id" },
-      { status: 400 }
+      { ok: false, code: "MISSING_ID", error: "Missing note id" },
+      { status: 400 },
     );
   }
 
-  let methodOverride = "";
-  try {
-    const form = await req.formData();
-    methodOverride = String(form.get("_method") || "").toUpperCase();
-  } catch {
-    methodOverride = "";
-  }
+  const form = await req.formData().catch(() => null);
+  const methodOverride = String(form?.get("_method") || "").toUpperCase();
 
   if (methodOverride !== "DELETE") {
     return NextResponse.json(
-      { error: "Method not allowed" },
-      { status: 405 }
+      { ok: false, code: "METHOD_NOT_ALLOWED", error: "Method not allowed" },
+      { status: 405 },
     );
   }
 
-  const ownerId = await getOwnerId();
-  if (!ownerId) {
+  const sb = await supabaseServerRoute();
+  const owner = await getOwnerCtx(req, sb);
+  if (!owner) {
     return NextResponse.json(
-      { error: "Unauthorized" },
-      { status: 401 }
+      { ok: false, code: "UNAUTHORIZED", error: "Login kræves." },
+      { status: 401 },
     );
   }
 
   try {
-    await deleteNote(noteId, ownerId);
-
-    // Tilbage til historik efter form-submit
-    return NextResponse.redirect(
-      new URL("/traener/noter/historik", req.url),
-      303
-    );
+    await deleteNote(sb, noteId, owner.ownerId);
+    return NextResponse.redirect(new URL("/traener/noter/historik", req.url), 303);
   } catch (e: any) {
-    console.error("Failed to delete note via POST _method=DELETE", e);
+    console.error("[notes/:id POST _method=DELETE] error", e);
     return NextResponse.json(
-      { error: e?.message ?? "DB delete failed" },
-      { status: 500 }
+      { ok: false, code: "DB_DELETE_FAILED", error: e?.message ?? "DB delete failed" },
+      { status: 500 },
     );
   }
 }
-
-

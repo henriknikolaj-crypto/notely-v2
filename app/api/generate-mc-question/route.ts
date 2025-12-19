@@ -1,8 +1,10 @@
 // app/api/generate-mc-question/route.ts
 import "server-only";
-import { NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+
+import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import OpenAI from "openai";
+import { randomUUID } from "node:crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,11 +14,11 @@ type Difficulty = "easy" | "medium" | "hard";
 type GenerateMcRequest = {
   scopeFolderIds?: string[];
   difficulty?: Difficulty;
-  maxContextChunks?: number;
+  maxContextChunks?: number; // total chunks in context (across files)
 };
 
 type McOptionPayload = {
-  id: string;
+  id: string; // "a" | "b" | "c" | "d"
   text: string;
   isCorrect: boolean;
 };
@@ -28,401 +30,345 @@ type McCitationPayload = {
 };
 
 type GenerateMcResponse = {
+  ok: true;
   questionId: string;
   question: string;
   options: McOptionPayload[];
   explanation: string | null;
   citations: McCitationPayload[];
+  usedFileId: string | null; // “primary” file (for rotation/debug/backwards compat)
 };
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) {
-        return data.user.id as string;
-      }
-    }
-  } catch {
-    // falder tilbage til DEV_USER_ID
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Fallback hvis noget går galt
-function buildDemoQuestion(): GenerateMcResponse {
-  return {
-    questionId: crypto.randomUUID(),
-    question:
-      "Hvad er hovedformålet med Notely, når du bruger det som studieassistent?",
-    options: [
-      {
-        id: "a",
-        text: "At være en nordisk studieassistent, der hjælper dig med at forstå dit eget pensum",
-        isCorrect: true,
-      },
-      {
-        id: "b",
-        text: "At erstatte alle lærebøger, så du aldrig behøver at læse igen",
-        isCorrect: false,
-      },
-      {
-        id: "c",
-        text: "At være et generelt AI-chatværktøj uden særligt fokus på studier",
-        isCorrect: false,
-      },
-      {
-        id: "d",
-        text: "Kun at lave flashede marketing-tekster til sociale medier",
-        isCorrect: false,
-      },
-    ],
-    explanation:
-      "Notely er designet som en studieassistent/eksamenstræner, der bygger på dit eget pensum og supplerer med faglig baggrundslitteratur – ikke som en total erstatning for bøger og undervisning.",
-    citations: [],
-  };
-}
-
-export async function POST(req: Request) {
-  const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return NextResponse.json(
-      { error: "Mangler owner_id (hverken login eller DEV_USER_ID sat)." },
-      { status: 401 },
-    );
-  }
-
-  let body: GenerateMcRequest | null = null;
+async function readJsonBody<T>(req: NextRequest) {
+  const contentType = req.headers.get("content-type") || "";
+  const raw = (await req.text()).trim();
+  if (!raw) return { ok: true as const, value: {} as T };
 
   try {
-    body = (await req.json()) as GenerateMcRequest;
+    return { ok: true as const, value: JSON.parse(raw) as T };
   } catch {
-    body = null;
+    return {
+      ok: false as const,
+      error: "Ugyldigt JSON-body.",
+      debug: { contentType, rawSnippet: raw.slice(0, 200) },
+    };
   }
+}
 
-  const scopeFolderIds =
-    body?.scopeFolderIds?.filter(
-      (x) => typeof x === "string" && x.trim().length > 0,
-    ) ?? [];
+function pickDifficulty(raw: any): Difficulty {
+  return raw === "easy" || raw === "hard" ? raw : "medium";
+}
 
-  const difficulty: Difficulty = body?.difficulty ?? "medium";
-
-  const rawMax = body?.maxContextChunks;
-  const maxContextChunks =
-    typeof rawMax === "number" && Number.isFinite(rawMax)
-      ? Math.min(Math.max(Math.round(rawMax), 1), 32)
-      : 8;
-
-  console.log("[generate-mc-question] ownerId:", ownerId, {
-    scopeFolderIds,
-    difficulty,
-    maxContextChunks,
-  });
-
-  // --- Hent noter i scope (fallback-kontekst) ---
-
-  type NoteRow = {
-    id: string;
-    title: string | null;
-    content: string | null;
-    source_title: string | null;
-    source_url: string | null;
-    folder_id?: string | null;
-  };
-
-  let notesQuery = sb
-    .from("notes")
-    .select("id,title,content,source_title,source_url,folder_id")
-    .eq("owner_id", ownerId)
-    .order("created_at", { ascending: false })
-    .limit(maxContextChunks);
-
-  if (scopeFolderIds.length > 0) {
-    notesQuery = notesQuery.in("folder_id", scopeFolderIds);
+function uniqTrimmed(ids: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of ids) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
   }
+  return out;
+}
 
-  const { data: notes, error: notesError } = await notesQuery;
+function scopeKeyFromFolderIds(folderIds: string[]) {
+  const ids = uniqTrimmed(folderIds).sort();
+  return ids.length ? `folders:${ids.join(",")}` : "all";
+}
 
-  if (notesError) {
-    console.error("[generate-mc-question] notes error:", notesError);
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
+  return a;
+}
 
-  const noteRows: NoteRow[] = (notes ?? []) as NoteRow[];
-
-  // topic = mappe-navn hvis muligt, ellers "dit pensum"
-  let topic = "dit pensum";
-
-  if (scopeFolderIds.length > 0) {
-    const { data: folder } = await sb
-      .from("folders")
-      .select("name")
+async function loadLastUsedFileId(sb: any, ownerId: string, scopeKey: string): Promise<string | null> {
+  try {
+    const { data } = await sb
+      .from("generation_state")
+      .select("last_used_file_id")
       .eq("owner_id", ownerId)
-      .eq("id", scopeFolderIds[0])
+      .eq("kind", "mc")
+      .eq("scope_key", scopeKey)
       .maybeSingle();
 
-    if (folder?.name) {
-      topic = folder.name;
-    }
-  } else if (noteRows[0]?.title) {
-    topic = noteRows[0].title!;
+    const v = (data as any)?.last_used_file_id;
+    return v ? String(v) : null;
+  } catch {
+    return null;
   }
+}
 
-  const MAX_CONTEXT_CHARS = 6000;
-
-  // --- PRIMÆR KONTEKST: doc_chunks fra de valgte mapper ---
-  let contextTextFromDocChunks = "";
-  let citationsFromDocChunks: McCitationPayload[] = [];
-
+async function saveLastUsedFileId(sb: any, ownerId: string, scopeKey: string, fileId: string) {
   try {
-    type ChunkRow = {
-      id: string;
-      content: string | null;
-      file_id: string | null;
-      folder_id: string | null;
-      created_at?: string | null;
-    };
-    type FileRow = {
-      id: string;
-      name: string | null;
-      original_name: string | null;
-      folder_id: string | null;
-    };
-
-    // 1) Find relevante filer i scope
-    let filesQuery = sb
-      .from("files")
-      .select("id, name, original_name, folder_id")
-      .eq("owner_id", ownerId);
-
-    if (scopeFolderIds.length > 0) {
-      filesQuery = filesQuery.in("folder_id", scopeFolderIds);
-    }
-
-    const { data: fileRows, error: filesError } = await filesQuery;
-
-    if (filesError) {
-      console.error(
-        "[generate-mc-question] files-in-scope error:",
-        filesError,
-      );
-    }
-
-    const filesInScope: FileRow[] = (fileRows ?? []) as FileRow[];
-
-    const fileTitleById: Record<string, string> = {};
-    for (const f of filesInScope) {
-      fileTitleById[f.id] =
-        f.name || f.original_name || topic || "Ukendt kilde";
-    }
-
-    const groups = new Map<string, ChunkRow[]>();
-
-    if (filesInScope.length > 0) {
-      // Hvor mange chunks må hver fil cirka bidrage med?
-      const perFileLimit = Math.max(
-        1,
-        Math.ceil(maxContextChunks / filesInScope.length),
-      );
-
-      console.log(
-        "[generate-mc-question] filesInScope:",
-        filesInScope.length,
-        "perFileLimit:",
-        perFileLimit,
-      );
-
-      // 2) Hent seneste chunks pr. fil
-      for (const f of filesInScope) {
-        const { data: chunks, error: chunkErr } = await sb
-          .from("doc_chunks")
-          .select("id, content, file_id, folder_id, created_at")
-          .eq("owner_id", ownerId)
-          .eq("file_id", f.id)
-          .order("created_at", { ascending: false })
-          .limit(perFileLimit);
-
-        if (chunkErr) {
-          console.error(
-            "[generate-mc-question] doc_chunks per-file error:",
-            chunkErr,
-          );
-          continue;
-        }
-
-        const chunkList: ChunkRow[] = (chunks ?? []) as ChunkRow[];
-        if (chunkList.length > 0) {
-          groups.set(f.id, chunkList);
-        }
-      }
-    }
-
-    let finalRows: ChunkRow[] = [];
-
-    if (groups.size > 0) {
-      // 3) Interleav på tværs af filer: 1. chunk fra hver fil, så 2. chunk osv.
-      const keys = Array.from(groups.keys());
-      let depth = 0;
-
-      while (finalRows.length < maxContextChunks) {
-        let added = false;
-        for (const key of keys) {
-          const group = groups.get(key)!;
-          if (depth < group.length) {
-            finalRows.push(group[depth]);
-            added = true;
-            if (finalRows.length >= maxContextChunks) break;
-          }
-        }
-        if (!added) break;
-        depth++;
-      }
-    } else {
-      // 4) Fallback: gammel adfærd (fx hvis der ikke er filer, men kun "løse" doc_chunks)
-      let fallbackQuery = sb
-        .from("doc_chunks")
-        .select("id, content, file_id, folder_id, created_at")
-        .eq("owner_id", ownerId);
-
-      if (scopeFolderIds.length > 0) {
-        fallbackQuery = fallbackQuery.in("folder_id", scopeFolderIds);
-      }
-
-      const { data: chunkRows, error: chunkError } = await fallbackQuery
-        .order("created_at", { ascending: false })
-        .limit(maxContextChunks);
-
-      if (chunkError) {
-        console.error(
-          "[generate-mc-question] doc_chunks fallback error:",
-          chunkError,
-        );
-      } else {
-        finalRows = (chunkRows ?? []) as ChunkRow[];
-      }
-    }
-
-    if (finalRows.length > 0) {
-      contextTextFromDocChunks = finalRows
-        .map((row) => row.content ?? "")
-        .filter(Boolean)
-        .join("\n\n---\n\n");
-
-      if (contextTextFromDocChunks.length > MAX_CONTEXT_CHARS) {
-        contextTextFromDocChunks = contextTextFromDocChunks.slice(
-          0,
-          MAX_CONTEXT_CHARS,
-        );
-      }
-
-      citationsFromDocChunks = finalRows.map((row) => ({
-        chunkId: row.id,
-        title:
-          (row.file_id && fileTitleById[row.file_id]) ||
-          topic ||
-          "Ukendt kilde",
-        url: null,
-      }));
-    }
-  } catch (err) {
-    console.error(
-      "[generate-mc-question] doc_chunks fetch error, falling back to notes:",
-      err,
+    await sb.from("generation_state").upsert(
+      {
+        owner_id: ownerId,
+        kind: "mc",
+        scope_key: scopeKey,
+        last_used_file_id: fileId,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "owner_id,kind,scope_key" },
     );
+  } catch (e) {
+    console.error("[generate-mc] save generation_state failed:", e);
+  }
+}
+
+function fileTitle(row: any) {
+  return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
+}
+
+type FileRow = {
+  id: string;
+  name: string | null;
+  original_name: string | null;
+  folder_id: string | null;
+  created_at: string | null;
+};
+
+type ChunkRow = {
+  id: string;
+  file_id: string;
+  content: string | null;
+  created_at: string | null;
+};
+
+function interleavePicked(
+  fileOrder: string[],
+  pickedByFile: Record<string, ChunkRow[]>,
+  targetTotal: number,
+) {
+  const idx = new Map<string, number>();
+  const out: ChunkRow[] = [];
+  for (const f of fileOrder) idx.set(f, 0);
+
+  while (out.length < targetTotal) {
+    let added = false;
+    for (const f of fileOrder) {
+      const list = pickedByFile[f] ?? [];
+      const i = idx.get(f) ?? 0;
+      if (i < list.length) {
+        out.push(list[i]);
+        idx.set(f, i + 1);
+        added = true;
+        if (out.length >= targetTotal) break;
+      }
+    }
+    if (!added) break;
   }
 
-  // --- Fallback: brug noter hvis der ikke er doc_chunks ---
+  return out;
+}
 
-  let contextText = "";
-  let citations: McCitationPayload[] = [];
+export async function POST(req: NextRequest) {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY mangler i .env.local." }, { status: 500 });
+    }
 
-  if (contextTextFromDocChunks) {
-    contextText = contextTextFromDocChunks;
-    citations = citationsFromDocChunks;
-  } else {
-    const contextBlocks = noteRows.map((n) => {
-      const label = n.title || n.source_title || "Ukendt kilde";
-      const body = (n.content ?? "").trim();
-      return `KILDE: ${label}\n${body}`;
+    const parsed = await readJsonBody<GenerateMcRequest>(req);
+    if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error, debug: (parsed as any).debug }, { status: 400 });
+
+    const body = parsed.value ?? {};
+    const difficulty = pickDifficulty(body.difficulty);
+
+    const rawMax = body.maxContextChunks;
+    const maxContextChunks =
+      typeof rawMax === "number" && Number.isFinite(rawMax)
+        ? Math.min(Math.max(Math.round(rawMax), 4), 32)
+        : 10;
+
+    const scopeFolderIds = Array.isArray(body.scopeFolderIds)
+      ? uniqTrimmed(body.scopeFolderIds.filter((x): x is string => typeof x === "string" && x.trim().length > 0))
+      : [];
+
+    const scopeKey = scopeKeyFromFolderIds(scopeFolderIds);
+
+    // Auth/dev-bypass via requireUser(req)
+    let sb: any;
+    let ownerId = "";
+    try {
+      const u = await requireUser(req);
+      sb = u.sb;
+      ownerId = u.id;
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      const isAuth = msg.toLowerCase().includes("unauthorized");
+      if (!isAuth) console.error("[generate-mc] requireUser crash:", e);
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+
+    const lastUsed = await loadLastUsedFileId(sb, ownerId, scopeKey);
+
+    // Topic (mappe-navn hvis muligt)
+    let topic = "pensum";
+    if (scopeFolderIds.length > 0) {
+      const { data: f } = await sb
+        .from("folders")
+        .select("name")
+        .eq("owner_id", ownerId)
+        .eq("id", scopeFolderIds[0])
+        .maybeSingle();
+      if (f?.name) topic = String(f.name);
+    }
+
+    // Filer i scope (seneste N)
+    let filesQ = sb
+      .from("files")
+      .select("id,name,original_name,folder_id,created_at")
+      .eq("owner_id", ownerId)
+      .order("created_at", { ascending: false })
+      .limit(40);
+
+    if (scopeFolderIds.length > 0) filesQ = filesQ.in("folder_id", scopeFolderIds);
+
+    const { data: files, error: filesErr } = await filesQ;
+    if (filesErr) console.error("[generate-mc] files error:", filesErr);
+
+    const fileRows = (files ?? []) as FileRow[];
+    if (fileRows.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "Ingen filer fundet i scope. Upload materiale først.", debug: { scopeFolderIds } },
+        { status: 400 },
+      );
+    }
+
+    // Rotation: start efter lastUsed
+    let start = 0;
+    if (lastUsed) {
+      const idx = fileRows.findIndex((f) => String(f.id) === String(lastUsed));
+      if (idx >= 0) start = (idx + 1) % fileRows.length;
+    }
+    const rotated = [...fileRows.slice(start), ...fileRows.slice(0, start)];
+
+    // Hvor mange filer vil vi blande?
+    const desiredFiles = Math.min(5, Math.max(2, Math.ceil(maxContextChunks / 3)), rotated.length);
+    const scanMax = Math.min(20, rotated.length);
+
+    const pickedByFile: Record<string, ChunkRow[]> = {};
+    const usedFiles: FileRow[] = [];
+
+    const perFileTake = Math.max(2, Math.ceil(maxContextChunks / desiredFiles));
+    const perFilePool = Math.min(80, Math.max(20, perFileTake * 8));
+
+    for (const f of rotated.slice(0, scanMax)) {
+      if (usedFiles.length >= desiredFiles) break;
+
+      const fileId = String(f.id);
+
+      const { data: pool, error: poolErr } = await sb
+        .from("doc_chunks")
+        .select("id,file_id,content,created_at")
+        .eq("owner_id", ownerId)
+        .eq("file_id", fileId)
+        .order("created_at", { ascending: false })
+        .limit(perFilePool);
+
+      if (poolErr) {
+        console.error("[generate-mc] doc_chunks pool error:", poolErr);
+        continue;
+      }
+
+      const poolRows = (pool ?? []) as ChunkRow[];
+      const nonEmpty = poolRows.filter((r) => (r.content ?? "").trim().length > 0);
+      if (nonEmpty.length === 0) continue;
+
+      const picked = shuffle(nonEmpty)
+        .slice(0, Math.min(perFileTake, nonEmpty.length))
+        .sort((a, b) => {
+          const ta = a.created_at ? Date.parse(a.created_at) : 0;
+          const tb = b.created_at ? Date.parse(b.created_at) : 0;
+          return ta - tb;
+        });
+
+      pickedByFile[fileId] = picked;
+      usedFiles.push(f);
+    }
+
+    if (usedFiles.length === 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Ingen kontekst fundet (doc_chunks) for filerne i scope. Tjek at upload/parse er kørt.",
+          debug: { scopeFolderIds, fileCount: fileRows.length },
+        },
+        { status: 400 },
+      );
+    }
+
+    const fileMap = new Map<string, FileRow>(usedFiles.map((f) => [String(f.id), f]));
+    const fileOrder = shuffle(usedFiles.map((f) => String(f.id)));
+    const interleaved = interleavePicked(fileOrder, pickedByFile, maxContextChunks);
+
+    const contextText = interleaved
+      .map((c) => {
+        const f = fileMap.get(String(c.file_id));
+        const title = f ? fileTitle(f) : "Ukendt kilde";
+        const txt = (c.content ?? "").trim();
+        return `KILDE: ${title}\n\n${txt}`;
+      })
+      .filter(Boolean)
+      .join("\n\n---\n\n")
+      .slice(0, 7000);
+
+    if (!contextText.trim()) {
+      return NextResponse.json(
+        { ok: false, error: "Kontekst blev tom efter filtrering. Tjek at doc_chunks.content ikke er tomt.", debug: { scopeFolderIds } },
+        { status: 400 },
+      );
+    }
+
+    const citations: McCitationPayload[] = interleaved.map((c) => {
+      const f = fileMap.get(String(c.file_id));
+      return { chunkId: c.id, title: f ? fileTitle(f) : null, url: null };
     });
 
-    contextText = contextBlocks.join("\n\n---\n\n");
-    if (contextText.length > MAX_CONTEXT_CHARS) {
-      contextText = contextText.slice(0, MAX_CONTEXT_CHARS);
-    }
+    const usedFileId = String(usedFiles[0]?.id ?? "") || null;
 
-    citations = noteRows.map((n) => ({
-      chunkId: n.id,
-      title: n.title || n.source_title || null,
-      url: n.source_url || null,
-    }));
-  }
+    const model = process.env.OPENAI_MODEL_MC || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-  // --- LLM-kald: generér ét MC-spørgsmål på dansk ud fra konteksten ---
-
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.error("[generate-mc-question] Missing OPENAI_API_KEY, using demo");
-    return NextResponse.json(buildDemoQuestion());
-  }
-
-  const client = new OpenAI({ apiKey });
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  const systemPrompt = `
-Du er en dansk studieassistent. Du laver eksamenslignende multiple choice-spørgsmål til elever/studerende
-på baggrund af deres egne pensumtekster ("kontekst").
+    const systemPrompt = `
+Du er en dansk studieassistent. Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddrag.
 
 VIGTIGT:
-- Du MÅ KUN bruge den kontekst, du får i prompten, som grundlag for spørgsmål og svar.
-- Brug konkrete navne, begreber, eksempler og pointer fra konteksten, når det er muligt.
-- Find et centralt fagligt punkt i konteksten og lav et spørgsmål, der KUN kan besvares korrekt,
-  hvis man har læst konteksten.
-- Skriv ALT på dansk.
+- Du MÅ KUN bruge den kontekst, du får (som kan indeholde flere KILDE-afsnit).
+- Skriv alt på dansk.
 
-KRAV TIL OUTPUT:
-- Lav præcise, faglige spørgsmål – ingen overfladisk smalltalk.
-- Lav 1 (ét) multiple choice-spørgsmål.
-- Lav 4 svarmuligheder, hvor præcis 1 er korrekt.
-- De forkerte svar (distraktorer) skal være plausible, ikke åbenlyst forkerte.
-- Spørgsmålet skal teste forståelse eller anvendelse, ikke kun ren udenadslære.
-- Returnér svaret som gyldig JSON med nøglerne:
-  {
-    "question": "...",
-    "options": [
-      { "text": "...", "isCorrect": true/false },
-      ...
-    ],
-    "explanation": "Kort forklaring på, hvorfor det rigtige svar er korrekt"
-  }
+KRAV:
+- 1 spørgsmål
+- 4 svarmuligheder
+- Præcis 1 korrekt
+- Plausible distraktorer
+
+Returnér gyldig JSON:
+{
+  "question": "...",
+  "options": [
+    { "text": "...", "isCorrect": true/false },
+    ...
+  ],
+  "explanation": "Kort forklaring"
+}
 `.trim();
 
-  const userPromptParts = [
-    `Fag/tema: ${topic}`,
-    `Sværhedsgrad: ${difficulty}`,
-  ];
-
-  if (contextText) {
-    userPromptParts.push(
+    const userPrompt = [
+      `Fag/tema: ${topic}`,
+      `Sværhedsgrad: ${difficulty}`,
       "",
-      "Her er uddrag fra elevens pensum. Brug dem som ENESTE grundlag for spørgsmål og forklaring:",
+      "KONTEKST (brug dette som eneste grundlag):",
       "",
       contextText,
-      "",
-      "Lav et spørgsmål, der tydeligt kan besvares korrekt ud fra uddragene ovenfor.",
-    );
-  } else {
-    userPromptParts.push(
-      "",
-      "Der er ingen eksplicit kontekst i denne forespørgsel – lav et generelt spørgsmål inden for fag/temaet.",
-    );
-  }
+    ].join("\n");
 
-  const userPrompt = userPromptParts.join("\n");
-
-  try {
-    const completion = await client.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model,
       response_format: { type: "json_object" },
       messages: [
@@ -431,69 +377,65 @@ KRAV TIL OUTPUT:
       ],
     });
 
-    const raw = completion.choices[0]?.message?.content || "{}";
+    const raw = completion.choices[0]?.message?.content ?? "{}";
 
     type LlmOption = { text?: string; isCorrect?: boolean };
-    type LlmPayload = {
-      question?: string;
-      options?: LlmOption[];
-      explanation?: string;
-    };
+    type LlmPayload = { question?: string; options?: LlmOption[]; explanation?: string };
 
-    let parsed: LlmPayload;
+    let payload: LlmPayload = {};
     try {
-      parsed = JSON.parse(raw) as LlmPayload;
-    } catch (err) {
-      console.error("[generate-mc-question] JSON parse error, using demo:", err);
-      return NextResponse.json(buildDemoQuestion());
+      payload = JSON.parse(raw) as LlmPayload;
+    } catch {
+      payload = {};
     }
 
-    const questionText = (parsed.question || "").trim();
-    const llmOptions = Array.isArray(parsed.options) ? parsed.options : [];
+    const question = (payload.question ?? "").trim();
+    const opts = Array.isArray(payload.options) ? payload.options : [];
 
-    if (!questionText || llmOptions.length < 2) {
-      console.error("[generate-mc-question] LLM output incomplete, using demo");
-      return NextResponse.json(buildDemoQuestion());
+    if (!question || opts.length < 2) {
+      return NextResponse.json({ ok: false, error: "Modellen returnerede ufuldstændigt output." }, { status: 500 });
     }
 
-    // Map til payload med id'er a,b,c,d,...
-    const letters = ["a", "b", "c", "d", "e", "f"];
-    const options: McOptionPayload[] = llmOptions
-      .slice(0, 6)
-      .map((opt, idx) => ({
-        id: letters[idx] ?? `opt${idx + 1}`,
-        text: String(opt.text ?? "").trim() || `Mulighed ${idx + 1}`,
-        isCorrect: !!opt.isCorrect,
-      }));
+    // Normalisér til 4 muligheder
+    const normalized = opts.slice(0, 4);
+    while (normalized.length < 4) normalized.push({ text: `Mulighed ${normalized.length + 1}`, isCorrect: false });
 
-    // Sikr præcis 1 korrekt svar
-    const firstCorrectIndex = options.findIndex((o) => o.isCorrect);
+    // Sikr præcis 1 korrekt (før shuffle)
+    let correctIdx = normalized.findIndex((o) => !!o.isCorrect);
+    if (correctIdx === -1) correctIdx = 0;
+    const fixed = normalized.map((o, i) => ({
+      text: String(o.text ?? "").trim() || `Mulighed ${i + 1}`,
+      isCorrect: i === correctIdx,
+    }));
 
-    if (firstCorrectIndex === -1) {
-      options[0].isCorrect = true;
-    } else {
-      options.forEach((o, idx) => {
-        o.isCorrect = idx === firstCorrectIndex;
-      });
-    }
+    // Shuffle og tildel nye ids a-d efter shuffle
+    const shuffled = shuffle(fixed);
+    const letters = ["a", "b", "c", "d"];
+    const options: McOptionPayload[] = shuffled.map((o, i) => ({
+      id: letters[i],
+      text: o.text,
+      isCorrect: o.isCorrect,
+    }));
 
-    // Shuffle rækkefølgen (så korrekt IKKE altid ligger først)
-    for (let i = options.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [options[i], options[j]] = [options[j], options[i]];
-    }
+    // Gem rotation state
+    if (usedFileId) await saveLastUsedFileId(sb, ownerId, scopeKey, usedFileId);
 
-    const response: GenerateMcResponse = {
-      questionId: crypto.randomUUID(),
-      question: questionText,
+    const resp: GenerateMcResponse = {
+      ok: true,
+      questionId: randomUUID(),
+      question,
       options,
-      explanation: parsed.explanation?.trim() || null,
+      explanation: (payload.explanation ?? "").trim() || null,
       citations,
+      usedFileId,
     };
 
-    return NextResponse.json(response);
-  } catch (err) {
-    console.error("[generate-mc-question] OpenAI error, using demo:", err);
-    return NextResponse.json(buildDemoQuestion());
+    return NextResponse.json(resp, { status: 200 });
+  } catch (err: any) {
+    console.error("[generate-mc] route error:", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message ?? "Uventet fejl i generate-mc-question." },
+      { status: 500 },
+    );
   }
 }

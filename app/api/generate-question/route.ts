@@ -1,288 +1,405 @@
 ﻿// app/api/generate-question/route.ts
 import "server-only";
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireUser } from "@/lib/auth";
 import OpenAI from "openai";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+type Difficulty = "easy" | "medium" | "hard";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // DEV fallback
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
+type GenerateQuestionRequest = {
+  folderId?: string | null;
+  scopeFolderIds?: string[];
+  difficulty?: Difficulty;
+  maxContextChunks?: number; // total chunks in context (across files)
+};
 
-async function callLLMQuestionGenerator(opts: {
+type GenerateQuestionResponse = {
+  ok: true;
+  question: string;
   topic: string;
-  contextText: string;
-}) {
-  const { topic, contextText } = opts;
+  folder_id: string | null;
+  note_id: string | null;
+  usedFileId: string | null; // “primary” file (for rotation/debug/backwards compat)
+};
 
-  const systemPrompt = `
-Du er opgavekonstruktør og eksamenssæt-forfatter på et dansk gymnasium.
-Du formulerer korte, skarpe eksamensspørgsmål til skriftlig og mundtlig eksamen.
-`.trim();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  const userPrompt = `
-Emne/fag: ${topic || "ukendt emne"}
-
-Baggrund (uddrag fra elevens pensum – én tekst ad gangen):
-"""${contextText || "Ingen baggrundstekst tilgængelig."}"""
-
-Opgave:
-- Formulér 1 kort eksamensspørgsmål.
-- Spørgsmålet skal teste forståelse og anvendelse, ikke kun udenadslære.
-- Det skal være konkret og fagspecifikt, og gerne pege på centrale begreber/teorier.
-- Maks 2 sætninger.
-- Ingen forklaring, ingen punktopstilling – kun selve spørgsmålet som én sammenhængende tekst.
-
-Returnér KUN selve spørgsmålet som ren tekst.
-`.trim();
-
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    temperature: 0.8,
-  });
-
-  const question =
-    completion.choices[0]?.message?.content?.trim() ??
-    `Formulér et kort eksamensspørgsmål inden for "${topic}", som tester forståelse og ikke kun udenadslære.`;
-
-  return question;
+async function readJsonBody<T>(req: NextRequest) {
+  const raw = (await req.text()).trim();
+  if (!raw) return { ok: true as const, value: {} as T };
+  try {
+    return { ok: true as const, value: JSON.parse(raw) as T };
+  } catch {
+    return { ok: false as const, error: "Ugyldigt JSON-body." };
+  }
 }
 
-/**
- * Bygger kontekst ud fra ÉN tilfældig fil i den valgte mappe.
- * Så bliver hvert spørgsmål knyttet til én konkret tekst,
- * men over tid bliver alle filer brugt.
- */
-async function buildContextFromSingleFile(opts: {
-  sb: any;
-  ownerId: string;
-  folderId: string | null;
-  maxChunks?: number;
-  maxChars?: number;
-}): Promise<string> {
-  const { sb, ownerId, folderId, maxChunks = 80, maxChars = 8000 } = opts;
+function pickDifficulty(raw: any): Difficulty {
+  return raw === "easy" || raw === "hard" ? raw : "medium";
+}
 
-  type ChunkRow = {
-    id: string;
-    content: string | null;
-    file_id: string | null;
-    folder_id: string | null;
-    created_at?: string | null;
-  };
-
-  type FileRow = {
-    id: string;
-    name: string | null;
-    original_name: string | null;
-    folder_id: string | null;
-  };
-
-  // 1) Find filer for brugeren (evt. kun i én mappe)
-  let filesQuery = sb
-    .from("files")
-    .select("id, name, original_name, folder_id")
-    .eq("owner_id", ownerId);
-
-  if (folderId) {
-    filesQuery = filesQuery.eq("folder_id", folderId);
+function uniqTrimmed(ids: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of ids) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
   }
+  return out;
+}
 
-  const { data: fileRows, error: filesError } = await filesQuery;
+function scopeKeyFromFolderIds(folderIds: string[]) {
+  const ids = uniqTrimmed(folderIds).sort();
+  return ids.length ? `folders:${ids.join(",")}` : "all";
+}
 
-  if (filesError) {
-    console.error("[generate-question] files error:", filesError);
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
+  return a;
+}
 
-  const filesInScope: FileRow[] = (fileRows ?? []) as FileRow[];
-
-  let finalRows: ChunkRow[] = [];
-
-  if (filesInScope.length > 0) {
-    // 2) Vælg ÉN tilfældig fil i scope
-    const idx = Math.floor(Math.random() * filesInScope.length);
-    const chosenFile = filesInScope[idx];
-
-    console.log("[generate-question] chosen file for context:", {
-      chosenFileId: chosenFile.id,
-      fileCountInScope: filesInScope.length,
-    });
-
-    // 3) Hent chunks fra den valgte fil
-    const { data: chunks, error: chunkErr } = await sb
-      .from("doc_chunks")
-      .select("id, content, file_id, folder_id, created_at")
+async function loadLastUsedFileId(sb: any, ownerId: string, scopeKey: string): Promise<string | null> {
+  try {
+    const { data } = await sb
+      .from("generation_state")
+      .select("last_used_file_id")
       .eq("owner_id", ownerId)
-      .eq("file_id", chosenFile.id)
-      .order("created_at", { ascending: false })
-      .limit(maxChunks);
+      .eq("kind", "question")
+      .eq("scope_key", scopeKey)
+      .maybeSingle();
 
-    if (chunkErr) {
-      console.error(
-        "[generate-question] doc_chunks error (single-file):",
-        chunkErr,
-      );
-    } else {
-      finalRows = (chunks ?? []) as ChunkRow[];
+    const v = (data as any)?.last_used_file_id;
+    return v ? String(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveLastUsedFileId(sb: any, ownerId: string, scopeKey: string, fileId: string) {
+  try {
+    await sb.from("generation_state").upsert(
+      {
+        owner_id: ownerId,
+        kind: "question",
+        scope_key: scopeKey,
+        last_used_file_id: fileId,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "owner_id,kind,scope_key" },
+    );
+  } catch {
+    // ignore
+  }
+}
+
+type FileRow = {
+  id: string;
+  name: string | null;
+  original_name: string | null;
+  folder_id: string | null;
+  created_at: string | null;
+};
+
+type ChunkRow = {
+  id: string;
+  file_id: string;
+  content: string | null;
+  created_at: string | null;
+};
+
+function fileTitle(row: any) {
+  return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
+}
+
+function interleavePicked(
+  fileOrder: string[],
+  pickedByFile: Record<string, ChunkRow[]>,
+  targetTotal: number,
+) {
+  const idx = new Map<string, number>();
+  const out: ChunkRow[] = [];
+  for (const f of fileOrder) idx.set(f, 0);
+
+  while (out.length < targetTotal) {
+    let added = false;
+    for (const f of fileOrder) {
+      const list = pickedByFile[f] ?? [];
+      const i = idx.get(f) ?? 0;
+      if (i < list.length) {
+        out.push(list[i]);
+        idx.set(f, i + 1);
+        added = true;
+        if (out.length >= targetTotal) break;
+      }
     }
+    if (!added) break;
   }
 
-  // 4) Fallback: brug alle doc_chunks i mappen / globalt hvis ingen filer
-  if (finalRows.length === 0) {
-    let fallbackQuery = sb
-      .from("doc_chunks")
-      .select("id, content, file_id, folder_id, created_at")
-      .eq("owner_id", ownerId);
-
-    if (folderId) {
-      fallbackQuery = fallbackQuery.eq("folder_id", folderId);
-    }
-
-    const { data: chunkRows, error: chunkError } = await fallbackQuery
-      .order("created_at", { ascending: false })
-      .limit(maxChunks);
-
-    if (chunkError) {
-      console.error(
-        "[generate-question] doc_chunks fallback error:",
-        chunkError,
-      );
-      return "";
-    }
-
-    finalRows = (chunkRows ?? []) as ChunkRow[];
-  }
-
-  if (finalRows.length === 0) return "";
-
-  let text = finalRows
-    .map((row) => row.content ?? "")
-    .filter(Boolean)
-    .join("\n\n---\n\n");
-
-  if (text.length > maxChars) {
-    text = text.slice(0, maxChars);
-  }
-
-  return text;
+  return out;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const sb = await supabaseServerRoute();
-    const ownerId = await getOwnerId(sb);
-
-    if (!ownerId) {
-      return NextResponse.json(
-        { error: "Unauthorized (mangler DEV_USER_ID eller login)" },
-        { status: 401 },
-      );
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY mangler i .env.local." }, { status: 500 });
     }
 
-    const body: any = await req.json().catch(() => ({}));
+    const parsed = await readJsonBody<GenerateQuestionRequest>(req);
+    if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
 
-    // Tillad både folder_id/folderId og note_id/noteId
-    const folder_id_raw = body.folder_id ?? body.folderId ?? null;
-    const note_id_raw = body.note_id ?? body.noteId ?? null;
+    const body = parsed.value ?? {};
+    const difficulty = pickDifficulty(body.difficulty);
+
+    const rawMax = body.maxContextChunks;
+    const maxContextChunks =
+      typeof rawMax === "number" && Number.isFinite(rawMax)
+        ? Math.min(Math.max(Math.round(rawMax), 4), 32)
+        : 12;
 
     const folderId =
-      typeof folder_id_raw === "string" ? folder_id_raw : null;
-    const noteId = typeof note_id_raw === "string" ? note_id_raw : null;
+      typeof body.folderId === "string" && body.folderId.trim() ? body.folderId.trim() : null;
 
-    //
-    // Find et simpelt "topic" til spørgsmålet:
-    // 1) Hvis noteId → hent titel fra noten.
-    // 2) Ellers hvis folderId → hent mappenavn.
-    // 3) Ellers fallback.
-    //
+    const scopeFolderIds = Array.isArray(body.scopeFolderIds)
+      ? uniqTrimmed(body.scopeFolderIds.filter((x): x is string => typeof x === "string" && x.trim().length > 0))
+      : [];
+
+    const effectiveFolderIds = scopeFolderIds.length > 0 ? scopeFolderIds : folderId ? [folderId] : [];
+    const scopeKey = scopeKeyFromFolderIds(effectiveFolderIds);
+
+    // Auth/dev-bypass via requireUser(req)
+    let sb: any;
+    let ownerId = "";
+    try {
+      const u = await requireUser(req);
+      sb = u.sb;
+      ownerId = u.id;
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      const isAuth = msg.toLowerCase().includes("unauthorized");
+      if (!isAuth) console.error("[generate-question] requireUser crash:", e);
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+
+    const lastUsed = await loadLastUsedFileId(sb, ownerId, scopeKey);
+
+    // Topic (mappe-navn hvis muligt)
     let topic = "pensum";
-
-    if (noteId) {
-      const { data: note } = await sb
-        .from("notes")
-        .select("title")
-        .eq("id", noteId)
-        .eq("owner_id", ownerId)
-        .maybeSingle();
-
-      if (note?.title) topic = note.title;
-    } else if (folderId) {
-      const { data: folder } = await sb
+    if (effectiveFolderIds.length > 0) {
+      const { data: f } = await sb
         .from("folders")
         .select("name")
-        .eq("id", folderId)
         .eq("owner_id", ownerId)
+        .eq("id", effectiveFolderIds[0])
         .maybeSingle();
-
-      if (folder?.name) topic = folder.name;
+      if (f?.name) topic = String(f.name);
     }
 
-    // Hent kontekst: én tilfældig fil i valgt mappe
-    let contextText = "";
-    try {
-      contextText = await buildContextFromSingleFile({
-        sb,
-        ownerId,
-        folderId,
-        maxChunks: 80,
-        maxChars: 8000,
+    // Filer i scope (flere for variation)
+    let filesQ = sb
+      .from("files")
+      .select("id,name,original_name,folder_id,created_at")
+      .eq("owner_id", ownerId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+
+    if (effectiveFolderIds.length > 0) filesQ = filesQ.in("folder_id", effectiveFolderIds);
+
+    const { data: files, error: filesErr } = await filesQ;
+    if (filesErr) console.error("[generate-question] files error:", filesErr);
+
+    const fileRows = (files ?? []) as FileRow[];
+
+    // Hvis ingen filer: fallback til generelt spørgsmål
+    if (fileRows.length === 0) {
+      const model = process.env.OPENAI_MODEL_QUESTION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+      const systemPrompt = `
+Du er en dansk studieassistent, der skriver eksamenslignende spørgsmål.
+
+Skriv ALT på dansk.
+Returnér som gyldig JSON: { "question": "..." }
+      `.trim();
+
+      const completion = await openai.chat.completions.create({
+        model,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: JSON.stringify({ topic, difficulty }) },
+        ],
       });
-    } catch (err) {
-      console.error(
-        "GENERATE-QUESTION: fejl ved hentning af doc_chunks:",
-        err,
-      );
-    }
 
-    let question: string;
-
-    if (!process.env.OPENAI_API_KEY) {
-      console.error(
-        "GENERATE-QUESTION: mangler OPENAI_API_KEY, bruger fallback-spørgsmål",
-      );
-      question = `Formulér et kort eksamensspørgsmål inden for "${topic}", som tester forståelse og ikke kun udenadslære.`;
-    } else {
+      const raw = completion.choices[0]?.message?.content ?? "{}";
+      let question = "";
       try {
-        question = await callLLMQuestionGenerator({ topic, contextText });
-      } catch (err) {
-        console.error(
-          "GENERATE-QUESTION: LLM-fejl, bruger fallback-spørgsmål:",
-          err,
-        );
-        question = `Formulér et kort eksamensspørgsmål inden for "${topic}", som tester forståelse og ikke kun udenadslære.`;
+        question = (JSON.parse(raw) as any)?.question?.trim?.() ?? "";
+      } catch {
+        question = "";
       }
-    }
+      if (!question) {
+        question = `Forklar et centralt begreb fra ${topic}, og vis hvordan det kan bruges analytisk på et konkret eksempel.`;
+      }
 
-    return NextResponse.json(
-      {
+      const resp: GenerateQuestionResponse = {
+        ok: true,
         question,
         topic,
         folder_id: folderId,
-        note_id: noteId,
-      },
-      { status: 200 },
-    );
-  } catch (e: any) {
-    console.error("GENERATE-QUESTION route error:", e);
+        note_id: null,
+        usedFileId: null,
+      };
+      return NextResponse.json(resp, { status: 200 });
+    }
+
+    // Rotation: start efter lastUsed (så vi ikke “låser” på én fil)
+    let start = 0;
+    if (lastUsed) {
+      const idx = fileRows.findIndex((f) => String(f.id) === String(lastUsed));
+      if (idx >= 0) start = (idx + 1) % fileRows.length;
+    }
+    const rotated = [...fileRows.slice(start), ...fileRows.slice(0, start)];
+
+    // Hvor mange filer vil vi blande?
+    const desiredFiles = Math.min(6, Math.max(2, Math.ceil(maxContextChunks / 3)), rotated.length);
+    const scanMax = Math.min(24, rotated.length);
+
+    const pickedByFile: Record<string, ChunkRow[]> = {};
+    const usedFiles: FileRow[] = [];
+
+    const perFileTake = Math.max(2, Math.ceil(maxContextChunks / desiredFiles));
+    const perFilePool = Math.min(100, Math.max(24, perFileTake * 10));
+
+    // Scan filer indtil vi har nok “ikke-tomme”
+    for (const f of rotated.slice(0, scanMax)) {
+      if (usedFiles.length >= desiredFiles) break;
+
+      const fileId = String(f.id);
+
+      const { data: pool, error: poolErr } = await sb
+        .from("doc_chunks")
+        .select("id,file_id,content,created_at")
+        .eq("owner_id", ownerId)
+        .eq("file_id", fileId)
+        .order("created_at", { ascending: false })
+        .limit(perFilePool);
+
+      if (poolErr) {
+        console.error("[generate-question] doc_chunks pool error:", poolErr);
+        continue;
+      }
+
+      const poolRows = (pool ?? []) as ChunkRow[];
+      const nonEmpty = poolRows.filter((r) => (r.content ?? "").trim().length > 0);
+      if (nonEmpty.length === 0) continue;
+
+      const picked = shuffle(nonEmpty)
+        .slice(0, Math.min(perFileTake, nonEmpty.length))
+        .sort((a, b) => {
+          const ta = a.created_at ? Date.parse(a.created_at) : 0;
+          const tb = b.created_at ? Date.parse(b.created_at) : 0;
+          return ta - tb;
+        });
+
+      pickedByFile[fileId] = picked;
+      usedFiles.push(f);
+    }
+
+    if (usedFiles.length === 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Ingen kontekst fundet (doc_chunks) for filerne i scope. Tjek at upload/parse er kørt.",
+          debug: { effectiveFolderIds, fileCount: fileRows.length },
+        },
+        { status: 400 },
+      );
+    }
+
+    const fileMap = new Map<string, FileRow>(usedFiles.map((f) => [String(f.id), f]));
+    const fileOrder = shuffle(usedFiles.map((f) => String(f.id)));
+
+    const interleaved = interleavePicked(fileOrder, pickedByFile, maxContextChunks);
+
+    const contextText = interleaved
+      .map((c) => {
+        const f = fileMap.get(String(c.file_id));
+        const title = f ? fileTitle(f) : "Ukendt kilde";
+        const txt = (c.content ?? "").trim();
+        return `KILDE: ${title}\n\n${txt}`;
+      })
+      .filter(Boolean)
+      .join("\n\n---\n\n")
+      .slice(0, 9000);
+
+    // “primary” file (rotation state)
+    const usedFileId = String(usedFiles[0]?.id ?? "");
+
+    const model = process.env.OPENAI_MODEL_QUESTION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    const systemPrompt = `
+Du er en dansk studieassistent, der skriver eksamenslignende spørgsmål.
+
+VIGTIGT:
+- Hvis der er "context", så lav et spørgsmål der kan besvares ud fra teksten.
+- Konteksten kan indeholde flere KILDE-afsnit (flere filer).
+- Skriv ALT på dansk.
+
+Returnér som gyldig JSON:
+{ "question": "..." }
+    `.trim();
+
+    const userPayload = { topic, difficulty, context: contextText };
+
+    const completion = await openai.chat.completions.create({
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(userPayload) },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+
+    let question = "";
+    try {
+      const j = JSON.parse(raw) as { question?: string };
+      question = (j.question ?? "").trim();
+    } catch {
+      question = "";
+    }
+
+    if (!question) {
+      question = `Forklar et centralt begreb fra ${topic}, og vis hvordan det kan bruges analytisk på et konkret eksempel.`;
+    }
+
+    if (usedFileId) await saveLastUsedFileId(sb, ownerId, scopeKey, usedFileId);
+
+    const resp: GenerateQuestionResponse = {
+      ok: true,
+      question,
+      topic,
+      folder_id: folderId,
+      note_id: null,
+      usedFileId: usedFileId || null,
+    };
+
+    return NextResponse.json(resp, { status: 200 });
+  } catch (err: any) {
+    console.error("[generate-question] route error:", err);
     return NextResponse.json(
-      { error: e?.message ?? "Unknown error" },
+      { ok: false, error: err?.message ?? "Uventet fejl i generate-question." },
       { status: 500 },
     );
   }

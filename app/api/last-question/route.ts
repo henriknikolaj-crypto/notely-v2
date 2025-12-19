@@ -1,27 +1,17 @@
-﻿ 
-import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import { requireUser } from "@/app/(lib)/requireUser";
+﻿// app/api/last-question/route.ts
+import "server-only";
 
-function makeDb() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)!;
-  return createClient(url, key, { auth: { persistSession: false } });
-}
+import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 
-export async function GET() {
-  const db = makeDb();
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function GET(req: NextRequest) {
   try {
-    let ownerId: string | null;
-    try {
-      const u = await requireUser();
-      ownerId = u?.id ?? process.env.DEV_USER_ID ?? null;
-    } catch {
-      ownerId = process.env.DEV_USER_ID ?? null;
-    }
-    if (!ownerId) return NextResponse.json({ question: null });
+    const { sb, id: ownerId } = await requireUser(req);
 
-    const { data, error } = await db
+    const { data, error } = await sb
       .from("ai_questions")
       .select("id, question, created_at")
       .eq("owner_id", ownerId)
@@ -29,11 +19,18 @@ export async function GET() {
       .limit(1)
       .maybeSingle();
 
-    if (error) return NextResponse.json({ question: null });
-    return NextResponse.json({ question: data?.question ?? null });
-  } catch {
-    return NextResponse.json({ question: null });
+    if (error) {
+      console.error("[last-question] db error", error);
+      return NextResponse.json({ ok: true, question: null }, { status: 200 });
+    }
+
+    return NextResponse.json({ ok: true, question: data?.question ?? null }, { status: 200 });
+  } catch (err: any) {
+    // Ikke logget ind (eller dev-bypass ikke opfyldt) => bare null
+    const msg = String(err?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+    if (!isAuth) console.error("[last-question] handler crash:", err);
+
+    return NextResponse.json({ ok: true, question: null }, { status: 200 });
   }
 }
-
-

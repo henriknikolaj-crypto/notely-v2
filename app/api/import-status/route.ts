@@ -1,24 +1,12 @@
 // app/api/import-status/route.ts
 import "server-only";
- 
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
+import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // falder igennem til DEV_USER_ID
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
 
 function errInfo(e: any) {
   if (!e) return { message: "Unknown error" };
@@ -71,6 +59,12 @@ function getMonthBoundsUTC(now = new Date()) {
   };
 }
 
+type CountJobsResult = {
+  count: number;
+  used: { tsCol: string | null; withStatus: boolean } | null;
+  error?: any;
+};
+
 async function countJobs(opts: {
   admin: any;
   ownerId: string;
@@ -78,10 +72,10 @@ async function countJobs(opts: {
   from?: string;
   to?: string;
   statuses?: string[];
-}) {
+}): Promise<CountJobsResult> {
   const { admin, ownerId, kind, from, to, statuses } = opts;
 
-  const tsCols = from && to ? ["queued_at", "created_at", "inserted_at"] : [null];
+  const tsCols: (string | null)[] = from && to ? ["queued_at", "created_at", "inserted_at"] : [null];
   let lastErr: any = null;
 
   for (const tsCol of tsCols) {
@@ -115,7 +109,7 @@ async function countJobs(opts: {
     lastErr = r2.error ?? lastErr;
   }
 
-  return { count: 0, used: null as any, error: lastErr };
+  return { count: 0, used: null, error: lastErr };
 }
 
 type FileRow = {
@@ -128,14 +122,18 @@ type FileRow = {
 };
 
 export async function GET(req: NextRequest) {
-  const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return NextResponse.json({ ok: false, error: "Mangler bruger-id." }, { status: 401 });
+  let ownerId = "";
+  try {
+    const u = await requireUser(req);
+    ownerId = u.id;
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+    if (!isAuth) console.error("[import-status] requireUser crash:", e);
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
-  const folderId = req.nextUrl.searchParams.get("folder_id") ?? undefined;
+  const folderId = req.nextUrl.searchParams.get("folder_id") || null;
 
   // Brug service-role så både kvote og fil-listning altid virker (uanset RLS/auth)
   let admin: any;
@@ -169,10 +167,10 @@ export async function GET(req: NextRequest) {
     .maybeSingle();
 
   if (limitErr) console.error("[import-status] plan_limits error:", errInfo(limitErr));
-  const limitPerMonth = typeof (limitRow as any)?.monthly_limit === "number" ? (limitRow as any).monthly_limit : null;
+  const limitPerMonth =
+    typeof (limitRow as any)?.monthly_limit === "number" ? (limitRow as any).monthly_limit : null;
 
-  // Import usage = jobs(kind=import)
-  // (job_status enum hos dig accepterer ikke "finished", så vi holder os til succeeded/queued/started)
+  // Import usage = jobs(kind=import) — vi tæller kun succeeded som "brug"
   const statuses = ["succeeded"];
 
   const month = await countJobs({
@@ -183,8 +181,7 @@ export async function GET(req: NextRequest) {
     to: resetAt,
     statuses,
   });
-
-  if ((month as any).error) console.error("[import-status] import month error:", errInfo((month as any).error));
+  if (month.error) console.error("[import-status] import month error:", errInfo(month.error));
 
   const all = await countJobs({
     admin,
@@ -192,8 +189,7 @@ export async function GET(req: NextRequest) {
     kind: "import",
     statuses,
   });
-
-  if ((all as any).error) console.error("[import-status] import all-time error:", errInfo((all as any).error));
+  if (all.error) console.error("[import-status] import all-time error:", errInfo(all.error));
 
   // Files (aktuelt antal + seneste)
   let q = admin
@@ -208,7 +204,7 @@ export async function GET(req: NextRequest) {
     .order("created_at", { ascending: false });
 
   if (error) {
-    console.error("/api/import-status files supabase error:", errInfo(error));
+    console.error("[import-status] files error:", errInfo(error));
     return NextResponse.json(
       { ok: false, error: "Supabase-forespørgsel fejlede.", details: (error as any)?.message ?? "unknown" },
       { status: 500 },
@@ -229,26 +225,27 @@ export async function GET(req: NextRequest) {
       }
     : null;
 
-  return NextResponse.json({
-    ok: true,
-    folderId: folderId ?? null,
+  return NextResponse.json(
+    {
+      ok: true,
+      folderId,
 
-    // Kvote / historik (jobs)
-    quota: {
-      usedThisMonth: n0(month.count),
-      totalAllTime: n0(all.count),
-      limitPerMonth,
-      monthStart,
-      monthEnd,
-      resetAt,
-      plan,
-    },
+      quota: {
+        usedThisMonth: n0(month.count),
+        totalAllTime: n0(all.count),
+        limitPerMonth,
+        monthStart,
+        monthEnd,
+        resetAt,
+        plan,
+      },
 
-    // Aktuel filstatus (files)
-    files: {
-      total: filesTotal,
-      hasFile: !!latestFile,
-      latest: latestFile,
+      files: {
+        total: filesTotal,
+        hasFile: !!latestFile,
+        latest: latestFile,
+      },
     },
-  });
+    { status: 200 },
+  );
 }

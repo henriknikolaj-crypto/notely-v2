@@ -66,3 +66,8 @@ next-env.d.ts
 .env.*
 *.local
 Subfiles.txt
+*.bak*
+*.off
+body.json
+repo_snapshot_*.md
+_audit_*.txt

@@ -1,24 +1,13 @@
 ﻿// app/api/quota/current/route.ts
 import "server-only";
- 
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { createClient } from "@supabase/supabase-js";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // fall through
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
 
 function errInfo(e: any) {
   if (!e) return { message: "Unknown error" };
@@ -41,22 +30,22 @@ function supabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
+/**
+ * Månedens start + næste måneds start i UTC.
+ * - monthStart: inklusiv
+ * - resetAt: eksklusiv
+ * - monthEnd: sidste ms i måneden (kun debug/visning)
+ */
 function getMonthBoundsUTC(now = new Date()) {
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
   const start = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
   const resetAt = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0));
   const monthEnd = new Date(resetAt.getTime() - 1);
-  return {
-    monthStart: start.toISOString(),
-    resetAt: resetAt.toISOString(),
-    monthEnd: monthEnd.toISOString(),
-  };
+  return { monthStart: start.toISOString(), resetAt: resetAt.toISOString(), monthEnd: monthEnd.toISOString() };
 }
 
 async function countJobs(opts: {
@@ -68,11 +57,13 @@ async function countJobs(opts: {
   statuses?: string[];
 }) {
   const { admin, ownerId, kind, from, to, statuses } = opts;
-  const tsCols = from && to ? ["queued_at", "created_at", "inserted_at"] : [null];
+
+  // Prøv disse timestamp-kolonner i rækkefølge (schema-kompatibilitet)
+  const tsCols = from && to ? ["queued_at", "created_at", "inserted_at"] : [null as any];
   let lastErr: any = null;
 
   for (const tsCol of tsCols) {
-    // med status-filter
+    // 1) med status-filter
     if (statuses?.length) {
       let q = admin
         .from("jobs")
@@ -88,7 +79,7 @@ async function countJobs(opts: {
       lastErr = r.error ?? lastErr;
     }
 
-    // fallback uden status-filter
+    // 2) fallback uden status-filter
     let q2 = admin
       .from("jobs")
       .select("id", { count: "exact", head: true })
@@ -105,20 +96,36 @@ async function countJobs(opts: {
   return { count: 0, used: null as any, error: lastErr };
 }
 
-export async function GET(_req: NextRequest) {
-  void _req;
-  const sb = await supabaseServerRoute();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
+export async function GET(req: NextRequest) {
+  // requireUser(req) håndterer auth + dev-bypass korrekt (ingen silent dev i prod)
+  let ownerId = "";
+  try {
+    const u = await requireUser(req);
+    ownerId = u.id;
+    // sb ikke brugt her, men vi kalder supabaseServerRoute for at sikre cookies/ctx er sat
+    // (ikke strengt nødvendigt, men stabilt i Next.js route handlers)
+    await supabaseServerRoute();
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    const isAuth = msg.toLowerCase().includes("unauthorized");
+    if (!isAuth) console.error("[quota/current] requireUser crash:", e);
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  const admin = supabaseAdmin();
+  let admin: any;
+  try {
+    admin = supabaseAdmin();
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: "server_config_missing", details: String(e?.message ?? e) },
+      { status: 500 },
+    );
+  }
+
   const now = new Date();
   const { monthStart, resetAt, monthEnd } = getMonthBoundsUTC(now);
 
-  // plan + limits
+  // plan
   const { data: profile, error: profileErr } = await admin
     .from("profiles")
     .select("plan")
@@ -128,6 +135,7 @@ export async function GET(_req: NextRequest) {
   if (profileErr) console.error("[quota/current] profile error:", errInfo(profileErr));
   const plan = (profile as any)?.plan ?? "freemium";
 
+  // limits
   const { data: planLimits, error: limitsErr } = await admin
     .from("plan_limits")
     .select("feature, monthly_limit")
@@ -140,9 +148,8 @@ export async function GET(_req: NextRequest) {
   const evalLimit =
     (planLimits ?? []).find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null;
 
-  // IMPORT = jobs(kind=import) — samme “sandhed” som /api/import-status
+  // IMPORT = jobs(kind=import) — succeeded tæller
   const importStatuses = ["succeeded"];
-
   const importMonth = await countJobs({
     admin,
     ownerId,
@@ -167,28 +174,28 @@ export async function GET(_req: NextRequest) {
 
   if (evalMonthErr) console.error("[quota/current] eval month error:", errInfo(evalMonthErr));
 
-  return NextResponse.json({
+  const resp: any = {
     ok: true,
-    ownerId,
     plan,
     monthStart,
     monthEnd,
     resetAt,
 
-    // kompatibilitet: både gamle og nye felter
+    // legacy felter (kompatibilitet)
     importUsedThisMonth: n0(importMonth.count),
     importLimitPerMonth: importLimit,
     evalUsedThisMonth: n0(evalThisMonthRaw),
     evalLimitPerMonth: evalLimit,
 
-    import: {
-      usedThisMonth: n0(importMonth.count),
-      limitPerMonth: importLimit,
-    },
-    evaluate: {
-      usedThisMonth: n0(evalThisMonthRaw),
-      limitPerMonth: evalLimit,
-    },
-  });
-}
+    // nye felter
+    import: { usedThisMonth: n0(importMonth.count), limitPerMonth: importLimit },
+    evaluate: { usedThisMonth: n0(evalThisMonthRaw), limitPerMonth: evalLimit },
+  };
 
+  if (process.env.NODE_ENV !== "production") {
+    resp.ownerId = ownerId;
+    resp._debug = { importMonthUsed: importMonth.used ?? null };
+  }
+
+  return NextResponse.json(resp, { status: 200 });
+}

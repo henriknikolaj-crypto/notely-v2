@@ -1,17 +1,21 @@
 ﻿import PageShell from "@/app/_ui/PageShell";
-import { getSupabaseServer } from "@/lib/supabase/server-rsc";
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { NewCourseForm, DeleteCourseBtn } from "./_actions";
 import Link from "next/link";
 
 export default async function CoursesPage() {
-  const supabase = await await getSupabaseServer();
-  const { data: { user } } = await supabase.auth.getUser();
+  const supabase = await supabaseServerRSC();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
   if (!user) {
     return (
       <div className="p-6">
         <p>Du er ikke logget ind.</p>
-        <Link className="underline" href="/auth/login">Log ind</Link>
+        <Link className="underline" href="/auth/login">
+          Log ind
+        </Link>
       </div>
     );
   }
