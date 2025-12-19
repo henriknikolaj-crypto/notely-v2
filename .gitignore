@@ -39,3 +39,39 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# backups / scratch
+*.bak
+*.bak-*
+*.backup*
+/backups/
+/_archive/
+
+# supabase cli temp
+/supabase/.temp/
+
+# local exports
+/exam-history*.csv
+/exam_history*.csv
+
+# local materials/assets (ignore by default)
+#/testdata/         # uncomment if you want to ignore entire folder
+/testdata/*.pdf
+/Materiale/
+/__traener.html
+/*.png
+
+# secrets / lokale filer
+.env
+.env.*
+*.local
+Subfiles.txt
+*.bak*
+*.off
+body.json
+repo_snapshot_*.md
+_audit_*.txt
+body.json
+repo_snapshot_*.md
+_audit_*.txt
+middleware.ts.off

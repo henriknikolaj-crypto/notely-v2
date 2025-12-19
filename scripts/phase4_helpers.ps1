@@ -1,0 +1,45 @@
+﻿function Smoke-ImportByEmailPs51 {
+  param([string]$Email,[int]$Times=4,[int]$Cost=1)
+  if (-not $Email) { throw "Email required"; }
+
+  $base   = "http://127.0.0.1:3000"
+  $secret = (Get-Content .env.local | ? { $_ -match '^IMPORT_SHARED_SECRET=' }) `
+            -replace '^IMPORT_SHARED_SECRET=', '' | % { $_.Trim('"').Trim() }
+  $headers = @{ "x-shared-secret"=$secret; "Content-Type"="application/json" }
+
+  1..$Times | % {
+    $payload = @{ userEmail = $Email; cost = $Cost } | ConvertTo-Json -Compress
+    try {
+      $r = Invoke-WebRequest -Uri "$base/api/import" -Method POST -Headers $headers -Body $payload
+      $b = $r.Content | ConvertFrom-Json
+
+      # find remaining uden ?? / ?.
+      $remaining = $null
+      if ($b -and $b.PSObject.Properties.Name -contains 'remaining') {
+        $remaining = $b.remaining
+      } elseif ($b -and $b.PSObject.Properties.Name -contains 'result') {
+        $res = $b.result
+        if ($res -and $res.PSObject.Properties.Name -contains 'audit') {
+          $aud = $res.audit
+          if ($aud -and $aud.PSObject.Properties.Name -contains 'quota_after') {
+            $remaining = $aud.quota_after
+          }
+        }
+      }
+
+      [pscustomobject]@{ i=$_; http=[int]$r.StatusCode; ok=$b.ok; remaining=$remaining }
+    } catch {
+      $resp = $_.Exception.Response
+      if ($resp) {
+        $sr  = New-Object IO.StreamReader($resp.GetResponseStream())
+        $raw = $sr.ReadToEnd()
+        $bj  = $null; try { $bj = $raw | ConvertFrom-Json } catch {}
+        $rem = $null
+        if ($bj -and $bj.PSObject.Properties.Name -contains 'remaining') { $rem = $bj.remaining }
+        [pscustomobject]@{ i=$_; http=[int]$resp.StatusCode; ok=$false; remaining=$rem }
+      } else {
+        [pscustomobject]@{ i=$_; http=-1; ok=$false; remaining=$null }
+      }
+    }
+  } | Format-Table -AutoSize
+}

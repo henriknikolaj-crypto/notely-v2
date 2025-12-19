@@ -1,0 +1,2 @@
+﻿-- (full SQL omitted here for brevity; use the block I sent)
+-- creates table public.retrieval_config_audit, function, trigger, and view

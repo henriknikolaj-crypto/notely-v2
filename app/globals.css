@@ -1,0 +1,78 @@
+﻿@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Peg på alle TS/TSX/MDX-filer */
+@source "./**/*.{ts,tsx,mdx}";
+
+/* Basis */
+:root {
+  --bg: #fffef9;
+}
+
+/* Global baggrund */
+html,
+body {
+  background-color: var(--bg);
+}
+
+/* Logo-font (bruges sammen med --font-logo fra layout.tsx) */
+.logo-script {
+  font-family: var(--font-logo), system-ui, -apple-system, BlinkMacSystemFont,
+    -webkit-system-font, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0.03em;
+}
+/* Custom grå checkbox med hvidt flueben */
+.custom-checkbox {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  appearance: none;
+  border: 1.5px solid #a1a1aa; /* lys grå kant */
+  border-radius: 4px;
+  background-color: white;
+  cursor: pointer;
+  display: inline-block;
+}
+
+.custom-checkbox:checked {
+  background-color: #52525b; /* mørkere grå */
+  border-color: #52525b;
+}
+
+.custom-checkbox:checked::after {
+  content: "✓";
+  position: absolute;
+  top: -2px;
+  left: 2px;
+  font-size: 14px;
+  color: white; /* hvidt flueben */
+  font-weight: 700;
+}
+/* Custom grå checkbox med hvidt flueben */
+.custom-checkbox {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  appearance: none;
+  border: 1.5px solid #a1a1aa; /* lys grå kant */
+  border-radius: 4px;
+  background-color: white;
+  cursor: pointer;
+  display: inline-block;
+}
+
+.custom-checkbox:checked {
+  background-color: #52525b; /* mørkere grå */
+  border-color: #52525b;
+}
+
+.custom-checkbox:checked::after {
+  content: "✓";
+  position: absolute;
+  top: -2px;
+  left: 2px;
+  font-size: 14px;
+  color: white; /* hvidt flueben */
+  font-weight: 700;
+}
