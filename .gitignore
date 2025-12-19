@@ -75,3 +75,12 @@ body.json
 repo_snapshot_*.md
 _audit_*.txt
 middleware.ts.off
+*.bak
+*.bak*
+*.lnk
+*.zip
+payload*.json
+hosts.txt
+testdata/
+app/api/import/_backups/
+middleware.ts.disabled
