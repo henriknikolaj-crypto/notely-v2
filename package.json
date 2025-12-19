@@ -14,7 +14,6 @@
     "preflight:week9": "npm run typecheck:week9 && npm run lint:week9 && powershell -ExecutionPolicy Bypass -File .\\\\scripts\\\\smoke_generate.ps1 && powershell -ExecutionPolicy Bypass -File .\\\\scripts\\\\smoke_evaluate.ps1"
   },
   "dependencies": {
-    "@supabase/auth-helpers-nextjs": "^0.10.0",
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "2.75.0",
     "class-variance-authority": "^0.7.1",
