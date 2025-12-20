@@ -36,7 +36,7 @@ type GenerateMcResponse = {
   options: McOptionPayload[];
   explanation: string | null;
   citations: McCitationPayload[];
-  usedFileId: string | null; // “primary” file (for rotation/debug/backwards compat)
+  usedFileId: string | null; // rotation anchor (for variation/debug/backwards compat)
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -118,6 +118,7 @@ async function saveLastUsedFileId(sb: any, ownerId: string, scopeKey: string, fi
       { onConflict: "owner_id,kind,scope_key" },
     );
   } catch (e) {
+    // Hvis RLS/tabla mangler, så kører vi stadig (fallback-variation nedenfor).
     console.error("[generate-mc] save generation_state failed:", e);
   }
 }
@@ -139,6 +140,7 @@ type ChunkRow = {
   file_id: string;
   content: string | null;
   created_at: string | null;
+  source_url?: string | null;
 };
 
 function interleavePicked(
@@ -175,7 +177,12 @@ export async function POST(req: NextRequest) {
     }
 
     const parsed = await readJsonBody<GenerateMcRequest>(req);
-    if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error, debug: (parsed as any).debug }, { status: 400 });
+    if (!parsed.ok) {
+      return NextResponse.json(
+        { ok: false, error: parsed.error, debug: (parsed as any).debug },
+        { status: 400 },
+      );
+    }
 
     const body = parsed.value ?? {};
     const difficulty = pickDifficulty(body.difficulty);
@@ -226,7 +233,7 @@ export async function POST(req: NextRequest) {
       .select("id,name,original_name,folder_id,created_at")
       .eq("owner_id", ownerId)
       .order("created_at", { ascending: false })
-      .limit(40);
+      .limit(60);
 
     if (scopeFolderIds.length > 0) filesQ = filesQ.in("folder_id", scopeFolderIds);
 
@@ -241,24 +248,32 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Rotation: start efter lastUsed
+    // Rotation: start efter lastUsed.
+    // Fallback: hvis lastUsed ikke kan læses (fx RLS/table), så randomiser start for variation.
     let start = 0;
     if (lastUsed) {
       const idx = fileRows.findIndex((f) => String(f.id) === String(lastUsed));
       if (idx >= 0) start = (idx + 1) % fileRows.length;
+    } else {
+      start = Math.floor(Math.random() * fileRows.length);
     }
+
     const rotated = [...fileRows.slice(start), ...fileRows.slice(0, start)];
 
+    // Dette er “anchor” vi gemmer i generation_state for at sikre variation på tværs af kald
+    const rotationAnchorFileId = rotated[0]?.id ? String(rotated[0].id) : null;
+
     // Hvor mange filer vil vi blande?
-    const desiredFiles = Math.min(5, Math.max(2, Math.ceil(maxContextChunks / 3)), rotated.length);
-    const scanMax = Math.min(20, rotated.length);
+    const desiredFiles = Math.min(6, Math.max(2, Math.ceil(maxContextChunks / 3)), rotated.length);
+    const scanMax = Math.min(30, rotated.length);
 
     const pickedByFile: Record<string, ChunkRow[]> = {};
     const usedFiles: FileRow[] = [];
 
-    const perFileTake = Math.max(2, Math.ceil(maxContextChunks / desiredFiles));
-    const perFilePool = Math.min(80, Math.max(20, perFileTake * 8));
+    const perFileTake = Math.max(1, Math.ceil(maxContextChunks / desiredFiles));
+    const perFilePool = Math.min(120, Math.max(24, perFileTake * 12));
 
+    // Scan filer indtil vi har nok “ikke-tomme”
     for (const f of rotated.slice(0, scanMax)) {
       if (usedFiles.length >= desiredFiles) break;
 
@@ -266,7 +281,7 @@ export async function POST(req: NextRequest) {
 
       const { data: pool, error: poolErr } = await sb
         .from("doc_chunks")
-        .select("id,file_id,content,created_at")
+        .select("id,file_id,content,created_at,source_url")
         .eq("owner_id", ownerId)
         .eq("file_id", fileId)
         .order("created_at", { ascending: false })
@@ -281,6 +296,7 @@ export async function POST(req: NextRequest) {
       const nonEmpty = poolRows.filter((r) => (r.content ?? "").trim().length > 0);
       if (nonEmpty.length === 0) continue;
 
+      // Random pick fra pool + stabil sort (så kontekst ikke er “helt tilfældig”)
       const picked = shuffle(nonEmpty)
         .slice(0, Math.min(perFileTake, nonEmpty.length))
         .sort((a, b) => {
@@ -306,6 +322,7 @@ export async function POST(req: NextRequest) {
 
     const fileMap = new Map<string, FileRow>(usedFiles.map((f) => [String(f.id), f]));
     const fileOrder = shuffle(usedFiles.map((f) => String(f.id)));
+
     const interleaved = interleavePicked(fileOrder, pickedByFile, maxContextChunks);
 
     const contextText = interleaved
@@ -321,17 +338,25 @@ export async function POST(req: NextRequest) {
 
     if (!contextText.trim()) {
       return NextResponse.json(
-        { ok: false, error: "Kontekst blev tom efter filtrering. Tjek at doc_chunks.content ikke er tomt.", debug: { scopeFolderIds } },
+        {
+          ok: false,
+          error: "Kontekst blev tom efter filtrering. Tjek at doc_chunks.content ikke er tomt.",
+          debug: { scopeFolderIds },
+        },
         { status: 400 },
       );
     }
 
     const citations: McCitationPayload[] = interleaved.map((c) => {
       const f = fileMap.get(String(c.file_id));
-      return { chunkId: c.id, title: f ? fileTitle(f) : null, url: null };
+      return {
+        chunkId: c.id,
+        title: f ? fileTitle(f) : null,
+        url: (c as any)?.source_url ? String((c as any).source_url) : null,
+      };
     });
 
-    const usedFileId = String(usedFiles[0]?.id ?? "") || null;
+    const usedFileId = rotationAnchorFileId;
 
     const model = process.env.OPENAI_MODEL_MC || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
@@ -393,12 +418,17 @@ Returnér gyldig JSON:
     const opts = Array.isArray(payload.options) ? payload.options : [];
 
     if (!question || opts.length < 2) {
-      return NextResponse.json({ ok: false, error: "Modellen returnerede ufuldstændigt output." }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Modellen returnerede ufuldstændigt output." },
+        { status: 500 },
+      );
     }
 
     // Normalisér til 4 muligheder
     const normalized = opts.slice(0, 4);
-    while (normalized.length < 4) normalized.push({ text: `Mulighed ${normalized.length + 1}`, isCorrect: false });
+    while (normalized.length < 4) {
+      normalized.push({ text: `Mulighed ${normalized.length + 1}`, isCorrect: false });
+    }
 
     // Sikr præcis 1 korrekt (før shuffle)
     let correctIdx = normalized.findIndex((o) => !!o.isCorrect);
@@ -417,7 +447,7 @@ Returnér gyldig JSON:
       isCorrect: o.isCorrect,
     }));
 
-    // Gem rotation state
+    // Gem rotation state (hvis muligt)
     if (usedFileId) await saveLastUsedFileId(sb, ownerId, scopeKey, usedFileId);
 
     const resp: GenerateMcResponse = {

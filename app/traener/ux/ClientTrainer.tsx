@@ -20,11 +20,103 @@ type Props = {
   selectedNoteTitle?: string | null;
 };
 
+type Citation = {
+  chunkId: string;
+  fileId: string | null;
+  title: string | null;
+  url: string | null;
+};
+
 type EvalResult = {
   feedback: string;
   score: number | null;
-  sources?: string[];
+  citations: Citation[];
+  usedFileId: string | null;
 };
+
+type CitationObj = {
+  chunkId?: string;
+  id?: string;
+  fileId?: string | null;
+  file_id?: string | null;
+  title?: string | null;
+  url?: string | null;
+};
+
+function clampScore(x: unknown): number | null {
+  const n = typeof x === "number" ? x : Number(x);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function normalizeCitations(input: unknown): Citation[] {
+  if (!input) return [];
+
+  // legacy string[]
+  if (Array.isArray(input) && input.every((x) => typeof x === "string")) {
+    const out: Citation[] = (input as string[])
+      .map((s, i) => {
+        const t = String(s ?? "").trim();
+        if (!t) return null;
+        return { chunkId: `legacy-${i}`, fileId: null, title: t, url: null };
+      })
+      .filter(Boolean) as Citation[];
+
+    return dedupeCitations(out);
+  }
+
+  // object[]
+  if (Array.isArray(input)) {
+    const out: Citation[] = [];
+    for (const x of input) {
+      if (!x || typeof x !== "object") continue;
+      const obj = x as CitationObj;
+
+      const chunkId = String(obj.chunkId ?? obj.id ?? "").trim();
+      const fileIdRaw = obj.fileId ?? obj.file_id ?? null;
+      const fileId = fileIdRaw ? String(fileIdRaw).trim() : null;
+
+      const title = obj.title != null && String(obj.title).trim() ? String(obj.title).trim() : null;
+      const url = obj.url != null && String(obj.url).trim() ? String(obj.url).trim() : null;
+
+      if (!chunkId && !title && !url && !fileId) continue;
+
+      out.push({
+        chunkId: chunkId || `c-${out.length}`,
+        fileId,
+        title,
+        url,
+      });
+    }
+
+    return dedupeCitations(out);
+  }
+
+  return [];
+}
+
+function dedupeCitations(citations: Citation[]): Citation[] {
+  const seen = new Set<string>();
+  const out: Citation[] = [];
+
+  for (const c of citations) {
+    const key = [
+      (c.title ?? "").trim().toLowerCase(),
+      (c.url ?? "").trim().toLowerCase(),
+      (c.fileId ?? "").trim().toLowerCase(),
+    ].join("|");
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+
+  return out;
+}
+
+function citationLabel(c: Citation, i: number) {
+  return c.title || c.url || `Kilde ${i + 1}`;
+}
 
 export default function ClientTrainer({
   ownerId, // pt. ikke brugt, men fin at have til senere
@@ -36,33 +128,25 @@ export default function ClientTrainer({
   noteId,
   selectedNoteTitle,
 }: Props) {
-  // eslint/lint: prop gemt til senere (auth/owner-scoped kald, analytics, etc.)
   void ownerId;
 
   const router = useRouter();
 
-  // 1) brug explicit folderId hvis givet
-  // 2) ellers activeFolderId fra layout
-  // 3) ellers null
   const effectiveFolderId = folderId ?? activeFolderId ?? null;
 
   const effectiveFolderName =
     folderName ??
-    (effectiveFolderId
-      ? folders?.find((f) => f.id === effectiveFolderId)?.name ?? null
-      : null);
+    (effectiveFolderId ? folders?.find((f) => f.id === effectiveFolderId)?.name ?? null : null);
 
-  // Navne på scope-mapper (til label)
   const scopeNames =
-    scopeFolderIds && folders
-      ? folders
-          .filter((f) => scopeFolderIds.includes(f.id))
-          .map((f) => f.name)
-      : [];
+    scopeFolderIds && folders ? folders.filter((f) => scopeFolderIds.includes(f.id)).map((f) => f.name) : [];
 
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [includeBackground, setIncludeBackground] = useState(true);
+
+  // Den fil /api/generate-question brugte som “primary”
+  const [questionFileId, setQuestionFileId] = useState<string | null>(null);
 
   const [evalResult, setEvalResult] = useState<EvalResult | null>(null);
 
@@ -78,26 +162,17 @@ export default function ClientTrainer({
     setNoteSavedMsg(null);
   };
 
-  // Label for hvad der trænes på
   const scopeLabel = (() => {
     if (noteId) {
-      return selectedNoteTitle
-        ? `Udvalgt materiale: ${selectedNoteTitle}`
-        : "Udvalgt materiale i mappen";
+      return selectedNoteTitle ? `Udvalgt materiale: ${selectedNoteTitle}` : "Udvalgt materiale i mappen";
     }
 
     if (scopeNames.length > 1) {
-      const preview =
-        scopeNames.length <= 3
-          ? scopeNames.join(", ")
-          : `${scopeNames.slice(0, 3).join(", ")} m.fl.`;
+      const preview = scopeNames.length <= 3 ? scopeNames.join(", ") : `${scopeNames.slice(0, 3).join(", ")} m.fl.`;
       return `Flere mapper: ${preview}`;
     }
 
-    if (scopeNames.length === 1) {
-      return `Hele mappen: ${scopeNames[0]}`;
-    }
-
+    if (scopeNames.length === 1) return `Hele mappen: ${scopeNames[0]}`;
     if (effectiveFolderName) return `Hele mappen: ${effectiveFolderName}`;
 
     return "Vælg en mappe eller et materiale i venstre side.";
@@ -120,17 +195,26 @@ export default function ClientTrainer({
         }),
       });
 
-      if (!res.ok) throw new Error("Kunne ikke generere spørgsmål");
-
       const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        const msg = (data as any)?.error || "Kunne ikke generere spørgsmål";
+        throw new Error(msg);
+      }
+
       const q =
-        data?.question ||
-        data?.prompt ||
+        (data as any)?.question ||
+        (data as any)?.prompt ||
         "Formulér et kort eksamensspørgsmål inden for dette emne.";
 
-      setQuestion(q);
+      const usedFileId = (data as any)?.usedFileId ? String((data as any).usedFileId) : null;
+
+      setQuestion(String(q));
       setAnswer("");
       setEvalResult(null);
+
+      // vigtig: gem fil-id fra spørgsmåls-generatoren,
+      // så evalueringen kan bruge SAMME kilde (trin #1: send file_id)
+      setQuestionFileId(usedFileId);
     } catch (err: any) {
       setErrorMsg(err?.message || "Fejl ved generering af spørgsmål.");
     } finally {
@@ -154,43 +238,40 @@ export default function ClientTrainer({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          prompt: question,
+          prompt: question, // legacy
           question,
           answer,
           includeBackground,
           folder_id: effectiveFolderId ?? null,
           note_id: noteId ?? null,
           scopeFolderIds: scopeFolderIds ?? [],
+          source_type: "trainer",
+
+          // ✅ trin #1: hvis vi har en questionFileId, så låser vi evalueringen til samme fil
+          file_id: includeBackground ? (questionFileId ?? null) : null,
         }),
       });
 
       const data = await res.json().catch(() => null);
       if (!res.ok || !data) {
-        const msg = (data as any)?.error || "Kunne ikke evaluere svaret";
+        const msg = (data as any)?.error || "Kunne ikke evaluere (tomt svar fra server).";
         throw new Error(msg);
       }
 
-      const score =
-        typeof data.score === "number"
-          ? data.score
-          : typeof data.grade === "number"
-          ? data.grade
-          : null;
+      const score = clampScore((data as any).score ?? (data as any).grade);
+      const feedback = String((data as any).feedback ?? (data as any).evaluation ?? "").trim();
 
-      const sources: string[] =
-        data.sources && Array.isArray(data.sources)
-          ? data.sources
-          : data.citations && Array.isArray(data.citations)
-          ? data.citations
-          : [];
+      // ✅ trin #2A: dedupe i UI (normalizeCitations deduper)
+      const citations = normalizeCitations((data as any).citations ?? (data as any).sources ?? []);
+      const usedFileId = (data as any).usedFileId ? String((data as any).usedFileId) : null;
 
       setEvalResult({
-        feedback: data.feedback ?? data.evaluation ?? "",
+        feedback: feedback || "Ingen feedback (tomt svar).",
         score,
-        sources,
+        citations,
+        usedFileId,
       });
 
-      // 🔄 Opdatér serverkomponenterne (seneste noter / evalueringer)
       router.refresh();
     } catch (err: any) {
       setErrorMsg(err?.message || "Fejl ved evaluering.");
@@ -211,29 +292,27 @@ export default function ClientTrainer({
     setSavingNote(true);
 
     try {
-      const baseTitle = effectiveFolderName
-        ? `${effectiveFolderName} – træner`
-        : "Træner";
+      const baseTitle = effectiveFolderName ? `${effectiveFolderName} – træner` : "Træner";
 
       const title =
         noteId && selectedNoteTitle
           ? `${baseTitle}: ${selectedNoteTitle}`
-          : `${baseTitle}: ${
-              question
-                ? question.replace(/\s+/g, " ").slice(0, 80)
-                : "Øvelse"
-            }`;
+          : `${baseTitle}: ${question ? question.replace(/\s+/g, " ").slice(0, 80) : "Øvelse"}`;
+
+      const citationsLines =
+        evalResult?.citations?.length
+          ? dedupeCitations(evalResult.citations).map((c, i) => {
+              const label = citationLabel(c, i);
+              return c.url ? `- ${label} (${c.url})` : `- ${label}`;
+            })
+          : [];
 
       const contentLines = [
         question ? `**Spørgsmål**\n${question}` : "",
         answer ? `\n\n**Svar**\n${answer}` : "",
         evalResult?.score != null ? `\n\n**Score**: ${evalResult.score}/100` : "",
         evalResult?.feedback ? `\n\n**Feedback**\n${evalResult.feedback}` : "",
-        evalResult?.sources && evalResult.sources.length
-          ? `\n\n**Kilder**\n${evalResult.sources
-              .map((s: string) => `- ${s}`)
-              .join("\n")}`
-          : "",
+        citationsLines.length ? `\n\n**Kilder**\n${citationsLines.join("\n")}` : "",
       ].filter(Boolean);
 
       const content = contentLines.join("");
@@ -268,16 +347,12 @@ export default function ClientTrainer({
 
   return (
     <div className="space-y-4">
-      {/* Valgt emne / scope */}
       <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <h2 className="mb-1 text-base font-semibold">Valgt emne</h2>
-        <p className="text-xs text-zinc-600">
-          Træn på hele mapper eller udvalgte noter/materialer fra venstre side.
-        </p>
+        <p className="text-xs text-zinc-600">Træn på hele mapper eller udvalgte noter/materialer fra venstre side.</p>
         <p className="mt-1 text-xs text-zinc-500">{scopeLabel}</p>
       </section>
 
-      {/* Spørgsmål */}
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-semibold">Spørgsmål / øvelse</h3>
@@ -290,6 +365,7 @@ export default function ClientTrainer({
             {loadingQuestion ? "Genererer..." : "Generér nyt spørgsmål"}
           </button>
         </div>
+
         <textarea
           className="mt-1 w-full min-h-[96px] rounded-xl border border-zinc-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-zinc-900/5"
           value={question}
@@ -299,12 +375,10 @@ export default function ClientTrainer({
           }}
           placeholder="Skriv eller redigér spørgsmålet her..."
         />
-        <p className="text-[10px] text-zinc-500">
-          Du kan tilpasse spørgsmålet til det stof, du vil træne.
-        </p>
+
+        <p className="text-[10px] text-zinc-500">Du kan tilpasse spørgsmålet til det stof, du vil træne.</p>
       </section>
 
-      {/* Dit svar */}
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-semibold">Dit svar / 100</h3>
@@ -325,8 +399,7 @@ export default function ClientTrainer({
             onChange={(e) => setIncludeBackground(e.target.checked)}
             className="h-3.5 w-3.5 rounded border-zinc-300 accent-zinc-600"
           />
-          Inkludér baggrundslitteratur og kildehenvisninger i evalueringen
-          (avanceret / til eksamen).
+          Inddrag baggrundslitteratur i evalueringen (mere eksamensnært).
         </label>
 
         <textarea
@@ -340,7 +413,6 @@ export default function ClientTrainer({
         />
       </section>
 
-      {/* Feedback + kilder + gem som note */}
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-semibold">Feedback</h3>
@@ -360,17 +432,24 @@ export default function ClientTrainer({
               <div className="font-medium">Score: {evalResult.score ?? 0}/100</div>
               <p className="mt-1 whitespace-pre-wrap">{evalResult.feedback}</p>
 
-              {evalResult.sources && evalResult.sources.length > 0 && (
+              {includeBackground && evalResult.citations.length > 0 && (
                 <div className="mt-2 text-[10px] text-zinc-500">
-                  <div className="font-semibold text-zinc-600">
-                    Baggrundslitteratur / kilder
-                  </div>
-                  <ul className="mt-1 list-disc space-y-0.5 pl-4">
-                    {evalResult.sources.map((src, i) => (
-                      <li key={i} className="break-all">
-                        {src}
-                      </li>
-                    ))}
+                  <div className="font-semibold text-zinc-600">Baggrundslitteratur / kilder</div>
+                  <ul className="mt-1 space-y-0.5">
+                    {dedupeCitations(evalResult.citations).map((c, i) => {
+                      const label = citationLabel(c, i);
+                      return (
+                        <li key={c.chunkId || `${c.fileId ?? "file"}-${i}`} className="break-all">
+                          {c.url ? (
+                            <a className="underline" href={c.url} target="_blank" rel="noreferrer">
+                              {label}
+                            </a>
+                          ) : (
+                            <span>{label}</span>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               )}
@@ -381,7 +460,6 @@ export default function ClientTrainer({
         </div>
       </section>
 
-      {/* Statusbeskeder */}
       {noteSavedMsg && (
         <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
           {noteSavedMsg}
