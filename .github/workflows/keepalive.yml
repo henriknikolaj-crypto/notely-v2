@@ -1,0 +1,14 @@
+name: keepalive
+on:
+  schedule:
+    - cron: "0 7 * * 1,4" # man+tor 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Notely (no-cache)
+        run: |
+          curl -fsS "https://notely.dk/api/ping-supabase?t=$(date +%s)" \
+            -H "x-ping-secret: ${{ secrets.PING_SHARED_SECRET }}" >/dev/null
