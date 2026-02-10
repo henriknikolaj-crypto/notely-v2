@@ -1,540 +1,651 @@
 ﻿// app/traener/upload/UploadClient.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { toast } from "sonner";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import LimitNotice from "@/app/traener/_ui/LimitNotice";
 
 type Folder = {
   id: string;
   name: string;
 };
 
-type FileItem = {
+type FileRow = {
   id: string;
-  name?: string | null;
-  filename?: string | null;
-  file_name?: string | null;
-  size?: number | null;
-  size_bytes?: number | null;
-  created_at?: string | null;
-  uploaded_at?: string | null;
-  folder_id?: string | null;
+  name: string;
+  folderId: string | null;
+  sizeBytes: number | null;
+  uploadedAt: string | null;
 };
 
 type Props = {
   folders: Folder[];
-  initialFolderId?: string | null;
-  ownerId?: string | null;
+  initialFolderId: string | null;
+  ownerId: string;
 };
 
-function displayName(file: FileItem) {
-  return file.name ?? file.filename ?? file.file_name ?? "Ukendt fil";
+function asString(v: any): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+function asNumber(v: any): number | null {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function displaySize(file: FileItem) {
-  const raw =
-    typeof file.size_bytes === "number"
-      ? file.size_bytes
-      : typeof file.size === "number"
-        ? file.size
-        : null;
-
-  if (!raw || raw <= 0) return "ukendt størrelse";
-  const kb = Math.round(raw / 102.4) / 10;
-  return `${kb.toLocaleString("da-DK")} kB`;
+function normalizeFolderRow(x: any): Folder | null {
+  const id = asString(x?.id);
+  const name = asString(x?.name) ?? asString(x?.title);
+  if (!id || !name) return null;
+  return { id, name };
 }
 
-function displayDate(file: FileItem) {
-  const iso = file.uploaded_at ?? file.created_at;
+function normalizeFileRow(x: any): FileRow | null {
+  const id = asString(x?.id);
+  const name = asString(x?.name) ?? asString(x?.original_name) ?? asString(x?.originalName);
+  if (!id || !name) return null;
+
+  return {
+    id,
+    name,
+    folderId: asString(x?.folder_id) ?? asString(x?.folderId),
+    sizeBytes: asNumber(x?.size_bytes) ?? asNumber(x?.sizeBytes),
+    uploadedAt: asString(x?.uploaded_at) ?? asString(x?.uploadedAt) ?? asString(x?.created_at),
+  };
+}
+
+function fmtDa(iso: string | null) {
   if (!iso) return "";
   const d = new Date(iso);
-  return d.toLocaleString("da-DK", {
-    day: "2-digit",
-    month: "short",
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("da-DK", {
     year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  });
+  }).format(d);
 }
 
-function formatDaDate(iso: string) {
+function humanBytes(n: number | null) {
+  if (n == null || !Number.isFinite(n)) return "";
+  const kb = 1024;
+  const mb = kb * 1024;
+  if (n >= mb) return `${(n / mb).toFixed(1).replace(".", ",")} MB`;
+  if (n >= kb) return `${Math.round(n / kb)} KB`;
+  return `${n} B`;
+}
+
+function safeJson(text: string) {
   try {
-    const d = new Date(iso);
-    return d.toLocaleDateString("da-DK", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
+    return text ? JSON.parse(text) : null;
   } catch {
-    return iso;
+    return null;
   }
 }
 
-export default function UploadClient({ folders, initialFolderId }: Props) {
-  const firstFolderId = folders[0]?.id ?? null;
+export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId }: Props) {
+  // NOTE: props bruges primært til at fixe typecheck + give hurtig initial state
+  void ownerId;
 
-  const [uploadFolderId, setUploadFolderId] = useState<string | null>(
-    initialFolderId ?? firstFolderId,
-  );
-  const [listFolderId, setListFolderId] = useState<string | null>(
-    initialFolderId ?? firstFolderId,
-  );
+  // folders
+  const [folders, setFolders] = useState<Folder[]>(() => (Array.isArray(initialFolders) ? initialFolders : []));
+  const [foldersLoading, setFoldersLoading] = useState(() => (Array.isArray(initialFolders) ? false : true));
+  const [foldersError, setFoldersError] = useState<string | null>(null);
 
-  const [files, setFiles] = useState<FileItem[]>([]);
-  const [fileToUpload, setFileToUpload] = useState<File | null>(null);
+  // selection
+  const [uploadFolderId, setUploadFolderId] = useState<string | null>(() => initialFolderId ?? null);
+  const [listFolderId, setListFolderId] = useState<string | null>(() => initialFolderId ?? null);
 
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  const [loadingList, setLoadingList] = useState(false);
-  const [uploading, setUploading] = useState(false);
-
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  const currentUploadFolder = useMemo(
-    () => folders.find((f) => f.id === uploadFolderId) ?? null,
-    [folders, uploadFolderId],
-  );
-
-  const currentListFolder = useMemo(
-    () => folders.find((f) => f.id === listFolderId) ?? null,
-    [folders, listFolderId],
-  );
-
-  const uniqueFiles = useMemo(
-    () =>
-      files.filter((file, index, self) => {
-        if (!file.id) return true;
-        return self.findIndex((f) => f.id === file.id) === index;
-      }),
-    [files],
-  );
-
+  // keep latest listFolderId for async flows
+  const listFolderIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (initialFolderId == null) return;
-    setUploadFolderId(initialFolderId);
-    setListFolderId(initialFolderId);
+    listFolderIdRef.current = listFolderId;
+  }, [listFolderId]);
+
+  // files list
+  const [files, setFiles] = useState<FileRow[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
+
+  // upload
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [pickedFile, setPickedFile] = useState<File | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [quotaBlocked, setQuotaBlocked] = useState<string | null>(null);
+
+  // delete
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // move
+  const [movingId, setMovingId] = useState<string | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
+  const [moveNotice, setMoveNotice] = useState<string | null>(null);
+
+  const dispatchQuotaChanged = useCallback(() => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new Event("notely-quota-changed"));
+    window.dispatchEvent(new Event("notely:import-status-refresh"));
+  }, []);
+
+  const dispatchImportStatusRefresh = useCallback(() => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new Event("notely:import-status-refresh"));
+  }, []);
+
+  const folderOptions = useMemo(() => folders, [folders]);
+
+  const loadFolders = useCallback(async () => {
+    setFoldersLoading(true);
+    setFoldersError(null);
+
+    try {
+      const res = await fetch("/api/folders", {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+
+      const text = await res.text();
+      const json = safeJson(text);
+
+      if (!res.ok) {
+        setFolders([]);
+        const msg = (json && (json.error || json.message)) || `Kunne ikke hente mapper (${res.status}).`;
+        setFoldersError(String(msg));
+        setUploadFolderId(null);
+        setListFolderId(null);
+        return;
+      }
+
+      if (!json || json.ok === false) {
+        setFolders([]);
+        setFoldersError(String(json?.error ?? json?.message ?? "Kunne ikke hente mapper."));
+        setUploadFolderId(null);
+        setListFolderId(null);
+        return;
+      }
+
+      const raw = Array.isArray(json.folders)
+        ? json.folders
+        : Array.isArray(json.items)
+          ? json.items
+          : Array.isArray(json.data)
+            ? json.data
+            : [];
+
+      const normalized = raw.map(normalizeFolderRow).filter(Boolean) as Folder[];
+      setFolders(normalized);
+
+      if (normalized.length > 0) {
+        setFoldersError(null);
+
+        const fallback = normalized[0].id;
+
+        setUploadFolderId((prev) => {
+          if (prev && normalized.some((f) => f.id === prev)) return prev;
+          if (initialFolderId && normalized.some((f) => f.id === initialFolderId)) return initialFolderId;
+          return fallback;
+        });
+
+        setListFolderId((prev) => {
+          if (prev && normalized.some((f) => f.id === prev)) return prev;
+          if (initialFolderId && normalized.some((f) => f.id === initialFolderId)) return initialFolderId;
+          return fallback;
+        });
+      } else {
+        setUploadFolderId(null);
+        setListFolderId(null);
+        setFoldersError("Ingen mapper fundet endnu (opret en mappe længere nede).");
+      }
+    } catch (e) {
+      console.error("[UploadClient] loadFolders error", e);
+      setFolders([]);
+      setUploadFolderId(null);
+      setListFolderId(null);
+      setFoldersError("Kunne ikke hente mapper.");
+    } finally {
+      setFoldersLoading(false);
+    }
   }, [initialFolderId]);
 
-  async function safeJson(res: Response) {
-    try {
-      return await res.json();
-    } catch {
-      return null;
-    }
-  }
-
-  function setInlineError(msg: string) {
-    setErrorMsg(msg);
-    setStatusMsg(null);
-  }
-
-  function setInlineStatus(msg: string) {
-    setStatusMsg(msg);
-    setErrorMsg(null);
-  }
-
-  async function refreshFiles(targetFolderId: string | null) {
-    const folderId = targetFolderId ?? listFolderId;
+  const loadFiles = useCallback(async (folderId: string | null) => {
     if (!folderId) {
       setFiles([]);
       return;
     }
 
-    setLoadingList(true);
-    setErrorMsg(null);
+    setFilesLoading(true);
+    setFilesError(null);
 
     try {
-      const res = await fetch(`/api/files?folder_id=${encodeURIComponent(folderId)}`, {
-        method: "GET",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      });
-
-      const data = (await safeJson(res)) as any;
-
-      if (!res.ok || !data) {
-        const msg =
-          (data && (data.error as string)) ||
-          (data && (data.message as string)) ||
-          "Kunne ikke hente filer (ukendt fejl).";
-        setInlineError(msg);
-        setFiles([]);
-        return;
-      }
-
-      let items: any = data;
-      if (Array.isArray(data?.items)) items = data.items;
-      else if (Array.isArray(data?.files)) items = data.files;
-
-      if (!Array.isArray(items)) {
-        setInlineError("Uventet svarformat fra /api/files.");
-        setFiles([]);
-        return;
-      }
-
-      setFiles(
-        items.map((x: any) => ({
-          id: String(x.id),
-          name: x.name ?? x.filename ?? x.file_name ?? null,
-          filename: x.filename ?? null,
-          file_name: x.file_name ?? null,
-          size: x.size ?? x.size_bytes ?? null,
-          size_bytes: x.size_bytes ?? x.size ?? null,
-          created_at: x.created_at ?? null,
-          uploaded_at: x.uploaded_at ?? null,
-          folder_id: x.folder_id ?? null,
-        })),
-      );
-    } catch (err: any) {
-      console.warn("refreshFiles failed:", err?.message ?? err);
-      setInlineError(err?.message ?? "Kunne ikke hente filer (ukendt fejl).");
-      setFiles([]);
-    } finally {
-      setLoadingList(false);
-    }
-  }
-
-  useEffect(() => {
-    void refreshFiles(listFolderId ?? null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listFolderId]);
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setStatusMsg(null);
-    setErrorMsg(null);
-
-    if (!fileToUpload) {
-      setInlineError("Vælg en fil først.");
-      return;
-    }
-    if (!uploadFolderId) {
-      setInlineError("Vælg en mappe først.");
-      return;
-    }
-
-    const uploadingToastId = toast.loading("Uploader fil…");
-
-    try {
-      setUploading(true);
-
-      const form = new FormData();
-      form.append("file", fileToUpload);
-      form.append("folderId", uploadFolderId);
-      form.append("folder_id", uploadFolderId);
-
-      const res = await fetch("/api/trainer/upload", { method: "POST", body: form });
-      const data = (await safeJson(res)) as any;
+      const url = `/api/files?folder_id=${encodeURIComponent(folderId)}`;
+      const res = await fetch(url, { method: "GET", cache: "no-store", headers: { Accept: "application/json" } });
+      const text = await res.text();
+      const json = safeJson(text);
 
       if (!res.ok) {
-        if (res.status === 402 && data?.code === "QUOTA_EXCEEDED") {
-          const used = data?.usedThisMonth;
-          const limit = data?.monthlyLimit;
-          const resetIso = (data?.resetAt as string | undefined) ?? (data?.monthEnd as string | undefined);
-          const resetAt = resetIso ? formatDaDate(String(resetIso)) : null;
-
-          const msg =
-            typeof used === "number" && typeof limit === "number"
-              ? `Du har nået din månedlige grænse: ${used}/${limit}.${resetAt ? ` Nulstilles omkring ${resetAt}.` : ""}`
-              : data?.message ?? "Du har nået din månedlige grænse for upload.";
-
-          toast.error("Grænse nået", { id: uploadingToastId, description: msg });
-          setInlineError(msg);
-          return;
-        }
-
-        const msg =
-          (data && (data.message as string)) ||
-          (data && (data.error as string)) ||
-          `Upload fejlede (status ${res.status}).`;
-
-        toast.error("Upload mislykkedes", { id: uploadingToastId, description: msg });
-        setInlineError(msg);
+        setFiles([]);
+        setFilesError(String((json && (json.error || json.message)) || `Kunne ikke hente filer (${res.status}).`));
         return;
       }
 
-      toast.success("Upload gennemført", {
-        id: uploadingToastId,
-        description: "Materialet er gjort klar og kan bruges på tværs af Notely.",
-      });
+      if (!json || json.ok === false) {
+        setFiles([]);
+        setFilesError(String(json?.error ?? json?.message ?? "Kunne ikke hente filer."));
+        return;
+      }
 
-      setInlineStatus("Upload gennemført. Materialet er gjort klar og kan nu bruges på tværs af Notely.");
+      const raw = Array.isArray(json.files) ? json.files : Array.isArray(json.items) ? json.items : [];
+      const normalized = raw.map(normalizeFileRow).filter(Boolean) as FileRow[];
+      setFiles(normalized);
+    } catch (e) {
+      console.error("[UploadClient] loadFiles error", e);
+      setFiles([]);
+      setFilesError("Kunne ikke hente filer.");
+    } finally {
+      setFilesLoading(false);
+    }
+  }, []);
 
-      setFileToUpload(null);
+  useEffect(() => {
+    // Hvis der allerede er initial folders, kan vi nøjes med at hente filer først
+    void loadFolders();
+  }, [loadFolders]);
+
+  useEffect(() => {
+    void loadFiles(listFolderId);
+  }, [listFolderId, loadFiles]);
+
+  function onPickFile(f: File | null) {
+    setUploadError(null);
+    setQuotaBlocked(null);
+    setPickedFile(f);
+  }
+
+  const canUpload = !!pickedFile && !!uploadFolderId && !uploading && !quotaBlocked && !foldersLoading;
+
+  async function doUpload() {
+    if (!pickedFile || !uploadFolderId) return;
+
+    setUploading(true);
+    setUploadError(null);
+
+    try {
+      const fd = new FormData();
+      fd.append("file", pickedFile);
+      fd.append("folder_id", uploadFolderId);
+
+      const res = await fetch("/api/trainer/upload", { method: "POST", body: fd });
+
+      if (res.status === 402 || res.status === 429) {
+        const j = safeJson(await res.text());
+        const msg = String(j?.message ?? j?.error ?? "Du har nået din månedlige upload-kvote.");
+        setQuotaBlocked(msg);
+        dispatchQuotaChanged();
+        return;
+      }
+
+      if (res.status === 409) {
+        const j = safeJson(await res.text());
+        const msg = String(
+          j?.message ??
+            j?.error ??
+            "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+        );
+        setUploadError(msg);
+        return;
+      }
+
+      if (res.status === 401) {
+        const j = safeJson(await res.text());
+        setUploadError(String(j?.error ?? "Login kræves."));
+        return;
+      }
+
+      if (res.status === 413) {
+        const j = safeJson(await res.text());
+        setUploadError(String(j?.message ?? j?.error ?? "Filen er for stor til din plan."));
+        return;
+      }
+
+      if (!res.ok) {
+        const j = safeJson(await res.text());
+        setUploadError(String(j?.message ?? j?.error ?? `Upload fejlede (${res.status}).`));
+        return;
+      }
+
+      setPickedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
+      dispatchQuotaChanged();
 
-      setListFolderId(uploadFolderId);
-      await refreshFiles(uploadFolderId);
-
-      // Bed ImportStatusBox (hvis den findes på siden) om at refreshe
-      window.dispatchEvent(new Event("notely:import-status-refresh"));
-    } catch (err: any) {
-      console.warn("handleSubmit failed:", err?.message ?? err);
-      toast.error("Upload mislykkedes", {
-        id: uploadingToastId,
-        description: err?.message ?? "Upload fejlede (ukendt fejl).",
-      });
-      setInlineError(err?.message ?? "Upload fejlede (ukendt fejl).");
+      await loadFolders();
+      await loadFiles(listFolderIdRef.current ?? uploadFolderId);
+    } catch (e) {
+      console.error("[UploadClient] upload error", e);
+      setUploadError("Upload fejlede. Prøv igen.");
     } finally {
       setUploading(false);
     }
   }
 
-  async function handleMove(fileId: string, newFolderId: string) {
-    try {
-      setErrorMsg(null);
+  async function moveFile(fileId: string, newFolderId: string) {
+    setMoveError(null);
+    setMoveNotice(null);
+    setMovingId(fileId);
 
-      const res = await fetch(`/api/files/${encodeURIComponent(fileId)}`, {
+    const prevFolderId = files.find((x) => x.id === fileId)?.folderId ?? null;
+    const currentList = listFolderIdRef.current;
+    const destName = folderOptions.find((x) => x.id === newFolderId)?.name ?? "den nye mappe";
+
+    // optimistic update (så dropdown skifter med det samme)
+    setFiles((prev) => prev.map((f) => (f.id === fileId ? { ...f, folderId: newFolderId } : f)));
+
+    let res: Response | null = null;
+
+    try {
+      res = await fetch(`/api/files/${encodeURIComponent(fileId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ folder_id: newFolderId }),
       });
-
-      const data = (await safeJson(res)) as any;
-
-      if (!res.ok || !data) {
-        const msg =
-          (data && (data.message as string)) ||
-          (data && (data.error as string)) ||
-          "Kunne ikke opdatere filens mappe.";
-        setInlineError(msg);
-        toast.error("Kunne ikke flytte filen", { description: msg });
-        return;
-      }
-
-      await refreshFiles(listFolderId ?? null);
-    } catch (err: any) {
-      console.warn("handleMove failed:", err?.message ?? err);
-      const msg = err?.message ?? "Kunne ikke flytte filen (ukendt fejl).";
-      setInlineError(msg);
-      toast.error("Kunne ikke flytte filen", { description: msg });
+    } catch {
+      res = null;
     }
+
+    if (!res || !res.ok) {
+      const j = res ? safeJson(await res.text()) : null;
+      setMoveError(String(j?.error ?? j?.message ?? "Kunne ikke flytte filen. (Tjek API/RLS)"));
+
+      // revert optimistic
+      setFiles((prev) => prev.map((f) => (f.id === fileId ? { ...f, folderId: prevFolderId } : f)));
+      setMovingId(null);
+      return;
+    }
+
+    // Hvis du flytter væk fra den mappe du står og kigger i: filen forsvinder fra listen (korrekt)
+    if (currentList && prevFolderId === currentList && newFolderId !== currentList) {
+      setFiles((prev) => prev.filter((f) => f.id !== fileId));
+      setMoveNotice(`Filen er flyttet til "${destName}". Skift mappe for at se den.`);
+    } else {
+      await loadFiles(currentList);
+      setMoveNotice(`Filen er flyttet til "${destName}".`);
+    }
+
+    setMovingId(null);
+    dispatchImportStatusRefresh();
   }
 
-  async function handleDelete(fileId: string) {
-    if (!window.confirm("Er du sikker på, at du vil slette denne fil?")) return;
+  async function deleteFile(fileId: string) {
+    const file = files.find((x) => x.id === fileId);
+    const name = file?.name ?? "filen";
 
-    const tId = toast.loading("Sletter fil…");
+    const ok = window.confirm(
+      `Er du sikker på, at du vil slette "${name}"?\n\n` +
+        `Filen bliver slettet permanent.\n` +
+        `Bemærk: Sletning giver ikke sider tilbage i denne måned.`,
+    );
+
+    if (!ok) return;
+
+    setDeleteError(null);
+    setDeletingId(fileId);
+
+    let res: Response | null = null;
 
     try {
-      setErrorMsg(null);
-      setStatusMsg(null);
-
-      const res = await fetch(`/api/files/${encodeURIComponent(fileId)}`, {
-        method: "DELETE",
-        headers: { Accept: "application/json" },
-      });
-
-      const data = (await safeJson(res)) as any;
-
-      if (res.status === 404) {
-        setFiles((prev) => prev.filter((f) => f.id !== fileId));
-        toast.success("Filen var allerede slettet", { id: tId, description: "Listen er opdateret." });
-        setInlineStatus("Filen var allerede slettet i systemet. Listen er opdateret.");
-        window.dispatchEvent(new Event("notely:import-status-refresh"));
-        return;
-      }
-
-      if (!res.ok || !data) {
-        const msg =
-          (data && (data.message as string)) ||
-          (data && (data.error as string)) ||
-          "Kunne ikke slette filen (ukendt fejl).";
-        toast.error("Sletning mislykkedes", { id: tId, description: msg });
-        setInlineError(msg);
-        return;
-      }
-
-      toast.success("Filen er slettet", { id: tId });
-      await refreshFiles(listFolderId ?? null);
-      window.dispatchEvent(new Event("notely:import-status-refresh"));
-    } catch (err: any) {
-      console.warn("handleDelete failed:", err?.message ?? err);
-      const msg = err?.message ?? "Kunne ikke slette filen (ukendt fejl).";
-      toast.error("Sletning mislykkedes", { id: tId, description: msg });
-      setInlineError(msg);
+      res = await fetch(`/api/files/${encodeURIComponent(fileId)}`, { method: "DELETE" });
+    } catch {
+      res = null;
     }
+
+    if (!res || res.status === 404) {
+      try {
+        res = await fetch(`/api/files?fileId=${encodeURIComponent(fileId)}`, { method: "DELETE" });
+      } catch {
+        res = null;
+      }
+    }
+
+    if (!res || !res.ok) {
+      const j = res ? safeJson(await res.text()) : null;
+      setDeleteError(String(j?.error ?? j?.message ?? "Kunne ikke slette filen. Prøv igen."));
+      setDeletingId(null);
+      return;
+    }
+
+    setFiles((prev) => prev.filter((f) => f.id !== fileId));
+    setDeletingId(null);
+
+    await loadFiles(listFolderIdRef.current);
+    dispatchImportStatusRefresh();
   }
 
   return (
-    <div className="-mt-6 space-y-6">
-      <section className="rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm">
-        <div className="mb-6">
-          <h2 className="text-lg font-semibold">Upload / ret materiale</h2>
-          <p className="mt-1 text-sm text-zinc-600">
-            Vælg den mappe materialet hører til, og upload dine noter eller slides som filer (fx PDF).
-            Når materialet er gjort klar, kan det bruges på tværs af Notely.
-          </p>
+    <div className="space-y-6">
+      {/* Upload card */}
+      <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+        <div className="text-sm font-semibold text-zinc-900">Upload materiale</div>
+        <div className="mt-1 text-xs text-zinc-600">
+          Vælg mappe og upload noter/slides som PDF. Når materialet er gjort klar, kan det bruges på tværs af Notely.
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="space-y-1">
-            <label className="text-sm font-medium text-zinc-800">Mappe</label>
-            <select
-              className="mt-1 w-full rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black"
-              value={uploadFolderId ?? ""}
-              onChange={(e) => setUploadFolderId(e.target.value || null)}
-              disabled={uploading}
-            >
-              {folders.map((f) => (
+        <div className="mt-4">
+          <div className="text-xs font-medium text-zinc-900">Mappe</div>
+
+          <select
+            className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm"
+            value={uploadFolderId ?? ""}
+            onChange={(e) => setUploadFolderId(e.target.value || null)}
+            disabled={foldersLoading || folderOptions.length === 0}
+          >
+            {foldersLoading ? <option value="">Indlæser...</option> : null}
+            {!foldersLoading && folderOptions.length === 0 ? <option value="">Ingen mapper</option> : null}
+            {!foldersLoading &&
+              folderOptions.map((f) => (
                 <option key={f.id} value={f.id}>
                   {f.name}
                 </option>
               ))}
-            </select>
+          </select>
 
-            {currentUploadFolder && (
-              <p className="mt-1 text-xs text-zinc-500">
-                Mapper styrer, hvilket fag/forløb materialet bliver knyttet til.
-              </p>
-            )}
+          <div className="mt-1 text-[11px] text-zinc-500">
+            Mapper styrer, hvilket fag/forløb materialet bliver knyttet til.
+          </div>
+          {foldersError ? <div className="mt-2 text-[11px] text-red-600">{foldersError}</div> : null}
+        </div>
+
+        {/* Dropzone */}
+        <label
+          className={[
+            "mt-4 block cursor-pointer rounded-2xl border border-dashed p-6 text-center",
+            dragOver ? "border-zinc-700 bg-zinc-50" : "border-zinc-200 bg-white",
+            uploading ? "opacity-60 cursor-default" : "",
+          ].join(" ")}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragOver(true);
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragOver(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragOver(false);
+            const f = e.dataTransfer?.files?.[0] ?? null;
+            onPickFile(f);
+          }}
+        >
+          <div className="text-sm font-medium text-zinc-900">Træk en PDF herind eller klik for at vælge.</div>
+          <div className="mt-1 text-xs text-zinc-500">Maks. størrelse afhænger af din plan (typisk ~10–30 MB pr. fil).</div>
+
+          <div className="mt-4 flex items-center justify-center gap-2">
+            <span className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium">Vælg fil</span>
+
+            {pickedFile ? (
+              <button
+                type="button"
+                className="rounded-full border border-zinc-300 bg-white px-3 py-2 text-xs"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setPickedFile(null);
+                  if (fileInputRef.current) fileInputRef.current.value = "";
+                }}
+              >
+                Fjern
+              </button>
+            ) : null}
           </div>
 
-          <div className="rounded-2xl border border-dashed border-zinc-300 bg-zinc-50 px-4 py-10 text-center">
-            <p className="mb-1 text-sm text-zinc-700">Træk en PDF herind eller klik for at vælge.</p>
-            <p className="mb-4 text-xs text-zinc-500">
-              Maks. størrelse afhænger af din plan (typisk ~10–30 MB pr. fil).
-            </p>
+          {pickedFile ? (
+            <div className="mt-3 text-xs text-zinc-700">
+              Valgt fil: <span className="font-medium">{pickedFile.name}</span>
+            </div>
+          ) : null}
 
-            <input
-              ref={fileInputRef}
-              id="upload-file-input"
-              type="file"
-              accept=".pdf,application/pdf"
-              hidden
-              onChange={(e) => {
-                const f = e.target.files?.[0] ?? null;
-                setFileToUpload(f);
-                setStatusMsg(null);
-                setErrorMsg(null);
-              }}
-            />
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              onPickFile(f);
+            }}
+          />
+        </label>
 
-            <button
-              type="button"
-              className="rounded-full border border-zinc-300 px-4 py-1.5 text-sm font-medium hover:bg-zinc-100 disabled:opacity-60"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-            >
-              Vælg fil
-            </button>
+        {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
+        {uploadError ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
 
-            {fileToUpload && (
-              <p className="mt-3 text-xs text-zinc-600">
-                Valgt fil: <span className="font-medium">{fileToUpload.name}</span>
-              </p>
-            )}
-          </div>
+        <div className="mt-4 flex items-center justify-between">
+          <button
+            type="button"
+            onClick={() => void doUpload()}
+            disabled={!canUpload}
+            className="rounded-full bg-zinc-900 px-5 py-2 text-xs font-semibold text-white disabled:opacity-40"
+          >
+            {uploading ? "Uploader..." : "Upload fil"}
+          </button>
 
-          <div className="flex items-center justify-between gap-4">
-            <button
-              type="submit"
-              disabled={uploading || !fileToUpload || !uploadFolderId}
-              className="rounded-full bg-black px-5 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-zinc-400"
-            >
-              {uploading ? "Uploader…" : "Upload fil"}
-            </button>
+          <button
+            type="button"
+            onClick={() => void loadFolders()}
+            className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium"
+          >
+            Opdater mapper
+          </button>
+        </div>
+      </div>
 
-            <p className="text-xs text-zinc-500">
-              Filen knyttes til{" "}
-              <span className="font-medium">{currentUploadFolder?.name ?? "valgt mappe"}</span>.
-            </p>
-          </div>
-
-          {statusMsg && <p className="text-xs font-medium text-emerald-600">{statusMsg}</p>}
-          {errorMsg && <p className="text-xs font-medium text-red-600">{errorMsg}</p>}
-        </form>
-      </section>
-
-      <section className="rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm">
-        <div className="mb-4 flex items-center justify-between">
+      {/* Files list */}
+      <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+        <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-sm font-semibold">Materiale i dine mapper</h2>
-            <p className="mt-1 text-xs text-zinc-500">
-              Viser filer i den mappe, du har valgt i dropdownen herunder.
-            </p>
-            {currentListFolder && (
-              <p className="mt-1 text-[11px] text-zinc-400">Aktuel mappe: {currentListFolder.name}</p>
-            )}
+            <div className="text-sm font-semibold text-zinc-900">Materiale i dine mapper</div>
+            <div className="mt-1 text-xs text-zinc-600">Viser filer i den mappe, du vælger herunder.</div>
           </div>
 
           <button
             type="button"
-            onClick={() => refreshFiles(listFolderId ?? null)}
-            className="rounded-full border border-zinc-300 px-3 py-1 text-xs font-medium hover:bg-zinc-100"
-            disabled={loadingList || uploading}
+            onClick={() => void loadFiles(listFolderIdRef.current)}
+            className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium"
           >
             Opdater liste
           </button>
         </div>
 
-        <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-zinc-600">Vis filer i mappe:</span>
+        <div className="mt-4 flex items-center gap-3">
+          <div className="text-xs text-zinc-700">Vis filer i mappe:</div>
+
           <select
-            className="rounded-xl border border-zinc-300 bg-white px-3 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-black"
+            className="rounded-full border border-zinc-200 bg-white px-3 py-2 text-xs"
             value={listFolderId ?? ""}
             onChange={(e) => setListFolderId(e.target.value || null)}
-            disabled={loadingList || uploading}
+            disabled={foldersLoading || folderOptions.length === 0}
           >
-            {folders.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.name}
-              </option>
-            ))}
+            {foldersLoading ? <option value="">Indlæser...</option> : null}
+            {!foldersLoading && folderOptions.length === 0 ? <option value="">Ingen mapper</option> : null}
+            {!foldersLoading &&
+              folderOptions.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
           </select>
         </div>
 
-        {loadingList ? (
-          <p className="text-xs text-zinc-500">Henter filer…</p>
-        ) : uniqueFiles.length === 0 ? (
-          <p className="text-xs text-zinc-500">Der er endnu ikke uploadet materiale i denne mappe.</p>
-        ) : (
-          <ul className="space-y-2">
-            {uniqueFiles.map((file, index) => (
-              <li
-                key={file.id ?? `file-${index}`}
-                className="flex items-center justify-between rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-xs"
-              >
-                <div className="min-w-0">
-                  <div className="truncate font-medium">{displayName(file)}</div>
-                  <div className="mt-1 flex flex-wrap gap-3 text-[11px] text-zinc-500">
-                    <span>{displaySize(file)}</span>
-                    {displayDate(file) && <span>{displayDate(file)}</span>}
-                  </div>
+        {filesError ? <div className="mt-3 text-xs text-red-600">{filesError}</div> : null}
+        {deleteError ? <div className="mt-3 text-xs text-red-600">{deleteError}</div> : null}
+        {moveError ? <div className="mt-3 text-xs text-red-600">{moveError}</div> : null}
+        {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}
+
+        <div className="mt-4 space-y-3">
+          {filesLoading ? <div className="text-xs text-zinc-500">Henter filer…</div> : null}
+
+          {!filesLoading && (!listFolderId || files.length === 0) ? (
+            <div className="text-xs text-zinc-500">
+              {listFolderId ? "Ingen filer i denne mappe endnu." : "Vælg en mappe."}
+            </div>
+          ) : null}
+
+          {files.map((f) => (
+            <div
+              key={f.id}
+              className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3"
+            >
+              <div>
+                <div className="text-sm font-medium text-zinc-900">{f.name}</div>
+                <div className="mt-1 text-[11px] text-zinc-500">
+                  {humanBytes(f.sizeBytes)} {f.uploadedAt ? `· ${fmtDa(f.uploadedAt)}` : ""}
                 </div>
+              </div>
 
-                <div className="ml-4 flex items-center gap-2">
-                  <select
-                    className="rounded-xl border border-zinc-300 bg-white px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-black"
-                    value={file.folder_id ?? ""}
-                    onChange={(e) => handleMove(file.id, e.target.value || "")}
-                    disabled={uploading}
-                    title="Flyt fil til anden mappe"
-                  >
-                    {folders.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.name}
-                      </option>
-                    ))}
-                  </select>
+              <div className="flex items-center gap-2">
+                <select
+                  className="rounded-full border border-zinc-200 bg-white px-3 py-2 text-xs"
+                  value={f.folderId ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value || null;
+                    if (!v) return;
+                    void moveFile(f.id, v);
+                  }}
+                  disabled={folderOptions.length === 0 || deletingId === f.id || movingId === f.id}
+                  title="Flyt til anden mappe"
+                >
+                  {folderOptions.map((fo) => (
+                    <option key={fo.id} value={fo.id}>
+                      {fo.name}
+                    </option>
+                  ))}
+                </select>
 
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(file.id)}
-                    disabled={uploading}
-                    className="rounded-full border border-red-200 px-3 py-1 text-[11px] font-medium text-red-600 hover:bg-red-50 disabled:opacity-60"
-                  >
-                    Slet
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        {errorMsg && <p className="mt-3 text-xs font-medium text-red-600">{errorMsg}</p>}
-      </section>
+                <button
+                  type="button"
+                  onClick={() => void deleteFile(f.id)}
+                  disabled={deletingId === f.id || movingId === f.id}
+                  className="rounded-full border border-red-300 bg-white px-3 py-2 text-xs font-medium text-red-700 disabled:opacity-40"
+                >
+                  {deletingId === f.id ? "Sletter..." : "Slet"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

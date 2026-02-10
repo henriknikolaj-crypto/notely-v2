@@ -5,12 +5,14 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { requireUser } from "@/lib/auth";
 import { ensureQuotaAndDecrement } from "@/lib/quota";
+import { enforceRateLimit } from "@/lib/rateLimit";
 import { requireFlowModel, type NotelyFlow } from "@/lib/openai/requireModel";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const MAX_TRAINER_EVALS_PER_OWNER = 50;
+const TRAINER_EVALS_PER_ROUND = 2;
 
 type EvalRequest = {
   question: string;
@@ -30,6 +32,10 @@ type EvalRequest = {
   /** Flow (nu/fremtid): trainer | simulator | oral */
   source_type?: NotelyFlow;
   sourceType?: NotelyFlow;
+
+  /** ✅ Trainer-runde (evals er inkluderet i runden) */
+  round_id?: string | null;
+  roundId?: string | null;
 };
 
 type EvalJson = {
@@ -73,6 +79,63 @@ function fileTitle(row: any) {
   return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
 }
 
+function pickFlow(body: Partial<EvalRequest>): NotelyFlow {
+  const flowRaw = (body.source_type ?? body.sourceType) as NotelyFlow | undefined;
+  return flowRaw === "simulator" || flowRaw === "oral" ? flowRaw : "trainer";
+}
+
+function pickRoundId(body: Partial<EvalRequest>): string | null {
+  const raw = (body.round_id ?? body.roundId) as string | null | undefined;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
+
+async function loadTrainerRound(sb: any, ownerId: string, roundId: string): Promise<{ id: string; meta: any } | null> {
+  try {
+    const { data, error } = await sb
+      .from("jobs")
+      .select("id, meta")
+      .eq("owner_id", ownerId)
+      .eq("kind", "trainer_round")
+      .eq("id", roundId)
+      .maybeSingle();
+
+    if (error || !data?.id) return null;
+    return { id: String((data as any).id), meta: (data as any).meta ?? {} };
+  } catch {
+    return null;
+  }
+}
+
+function n0(x: any) {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function bumpTrainerRoundEval(sb: any, ownerId: string, roundId: string, meta: any) {
+  const evalsUsed = n0(meta?.evals_used);
+  const maxEvals = n0(meta?.max_evals) > 0 ? n0(meta?.max_evals) : TRAINER_EVALS_PER_ROUND;
+
+  const newMeta = {
+    ...(meta ?? {}),
+    evals_used: Math.min(maxEvals, evalsUsed + 1),
+    max_evals: maxEvals,
+    updated_at: new Date().toISOString(),
+  };
+
+  try {
+    await sb
+      .from("jobs")
+      .update({ meta: newMeta, updated_at: new Date().toISOString() })
+      .eq("owner_id", ownerId)
+      .eq("kind", "trainer_round")
+      .eq("id", roundId);
+  } catch {
+    // ignore
+  }
+
+  return newMeta;
+}
+
 /**
  * Byg kontekst til evaluering.
  *
@@ -108,12 +171,10 @@ async function buildContextForEvaluation(opts: {
     original_name: string | null;
     folder_id: string | null;
     created_at?: string | null;
-    // url?: string | null; // hvis du får et felt senere
   };
 
   const fileRaw = (body.file_id ?? body.fileId) as string | null | undefined;
-  const explicitFileId =
-    typeof fileRaw === "string" && fileRaw.trim().length > 0 ? fileRaw.trim() : null;
+  const explicitFileId = typeof fileRaw === "string" && fileRaw.trim().length > 0 ? fileRaw.trim() : null;
 
   const scopeFolderIds: string[] = Array.isArray(body.scopeFolderIds)
     ? body.scopeFolderIds
@@ -132,7 +193,6 @@ async function buildContextForEvaluation(opts: {
     chunkCount: number;
     citations: Citation[];
   }> {
-    // hent filnavn (så UI får titel og ikke “Kilde 1”)
     const { data: fileRow } = await sb
       .from("files")
       .select("id,name,original_name,folder_id,created_at")
@@ -164,7 +224,6 @@ async function buildContextForEvaluation(opts: {
     let text = nonEmpty.join("\n\n---\n\n");
     if (text.length > maxChars) text = text.slice(0, maxChars);
 
-    // ✅ Returnér kun 1 “kilde” for evalueringen (fil-niveau)
     const firstChunkId = String(nonEmptyRows[0]?.id ?? fileId);
     const citations: Citation[] = [
       {
@@ -203,7 +262,6 @@ async function buildContextForEvaluation(opts: {
 
   let filesInScope: FileRow[] = (fileRows ?? []) as FileRow[];
 
-  // fallback: hvis scope var tomt og der ikke kom filer tilbage, så prøv alle filer
   if (!filesInScope.length && effectiveFolderIds.length > 0) {
     const { data: allFiles, error: allFilesErr } = await sb
       .from("files")
@@ -252,12 +310,18 @@ async function pruneTrainerHistory(sb: any, ownerId: string) {
 }
 
 export async function POST(req: NextRequest) {
+  // til jobs-log i outer catch
+  let sb: any = null;
+  let ownerId = "";
+  let jobId: string | null = null;
+  let t0 = Date.now();
+
   try {
     const parsed = await readJsonBody<Partial<EvalRequest>>(req);
     if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
 
     const body = parsed.value ?? {};
-    const question = String(body.question ?? "").trim();
+    const question = String((body as any).question ?? (body as any).prompt ?? "").trim();
     const answer = String(body.answer ?? "").trim();
 
     if (!question || !answer) {
@@ -268,24 +332,57 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY (required)" }, { status: 500 });
     }
 
-    // Auth/dev-bypass
-    let sb: any;
-    let ownerId = "";
-    let mode: "auth" | "dev" = "auth";
-    try {
-      const u = await requireUser(req);
-      sb = u.sb;
-      ownerId = u.id;
-      mode = u.mode;
-    } catch (e: any) {
-      const msg = String(e?.message ?? "");
-      const isAuth = msg.toLowerCase().includes("unauthorized");
-      if (!isAuth) console.error("[evaluate] requireUser crash:", e);
-      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-    }
+    // Folder/note/scope normaliseres tidligt (bruges både i jobs + exam_sessions)
+    const folderId = typeof body.folder_id === "string" && body.folder_id.trim() ? body.folder_id.trim() : null;
+    const noteId = typeof body.note_id === "string" && body.note_id.trim() ? body.note_id.trim() : null;
 
-    const flowRaw = (body.source_type ?? body.sourceType) as NotelyFlow | undefined;
-    const flow: NotelyFlow = flowRaw === "simulator" || flowRaw === "oral" ? flowRaw : "trainer";
+    const scopeFolderIds = Array.isArray(body.scopeFolderIds)
+      ? body.scopeFolderIds
+          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+          .map((x) => x.trim())
+      : [];
+
+    const sessionFolderIds = scopeFolderIds.length > 0 ? scopeFolderIds : folderId ? [folderId] : [];
+    const sessionFolderId = sessionFolderIds.length === 1 ? sessionFolderIds[0] : null;
+    const sessionFolderIdsMeta = sessionFolderIds.length > 1 ? sessionFolderIds : undefined;
+
+    const flow: NotelyFlow = pickFlow(body);
+const roundId = pickRoundId(body);
+
+const includeBackgroundClient = !!body.includeBackground;
+const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
+
+    // Auth/dev-bypass
+let mode: "auth" | "dev" = "auth";
+
+try {
+  const u = await requireUser(req);
+  sb = u.sb;
+  ownerId = u.id;
+  mode = u.mode;
+  t0 = Date.now();
+
+  // Rate-limit (evaluate)
+  const rl = await enforceRateLimit(
+    ownerId,
+    "evaluate",
+    { limit: 6, windowSeconds: 60, minIntervalMs: 5000 },
+    "Evaluer svar",
+  );
+
+  if (!rl.ok) {
+    const retryAfterSec = Math.max(1, Math.ceil(rl.retryAfterMs / 1000));
+    return NextResponse.json(
+      { ok: false, error: rl.message, retryAfterMs: rl.retryAfterMs },
+      { status: 429, headers: { "Retry-After": String(retryAfterSec) } },
+    );
+  }
+} catch (e: any) {
+  const msg = String(e?.message ?? "");
+  const isAuth = msg.toLowerCase().includes("unauthorized");
+  if (!isAuth) console.error("[evaluate] requireUser crash:", e);
+  return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+}
 
     let model: string;
     try {
@@ -294,8 +391,36 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: e?.message ?? "Missing model env" }, { status: 500 });
     }
 
-    // Quota-check
-    {
+    // ✅ Trainer-runde gating (2 evals pr. runde) + ingen evaluate-quota for trainer
+    let trainerRoundMeta: any = null;
+    if (flow === "trainer") {
+      if (!roundId) {
+        return NextResponse.json(
+          { ok: false, error: "Tryk “Generér nyt spørgsmål” først for at starte en runde." },
+          { status: 400 },
+        );
+      }
+
+      const rr = await loadTrainerRound(sb, ownerId, roundId);
+      if (!rr) {
+        return NextResponse.json(
+          { ok: false, error: "Ugyldig runde. Generér et nyt spørgsmål for at starte en ny runde." },
+          { status: 400 },
+        );
+      }
+
+      trainerRoundMeta = rr.meta ?? {};
+      const evalsUsed = n0(trainerRoundMeta?.evals_used);
+      const maxEvals = n0(trainerRoundMeta?.max_evals) > 0 ? n0(trainerRoundMeta?.max_evals) : TRAINER_EVALS_PER_ROUND;
+
+      if (evalsUsed >= maxEvals) {
+        return NextResponse.json(
+          { ok: false, error: "Denne runde er brugt op. Generér et nyt spørgsmål for at starte en ny runde." },
+          { status: 402 },
+        );
+      }
+    } else {
+      // Quota-check (kun for simulator/oral)
       const cost = 1;
       const quota = await ensureQuotaAndDecrement(ownerId, "evaluate", cost);
       if (!quota.ok) {
@@ -304,7 +429,37 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const includeBackground = !!body.includeBackground;
+    // ✅ jobs-log: queued (+ queued_at denne måned)
+    try {
+      const nowIso = new Date().toISOString();
+      const { data: jobRow, error: jobErr } = await sb
+        .from("jobs")
+        .insert({
+          owner_id: ownerId,
+          kind: "evaluate",
+          status: "queued",
+          queued_at: nowIso,
+          started_at: nowIso,
+          folder_id: sessionFolderId,
+          file_id: null,
+          meta: {
+            flow,
+            includeBackground,
+            scopeFolderIds,
+            ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
+            note_id: noteId,
+            mode,
+            round_id: flow === "trainer" ? roundId : null,
+          },
+        })
+        .select("id")
+        .maybeSingle();
+
+      if (!jobErr && (jobRow as any)?.id) jobId = String((jobRow as any).id);
+      if (jobErr) console.error("[evaluate] jobs insert error:", jobErr);
+    } catch (e) {
+      console.error("[evaluate] jobs insert crash:", e);
+    }
 
     // Kontekst + citations (kun hvis includeBackground)
     let contextText = "";
@@ -317,7 +472,33 @@ export async function POST(req: NextRequest) {
       contextText = ctx.contextText;
       usedFileId = ctx.usedFileId;
       contextChunkCount = ctx.chunkCount;
-      citations = ctx.citations; // ✅ kun de kilder vi faktisk brugte (fil-niveau)
+      citations = ctx.citations;
+
+      if (jobId) {
+        try {
+          await sb
+            .from("jobs")
+            .update({
+              file_id: usedFileId,
+              meta: {
+                flow,
+                includeBackground,
+                scopeFolderIds,
+                ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
+                note_id: noteId,
+                file_id: usedFileId,
+                contextChunkCount,
+                mode,
+                round_id: flow === "trainer" ? roundId : null,
+              },
+              updated_at: new Date().toISOString(),
+            })
+            .eq("owner_id", ownerId)
+            .eq("id", jobId);
+        } catch {
+          // ignore
+        }
+      }
     }
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
@@ -399,14 +580,11 @@ Ingen tekst uden for JSON-objektet.
       ...nextSteps.map((s) => `- ${s}`),
     ].join("\n");
 
-    const folderId = typeof body.folder_id === "string" && body.folder_id.trim() ? body.folder_id.trim() : null;
-    const noteId = typeof body.note_id === "string" && body.note_id.trim() ? body.note_id.trim() : null;
-
-    const scopeFolderIds = Array.isArray(body.scopeFolderIds)
-      ? body.scopeFolderIds
-          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-          .map((x) => x.trim())
-      : [];
+    // ✅ bump evals_used på runden (LLM-kald er gennemført)
+    if (flow === "trainer" && roundId) {
+      const baseMeta = trainerRoundMeta ?? {};
+      await bumpTrainerRoundEval(sb, ownerId, roundId, baseMeta);
+    }
 
     const insertPayload = {
       owner_id: ownerId,
@@ -414,17 +592,19 @@ Ingen tekst uden for JSON-objektet.
       answer,
       feedback: feedbackText,
       score,
-      folder_id: folderId,
+      folder_id: sessionFolderId,
       source_type: flow,
       meta: {
         includeBackground,
         scopeFolderIds,
+        ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
         note_id: noteId,
         file_id: usedFileId,
         contextChunkCount,
         contextPreview: contextText ? contextText.slice(0, 400) : null,
-        citations, // ✅ gem hvad vi viste/brugte
+        citations,
         mode,
+        round_id: flow === "trainer" ? roundId : null,
       },
     };
 
@@ -435,17 +615,58 @@ Ingen tekst uden for JSON-objektet.
       void pruneTrainerHistory(sb, ownerId);
     }
 
+    // ✅ jobs-log: succeeded
+    if (jobId) {
+      try {
+        const tokensUsed = (completion as any)?.usage?.total_tokens ?? null;
+        await sb
+          .from("jobs")
+          .update({
+            status: "succeeded",
+            finished_at: new Date().toISOString(),
+            latency_ms: Math.max(0, Date.now() - t0),
+            tokens_used: typeof tokensUsed === "number" ? tokensUsed : null,
+            feedbackscore: score,
+            result: { score, round_id: flow === "trainer" ? roundId : null },
+            updated_at: new Date().toISOString(),
+          })
+          .eq("owner_id", ownerId)
+          .eq("id", jobId);
+      } catch (e) {
+        console.error("[evaluate] jobs update (succeeded) error:", e);
+      }
+    }
+
     return NextResponse.json(
       {
         ok: true,
         score,
         feedback: feedbackText,
-        usedFileId, // ✅ så UI kan matche/fejlsøge
-        citations, // ✅ én kilde med korrekt title (filnavn)
+        usedFileId,
+        citations,
       },
       { status: 200 },
     );
   } catch (err: any) {
+    // ✅ jobs-log: failed
+    if (sb && ownerId && jobId) {
+      try {
+        await sb
+          .from("jobs")
+          .update({
+            status: "failed",
+            finished_at: new Date().toISOString(),
+            latency_ms: Math.max(0, Date.now() - t0),
+            error_message: String(err?.message ?? "failed"),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("owner_id", ownerId)
+          .eq("id", jobId);
+      } catch {
+        // ignore
+      }
+    }
+
     console.error("EVALUATE /api/evaluate error:", err);
     return NextResponse.json({ ok: false, error: err?.message ?? "Intern fejl i evalueringen" }, { status: 500 });
   }

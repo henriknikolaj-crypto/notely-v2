@@ -4,6 +4,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import LimitNotice from "../_ui/LimitNotice";
 
 type Citation = {
   file_id?: string | null;
@@ -22,13 +23,16 @@ type Flashcard = {
   citation?: Citation | null;
 };
 
-type Quota = {
-  feature?: string;
-  plan?: string;
-  usedThisMonth?: number;
-  monthlyLimit?: number;
-  remaining?: number;
-} | null;
+type Quota =
+  | {
+      feature?: string;
+      plan?: string;
+      usedThisMonth?: number;
+      monthlyLimit?: number;
+      remaining?: number;
+      remainingThisMonth?: number; // bagudkompat
+    }
+  | null;
 
 const DEMO_CARDS: Flashcard[] = [
   {
@@ -57,10 +61,12 @@ type Props = {
   scopeFolderIds?: string[];
 };
 
+const QUOTA_MSG = "Du har nået din grænse for Flashcards denne måned.";
+
 async function readJsonSafe(res: Response) {
   const text = await res.text();
   try {
-    return JSON.parse(text);
+    return text.trim() ? JSON.parse(text) : {};
   } catch {
     const snippet = text.replace(/\s+/g, " ").slice(0, 160);
     throw new Error(`HTTP ${res.status}: ${snippet}`);
@@ -83,12 +89,16 @@ function normalizeCard(raw: any): Flashcard | null {
   return { id, front, back, citation: cit ?? null };
 }
 
-function getScopeFromUrl(sp: ReturnType<typeof useSearchParams> | null): string | null {
+function getScopeFromUrl(sp: ReturnType<typeof useSearchParams> | null): string[] {
   const s = sp?.get("scope");
-  return s && s.trim() ? s.trim() : null;
+  if (!s || !s.trim()) return [];
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
 
-function buildScopeFolderIds(propsScope: string[] | undefined, urlScope: string | null) {
+function buildScopeFolderIds(propsScope: string[] | undefined, urlScopeIds: string[]) {
   const out: string[] = [];
   const seen = new Set<string>();
 
@@ -100,17 +110,38 @@ function buildScopeFolderIds(propsScope: string[] | undefined, urlScope: string 
     }
   }
 
-  if (out.length === 0 && urlScope) out.push(urlScope);
+  if (out.length === 0 && urlScopeIds.length > 0) {
+    for (const s of urlScopeIds) {
+      const t = String(s || "").trim();
+      if (t && !seen.has(t)) {
+        seen.add(t);
+        out.push(t);
+      }
+    }
+  }
+
   return out;
+}
+
+function pickFlashcardsQuota(json: any): { used: number; limit: number | null } {
+  const used =
+    (typeof json?.flashcards_generate?.usedThisMonth === "number" ? json.flashcards_generate.usedThisMonth : null) ??
+    (typeof json?.flashcardsUsedThisMonth === "number" ? json.flashcardsUsedThisMonth : 0);
+
+  const limit =
+    (typeof json?.flashcards_generate?.limitPerMonth === "number" ? json.flashcards_generate.limitPerMonth : null) ??
+    (typeof json?.flashcardsLimitPerMonth === "number" ? json.flashcardsLimitPerMonth : null);
+
+  return { used: Number.isFinite(used) ? used : 0, limit: typeof limit === "number" ? limit : null };
 }
 
 export default function FlashcardsClient({ scopeFolderIds }: Props) {
   const sp = useSearchParams();
-  const urlScope = getScopeFromUrl(sp);
+  const urlScopeIds = React.useMemo(() => getScopeFromUrl(sp), [sp]);
 
   const effectiveScopeFolderIds = React.useMemo(
-    () => buildScopeFolderIds(scopeFolderIds, urlScope),
-    [scopeFolderIds, urlScope],
+    () => buildScopeFolderIds(scopeFolderIds, urlScopeIds),
+    [scopeFolderIds, urlScopeIds],
   );
 
   const [cards, setCards] = React.useState<Flashcard[]>([]);
@@ -119,8 +150,10 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
 
   const [loading, setLoading] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
+  const [limitReached, setLimitReached] = React.useState(false);
 
   const [quota, setQuota] = React.useState<Quota>(null);
+  void quota;
 
   const hasCards = cards.length > 0;
   const card = hasCards ? cards[i] : null;
@@ -136,22 +169,51 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
   const citationFileId = String(citation?.file_id ?? citation?.fileId ?? "").trim();
   const citationDetail = String(citation?.detail ?? "").trim();
 
-  const quotaText = (() => {
-    const remaining = Number(quota?.remaining);
-    const limit = Number(quota?.monthlyLimit);
-    if (!Number.isFinite(remaining) || !Number.isFinite(limit)) return null;
-    return `${remaining} tilbage i denne måned`;
-  })();
-
-  const dispatchChanged = React.useCallback(() => {
+  const dispatchQuotaChanged = React.useCallback(() => {
     try {
+      window.dispatchEvent(new Event("notely-quota-changed"));
       window.dispatchEvent(new Event("flashcards:changed"));
     } catch {
       // ignore
     }
   }, []);
 
+  const precheckQuota = React.useCallback(async () => {
+    try {
+      const res = await fetch("/api/quota/current", { method: "GET" });
+      if (!res.ok) return;
+
+      const json = await readJsonSafe(res);
+      if (!json?.ok) return;
+
+      const { used, limit } = pickFlashcardsQuota(json);
+      if (typeof limit === "number" && limit > 0) {
+        const remaining = Math.max(0, limit - used);
+        if (remaining <= 0) {
+          setLimitReached(true);
+          setNotice(QUOTA_MSG);
+        } else {
+          setLimitReached(false);
+          setNotice(null);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // ✅ Vis limit med det samme ved load + når quota ændrer sig
+  React.useEffect(() => {
+    void precheckQuota();
+
+    const onQuota = () => void precheckQuota();
+    window.addEventListener("notely-quota-changed", onQuota);
+    return () => window.removeEventListener("notely-quota-changed", onQuota);
+  }, [precheckQuota]);
+
   const generate = React.useCallback(async () => {
+    if (limitReached) return;
+
     setLoading(true);
     setNotice(null);
 
@@ -169,36 +231,47 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
 
       const data = await readJsonSafe(res);
 
-      // quota (valgfri)
       if (data?.quota) setQuota(data.quota as Quota);
+      else if (data?.limits) setQuota(data.limits as Quota);
+
+      if (res.status === 402 || res.status === 429) {
+        setLimitReached(true);
+        setNotice(String(data?.error ?? QUOTA_MSG));
+        dispatchQuotaChanged();
+        return;
+      }
 
       const rawCards = Array.isArray(data?.cards) ? data.cards : [];
       const next = rawCards.map(normalizeCard).filter(Boolean) as Flashcard[];
 
-      if (!res.ok || !data?.ok || next.length === 0) {
-        setCards(DEMO_CARDS);
+      if (res.ok && data?.ok && next.length > 0) {
+        setLimitReached(false);
+        setCards(next);
         setI(0);
         setShowBack(false);
-        setNotice(data?.warning ?? "Kunne ikke generere kort – bruger demo-kort i stedet.");
+        if (data?.warning) setNotice(String(data.warning));
+        dispatchQuotaChanged();
         return;
       }
 
-      setCards(next);
+      setLimitReached(false);
+      setCards(DEMO_CARDS);
       setI(0);
       setShowBack(false);
-      if (data?.warning) setNotice(String(data.warning));
-
-      dispatchChanged();
+      setNotice(String(data?.warning ?? data?.error ?? "Kunne ikke generere kort – bruger demo-kort i stedet."));
+      dispatchQuotaChanged();
     } catch (err) {
+      // eslint-disable-next-line no-console
       console.error("flashcards generate error:", err);
       setCards(DEMO_CARDS);
       setI(0);
       setShowBack(false);
       setNotice("Kunne ikke generere kort – bruger demo-kort i stedet.");
+      dispatchQuotaChanged();
     } finally {
       setLoading(false);
     }
-  }, [effectiveScopeFolderIds, dispatchChanged]);
+  }, [effectiveScopeFolderIds, dispatchQuotaChanged, limitReached]);
 
   function prev() {
     if (!canPrev) return;
@@ -217,32 +290,34 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
     setShowBack((x) => !x);
   }
 
+  const hasScope = effectiveScopeFolderIds.length > 0;
+
   return (
     <div className="space-y-4">
-      {/* Toplinje */}
       <div className="flex items-center justify-between gap-3">
         <div className="text-sm text-zinc-600">
           <span className="font-medium text-zinc-900">{pageLabel}</span>
-          {quotaText ? <span className="ml-3 text-xs text-zinc-500">{quotaText}</span> : null}
-          {notice ? <span className="ml-3 text-xs text-zinc-500">{notice}</span> : null}
         </div>
 
         <button
           type="button"
           onClick={generate}
-          disabled={loading}
+          disabled={loading || !hasScope || limitReached}
           className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-50 disabled:opacity-50"
         >
           {loading ? "Genererer…" : "Generér 10 kort"}
         </button>
       </div>
 
-      {/* Card */}
+      {/* ✅ ens “grå boks” ved limit */}
+      {limitReached ? <LimitNotice feature="flashcards_generate" message={notice ?? QUOTA_MSG} /> : null}
+      {!limitReached && notice ? <div className="text-xs text-zinc-500">{notice}</div> : null}
+
       <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
         <div className="text-sm font-semibold text-zinc-900">{showBack ? "Svar" : "Spørgsmål"}</div>
 
         <div className="mt-3 min-h-[120px] text-[15px] leading-6 text-zinc-900">
-          {card ? (showBack ? card.back : card.front) : "Tryk “Generér 10 kort” for at starte."}
+          {card ? (showBack ? card.back : card.front) : "Vælg mappe(r) i venstre side og tryk “Generér 10 kort”."}
         </div>
 
         <div className="mt-4 text-xs text-zinc-500">
@@ -276,7 +351,6 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
         </div>
       </div>
 
-      {/* Controls */}
       <div className="flex items-center justify-between gap-3">
         <button
           type="button"

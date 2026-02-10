@@ -1,4 +1,3 @@
-// app/traener/ui/TrainingTabs.tsx
 "use client";
 
 import Link from "next/link";
@@ -10,49 +9,54 @@ function cn(...xs: Array<string | false | null | undefined>) {
 
 type TabDef = {
   label: string;
-  href: string; // fx "/traener/noter"
+  href: string;
   pro?: boolean;
+  activePrefixes?: string[];
 };
 
 const TABS: TabDef[] = [
-  { label: "Noter", href: "/traener/noter" },
-  { label: "Multiple Choice", href: "/traener/mc" },
-  { label: "Flashcards", href: "/traener/flashcards" },
-  // Træner bruger /traener-siden (PoC)
-  { label: "Træner", href: "/traener", pro: true },
-  { label: "Simulator", href: "/traener/simulator", pro: true },
+  { label: "Noter", href: "/traener/noter", activePrefixes: ["/traener/noter"] },
+  { label: "Multiple Choice", href: "/traener/mc", activePrefixes: ["/traener/mc"] },
+  { label: "Flashcards", href: "/traener/flashcards", activePrefixes: ["/traener/flashcards"] },
+  { label: "Træner", href: "/traener" },
+
+  // Eksamen samler Skrift + Mundtlig
+  {
+    label: "Eksamen",
+    href: "/traener/simulator", // Skrift i v1
+    pro: true,
+    activePrefixes: ["/traener/simulator", "/traener/mundtlig"],
+  },
 ];
 
 export default function TrainingTabs() {
-  const pathname = usePathname();
+  const pathname = (usePathname() || "").replace(/\/+$/, "");
   const sp = useSearchParams();
 
-  // Skjul tabs på særlige sider (upload + historik-lister)
+  // Skjul tabs på upload + historik-sider
   const hideTabs =
     !pathname ||
     pathname.startsWith("/traener/upload") ||
-    pathname.startsWith("/traener/evalueringer/historik") ||
-    pathname.startsWith("/traener/mc/historik");
+    pathname.includes("/historik");
 
   if (hideTabs) return null;
 
-  // Bevar alle query-parametre (folder, scope, osv.)
   const baseParams = new URLSearchParams(sp.toString());
+  const qs = baseParams.toString();
+  const withQs = (href: string) => (qs ? `${href}?${qs}` : href);
 
   return (
     <div className="mb-4 rounded-2xl border border-zinc-200 bg-white shadow-sm">
-      <div className="flex items-center gap-2 overflow-x-auto px-3 py-2">
+      <div className="flex items-center gap-2 overflow-x-auto overflow-y-hidden px-3 py-2">
         {TABS.map((tab) => {
-          const isActive = pathname === tab.href;
-
-          const params = new URLSearchParams(baseParams.toString());
-          const qs = params.toString();
-          const url = qs ? `${tab.href}?${qs}` : tab.href;
+          const isActive = tab.activePrefixes?.length
+            ? tab.activePrefixes.some((pre) => pathname === pre || pathname.startsWith(pre + "/") || pathname.startsWith(pre))
+            : pathname === tab.href;
 
           return (
             <Link
               key={tab.href}
-              href={url}
+              href={withQs(tab.href)}
               className={cn(
                 "whitespace-nowrap rounded-lg px-3 py-2 text-sm border",
                 isActive
@@ -65,9 +69,7 @@ export default function TrainingTabs() {
                 <span
                   className={cn(
                     "ml-2 rounded border px-1 py-[1px] text-[11px]",
-                    isActive
-                      ? "border-white/60 text-white/90"
-                      : "border-zinc-300 text-zinc-700"
+                    isActive ? "border-white/60 text-white/90" : "border-zinc-300 text-zinc-700"
                   )}
                 >
                   Pro

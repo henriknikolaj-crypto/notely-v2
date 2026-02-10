@@ -1,507 +1,489 @@
-﻿// app/api/trainer/upload/route.ts
-import "server-only";
+﻿import "server-only";
 
-import { NextRequest } from "next/server";
-import { requireUser } from "@/lib/auth";
-import { randomUUID } from "node:crypto";
+import { NextRequest, NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { createClient } from "@supabase/supabase-js";
+import { createServerClient } from "@supabase/ssr";
+import { createHash, randomUUID } from "node:crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const TRAINER_BUCKET = "trainer_uploads";
+// Hold denne i sync med DELETE-route (din /api/files/[id] bruger trainer_uploads)
+const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "trainer_uploads";
+const MAX_FILE_BYTES = 30 * 1024 * 1024; // hård beskyttelse (ikke quota)
 
-// Chunking
-const CHUNK_LEN = 1800;
-
-// Per-plan hard limits (beskytter systemet)
-const PLAN_HARD_LIMITS: Record<
-  string,
-  { maxBytes: number; maxPdfPages: number; maxChunks: number }
-> = {
-  freemium: { maxBytes: 10 * 1024 * 1024, maxPdfPages: 60, maxChunks: 120 },
-  basis: { maxBytes: 20 * 1024 * 1024, maxPdfPages: 120, maxChunks: 260 },
-  pro: { maxBytes: 30 * 1024 * 1024, maxPdfPages: 200, maxChunks: 520 },
-};
-
-function limitsForPlan(planRaw: string | null | undefined) {
-  const plan = (planRaw ?? "freemium").toLowerCase();
-  return PLAN_HARD_LIMITS[plan] ?? PLAN_HARD_LIMITS.freemium;
-}
-
-type QuotaResult = {
-  plan: string;
-  usedThisMonth: number;
-  monthlyLimit: number;
-  monthStart: string;
-  monthEnd: string;
-  resetAt: string;
-  blocked: boolean;
-};
-
-function getMonthBoundsUTC(now = new Date()) {
-  const y = now.getUTCFullYear();
-  const m = now.getUTCMonth();
-
-  const start = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
-  const resetAt = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0));
-  const monthEnd = new Date(resetAt.getTime() - 1);
-
+function errInfo(e: any) {
+  if (!e) return { message: "Unknown error" };
+  if (typeof e === "string") return { message: e };
+  if (e instanceof Error) return { message: e.message, stack: e.stack };
   return {
-    monthStart: start.toISOString(),
-    resetAt: resetAt.toISOString(),
-    monthEnd: monthEnd.toISOString(),
+    message: e.message ?? e.error_description ?? e.error ?? e.msg ?? "Unknown error",
+    code: e.code,
+    details: e.details,
+    hint: e.hint,
+    status: e.status,
   };
 }
 
-async function getUserPlan(sb: any, ownerId: string): Promise<string> {
-  const { data, error } = await sb
-    .from("profiles")
-    .select("plan")
-    .eq("id", ownerId)
-    .maybeSingle();
-
-  if (!error && data?.plan) return String(data.plan);
-  return "freemium";
+function stripPathy(name: string) {
+  const n = String(name ?? "").trim();
+  const base = n.split(/[\\/]/g).pop() || n || "upload.pdf";
+  return base.replace(/[\u0000-\u001F]/g, "").slice(0, 180) || "upload.pdf";
 }
 
-async function getMonthlyLimit(sb: any, plan: string, feature: string): Promise<number | null> {
-  const { data, error } = await sb
-    .from("plan_limits")
-    .select("monthly_limit")
-    .eq("plan", plan)
-    .eq("feature", feature)
-    .maybeSingle();
-
-  if (error) return null;
-  const n = (data as any)?.monthly_limit;
-  return typeof n === "number" ? n : null;
+function formatDa(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat("da-DK", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
 }
 
-async function countMonthlyUsage(
-  sb: any,
-  ownerId: string,
-  monthStart: string,
-  resetAt: string,
-): Promise<number> {
-  const tsCols = ["queued_at", "created_at", "inserted_at"] as const;
-  let lastErr: any = null;
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
 
-  for (const tsCol of tsCols) {
-    const r = await sb
-      .from("jobs")
-      .select("id", { count: "exact", head: true })
-      .eq("owner_id", ownerId)
-      .eq("kind", "import")
-      .eq("status", "succeeded")
-      .gte(tsCol, monthStart)
-      .lt(tsCol, resetAt);
+async function getOwnerId(req: NextRequest): Promise<{ ownerId: string; isDev: boolean }> {
+  const devHeader = (req.headers.get("x-dev-secret") || "").trim();
+  const devSecret =
+    (process.env.NOTELY_DEV_SECRET || process.env.X_DEV_SECRET || process.env.DEV_BYPASS_SECRET || "").trim();
+  const devUserId = (process.env.DEV_USER_ID || "").trim();
 
-    if (!r.error) {
-      const c = r.count;
-      return typeof c === "number" && Number.isFinite(c) ? c : 0;
-    }
-    lastErr = r.error;
+  if (devHeader && devSecret && devUserId && devHeader === devSecret) {
+    return { ownerId: devUserId, isDev: true };
   }
 
-  throw lastErr ?? new Error("countMonthlyUsage failed");
-}
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+  if (!url || !anon) return { ownerId: "", isDev: false };
 
-async function assertImportQuota(sb: any, ownerId: string): Promise<QuotaResult> {
-  const plan = await getUserPlan(sb, ownerId);
-  const monthlyLimit = await getMonthlyLimit(sb, plan, "import");
-
-  if (!monthlyLimit || monthlyLimit <= 0) {
-    throw new Error(`PLAN_LIMITS_MISSING(import) for plan=${plan}`);
-  }
-
-  const { monthStart, resetAt, monthEnd } = getMonthBoundsUTC(new Date());
-  const usedThisMonth = await countMonthlyUsage(sb, ownerId, monthStart, resetAt);
-
-  return {
-    plan,
-    usedThisMonth,
-    monthlyLimit,
-    monthStart,
-    monthEnd,
-    resetAt,
-    blocked: usedThisMonth >= monthlyLimit,
-  };
-}
-
-/** pdfjs-dist loader – dynamisk import + cache. */
-let cachedPdfJs: any = null;
-async function getPdfJs(): Promise<any> {
-  if (cachedPdfJs) return cachedPdfJs;
-  const mod: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  cachedPdfJs = mod;
-  return mod;
-}
-
-async function loadPdf(buffer: Buffer) {
-  const mod = await getPdfJs();
-  const pdfjsLib: any =
-    mod && typeof mod.getDocument === "function"
-      ? mod
-      : mod?.default && typeof mod.default.getDocument === "function"
-        ? mod.default
-        : null;
-
-  if (!pdfjsLib) throw new Error("pdfjs-dist getDocument ikke fundet (server-konfiguration).");
-
-  const data = new Uint8Array(buffer);
-  const loadingTask = pdfjsLib.getDocument({
-    data,
-    useWorkerFetch: false,
-    useSystemFonts: false,
-    isEvalSupported: false,
+  const cookieStore = await cookies();
+  const sb = createServerClient(url, anon, {
+    cookies: {
+      getAll() {
+        return cookieStore.getAll();
+      },
+      setAll(cookiesToSet) {
+        for (const c of cookiesToSet) cookieStore.set(c.name, c.value, c.options);
+      },
+    },
   });
 
-  return loadingTask.promise;
+  const { data, error } = await sb.auth.getUser();
+  if (error || !data?.user?.id) return { ownerId: "", isDev: false };
+  return { ownerId: data.user.id, isDev: false };
 }
 
-async function extractTextFromPdf(opts: {
-  buffer: Buffer;
-  maxPages: number;
-}): Promise<{ text: string; pageCount: number }> {
-  const { buffer, maxPages } = opts;
+async function getPlan(admin: any, ownerId: string): Promise<string> {
+  try {
+    const r = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+    const p = String((r.data as any)?.plan ?? "").trim();
+    return p || "freemium";
+  } catch {
+    return "freemium";
+  }
+}
 
-  const pdf = await loadPdf(buffer);
-  const pageCount = Number(pdf.numPages ?? 0);
+async function tryInsertFile(admin: any, rows: any[]) {
+  let lastErr: any = null;
+  for (const obj of rows) {
+    const r = await admin.from("files").insert(obj).select("id").maybeSingle();
+    if (!r.error) return { ok: true as const, id: (r.data as any)?.id ?? obj.id };
+    lastErr = r.error;
+  }
+  return { ok: false as const, error: lastErr };
+}
 
-  if (pageCount <= 0) return { text: "[PDF-tekstfejl: Kunne ikke læse sider i PDF.]", pageCount: 0 };
+// pdfjs-dist extractor (samme “familie” som rebuild-chunks)
+async function extractPdfPagesText(buf: Buffer): Promise<{ pages: number; pageTexts: string[] }> {
+  // ✅ ESM-safe import (ingen require)
+  const mod: any = await import("pdfjs-dist/legacy/build/pdf.js");
+  const pdfjs: any = mod?.default ?? mod;
 
-  let fullText = "";
-  const pagesToRead = Math.min(pageCount, maxPages);
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(buf),
+    disableWorker: true, // node-friendly
+  });
 
-  for (let pageNum = 1; pageNum <= pagesToRead; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-    const strings = (content.items as any[])
-      .map((item) => (typeof item?.str === "string" ? item.str : ""))
-      .filter(Boolean);
-    fullText += strings.join(" ") + "\n\n";
+  const pdf = await loadingTask.promise;
+
+  const pages = Number(pdf?.numPages ?? 0) || 0;
+  const pageTexts: string[] = [];
+
+  for (let p = 1; p <= pages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    const items = Array.isArray(tc?.items) ? tc.items : [];
+    const s = items
+      .map((it: any) => (typeof it?.str === "string" ? it.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    pageTexts.push(s);
   }
 
-  const cleaned = fullText
-    .replace(/\u0000/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  return {
-    text: cleaned || "[PDF-tekstfejl: Ingen tekst fundet i PDF.]",
-    pageCount,
-  };
+  return { pages, pageTexts };
 }
 
-function splitIntoChunks(text: string, maxLen = CHUNK_LEN): string[] {
-  if (!text.trim()) return [];
-  const parts = text
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean);
+async function rebuildDocChunksForFile(
+  admin: any,
+  args: {
+    ownerId: string;
+    fileId: string;
+    folderId: string;
+    originalName: string;
+    pageTexts: string[];
+  },
+) {
+  const { ownerId, fileId, folderId, originalName, pageTexts } = args;
 
-  const chunks: string[] = [];
-  let current = "";
-
-  for (const part of parts) {
-    const next = current ? `${current}\n\n${part}` : part;
-
-    if (next.length > maxLen) {
-      if (current) chunks.push(current);
-
-      if (part.length > maxLen) {
-        for (let i = 0; i < part.length; i += maxLen) chunks.push(part.slice(i, i + maxLen));
-        current = "";
-      } else {
-        current = part;
-      }
-    } else {
-      current = next;
-    }
+  // ryd først (idempotent)
+  {
+    const del = await admin.from("doc_chunks").delete().eq("owner_id", ownerId).eq("file_id", fileId);
+    if (del.error) throw del.error;
   }
 
-  if (current) chunks.push(current);
-  return chunks;
-}
-
-async function insertDocChunks(opts: {
-  sb: any;
-  ownerId: string;
-  folderId: string | null;
-  fileId: string;
-  chunks: string[];
-}) {
-  const { sb, ownerId, folderId, fileId, chunks } = opts;
-  if (!chunks.length) return;
-
-  const rows = chunks.map((content) => ({
+  // lav 1 chunk pr side (matcher dine counts 12/7/6 osv.)
+  const base = pageTexts.map((text, idx) => ({
+    id: randomUUID(),
     owner_id: ownerId,
-    folder_id: folderId,
     file_id: fileId,
-    content,
-    source_type: "trainer_upload",
-    academic_weight: 0,
+    folder_id: folderId,
+    chunk_index: idx,
+    page: idx + 1,
+    content: text || "",
+    source_title: originalName,
+    source_url: null,
   }));
 
-  const { error } = await sb.from("doc_chunks").insert(rows);
-  if (error) console.error("[trainer/upload] doc_chunks insert error:", error);
-}
+  // prøv nogle skema-variationer (så vi ikke “overskriver” andre installationer)
+  const variants: any[][] = [
+    base.map((r) => ({
+      id: r.id,
+      owner_id: r.owner_id,
+      file_id: r.file_id,
+      folder_id: r.folder_id,
+      chunk_index: r.chunk_index,
+      page: r.page,
+      content: r.content,
+      source_title: r.source_title,
+      source_url: r.source_url,
+    })),
+    base.map((r) => ({
+      id: r.id,
+      owner_id: r.owner_id,
+      file_id: r.file_id,
+      folder_id: r.folder_id,
+      chunk_index: r.chunk_index,
+      page: r.page,
+      text: r.content,
+      source_title: r.source_title,
+      source_url: r.source_url,
+    })),
+    base.map((r) => ({
+      id: r.id,
+      owner_id: r.owner_id,
+      file_id: r.file_id,
+      folder_id: r.folder_id,
+      idx: r.chunk_index,
+      page: r.page,
+      content: r.content,
+    })),
+    base.map((r) => ({
+      owner_id: r.owner_id,
+      file_id: r.file_id,
+      folder_id: r.folder_id,
+      content: r.content,
+    })),
+  ];
 
-export async function GET() {
-  return Response.json({ ok: true, msg: "trainer/upload route is alive" }, { status: 200 });
+  let lastErr: any = null;
+  for (const rows of variants) {
+    const ins = await admin.from("doc_chunks").insert(rows);
+    if (!ins.error) return { chunkCount: rows.length };
+    lastErr = ins.error;
+  }
+
+  throw lastErr ?? new Error("doc_chunks insert failed");
 }
 
 export async function POST(req: NextRequest) {
-  let sb: any;
-  let ownerId = "";
-  let mode: "auth" | "dev" = "auth";
+  const requestId = randomUUID();
+
+  const { ownerId } = await getOwnerId(req);
+  if (!ownerId) return NextResponse.json({ ok: false, error: "Unauthorized", requestId }, { status: 401 });
+
+  let admin: any;
+  try {
+    admin = supabaseAdmin();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Server config mangler.", requestId }, { status: 500 });
+  }
 
   try {
-    const u = await requireUser(req);
-    sb = u.sb;
-    ownerId = u.id;
-    mode = u.mode;
+    const form = await req.formData();
+
+    const folderId = String(form.get("folder_id") ?? form.get("folderId") ?? form.get("folder") ?? "").trim() || null;
+    const file = form.get("file") as unknown as File | null;
+
+    if (!folderId) return NextResponse.json({ ok: false, error: "Manglende folder_id.", requestId }, { status: 400 });
+    if (!file) return NextResponse.json({ ok: false, error: "Manglende fil.", requestId }, { status: 400 });
+
+    if ((file as any).size != null && Number((file as any).size) > MAX_FILE_BYTES) {
+      return NextResponse.json(
+        { ok: false, error: `Filen er for stor (maks ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB).`, requestId },
+        { status: 413 },
+      );
+    }
+
+    // folder ownership (samme tabel som /api/folders typisk bruger)
+    const { data: folderRow, error: folderErr } = await admin
+      .from("folders")
+      .select("id")
+      .eq("owner_id", ownerId)
+      .eq("id", folderId)
+      .maybeSingle();
+
+    if (folderErr) console.error("[trainer/upload] folder lookup error:", errInfo(folderErr));
+    if (!folderRow)
+      return NextResponse.json({ ok: false, error: "Ugyldig mappe (folder_id).", requestId }, { status: 400 });
+
+    const originalName = stripPathy(file.name || "upload.pdf");
+    const mimeType = String((file as any).type || "application/pdf") || "application/pdf";
+
+    const ab = await file.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const md5 = createHash("md5").update(buf).digest("hex");
+
+    // duplicate check (før quota)
+    const { data: existing, error: existingErr } = await admin
+      .from("files")
+      .select("id")
+      .eq("owner_id", ownerId)
+      .eq("md5", md5)
+      .maybeSingle();
+
+    if (existingErr) console.error("[trainer/upload] duplicate lookup error:", errInfo(existingErr));
+    if (existing?.id) {
+      return NextResponse.json(
+        {
+          ok: false,
+          code: "DUPLICATE_FILE",
+          message: "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+          existingFileId: existing.id,
+          requestId,
+        },
+        { status: 409 },
+      );
+    }
+
+    // ✅ pdfjs-dist: side-tekster + side-tal
+    let pages = 0;
+    let pageTexts: string[] = [];
+    try {
+      const r = await extractPdfPagesText(buf);
+      pages = r.pages;
+      pageTexts = r.pageTexts;
+    } catch (e) {
+      console.error("[trainer/upload] pdfjs extract error:", errInfo(e));
+      return NextResponse.json(
+        { ok: false, code: "PDF_UNREADABLE", error: "PDF kunne ikke læses (pdfjs-dist).", requestId },
+        { status: 400 },
+      );
+    }
+
+    if (!pages || pages < 1) {
+      return NextResponse.json({ ok: false, code: "PDF_NO_PAGES", error: "PDF har ingen sider.", requestId }, { status: 400 });
+    }
+
+    // Freemium: max 10 sider pr PDF
+    const plan = await getPlan(admin, ownerId);
+    if (plan === "freemium" && pages > 10) {
+      return NextResponse.json(
+        { ok: false, code: "FILE_TOO_LONG", message: "Freemium: maks 10 sider pr PDF.", pages, requestId },
+        { status: 413 },
+      );
+    }
+
+    // ✅ quota: forbrug = sider
+    const quota = await admin.rpc("quota_try_consume", {
+      p_owner_id: ownerId,
+      p_feature: "import",
+      p_amount: pages,
+    });
+
+    if (quota.error) {
+      console.error("[trainer/upload] quota_try_consume error:", errInfo(quota.error));
+      return NextResponse.json(
+        {
+          ok: false,
+          code: "QUOTA_CHECK_FAILED",
+          message: "Kunne ikke tjekke din grænse lige nu. Prøv igen om lidt.",
+          requestId,
+        },
+        { status: 503 },
+      );
+    }
+
+    const row = Array.isArray(quota.data) ? quota.data[0] : quota.data;
+    const ok = !!row?.ok;
+
+    if (!ok) {
+      const used = Number(row?.out_used ?? 0);
+      const lim = row?.out_limit_per_month == null ? null : Number(row?.out_limit_per_month);
+      const resetAt = row?.out_reset_at ? String(row.out_reset_at) : "";
+
+      return NextResponse.json(
+        {
+          ok: false,
+          code: "QUOTA_EXCEEDED",
+          feature: "import",
+          usedThisMonth: used,
+          monthlyLimit: lim,
+          resetAt,
+          pages,
+          message: `Grænse nået. Du kan uploade igen efter nulstilling (${resetAt ? formatDa(resetAt) : "snart"}).`,
+          requestId,
+        },
+        { status: 429 },
+      );
+    }
+
+    // storage
+    const fileId = randomUUID();
+    const storagePath = `${ownerId}/${folderId}/${fileId}.pdf`;
+
+    const up = await admin.storage.from(UPLOAD_BUCKET).upload(storagePath, buf, {
+      contentType: mimeType || "application/pdf",
+      upsert: false,
+    });
+
+    if (up.error) {
+      console.error("[trainer/upload] storage upload error:", errInfo(up.error));
+      return NextResponse.json({ ok: false, error: "Kunne ikke uploade filen til storage.", requestId }, { status: 500 });
+    }
+
+    const uploadedAt = new Date().toISOString();
+
+    // insert files (robust fallback)
+    const insertAttempts = [
+      {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        original_name: originalName,
+        mime_type: mimeType,
+        size_bytes: (file as any).size ?? null,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+      },
+      {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        mime_type: mimeType,
+        size_bytes: (file as any).size ?? null,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+      },
+      {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+      },
+      {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        uploaded_at: uploadedAt,
+      },
+    ];
+
+    const ins = await tryInsertFile(admin, insertAttempts);
+    if (!ins.ok) {
+      console.error("[trainer/upload] files insert error:", errInfo(ins.error));
+
+      // rollback storage (best-effort)
+      try {
+        await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+      } catch {}
+
+      return NextResponse.json({ ok: false, error: "Kunne ikke gemme fil i databasen.", requestId }, { status: 500 });
+    }
+
+    // ✅ lav chunks nu (så du ikke ender i 0-chunks igen)
+    let chunkCount = 0;
+    try {
+      const r = await rebuildDocChunksForFile(admin, {
+        ownerId,
+        fileId,
+        folderId,
+        originalName,
+        pageTexts,
+      });
+      chunkCount = r.chunkCount;
+    } catch (e) {
+      console.error("[trainer/upload] rebuildDocChunks error:", errInfo(e));
+      return NextResponse.json(
+        { ok: false, code: "CHUNK_BUILD_FAILED", error: "Kunne ikke bygge doc_chunks (pdfjs-dist).", requestId, fileId },
+        { status: 500 },
+      );
+    }
+
+    // valgfri job-log (best-effort)
+    try {
+      await admin.from("jobs").insert({
+        id: randomUUID(),
+        owner_id: ownerId,
+        kind: "import",
+        status: "finished",
+        queued_at: uploadedAt,
+        started_at: uploadedAt,
+        finished_at: new Date().toISOString(),
+        payload: {
+          source: "trainer_upload",
+          folder_id: folderId,
+          file_id: fileId,
+          md5,
+          pages,
+          chunkCount,
+          storage_path: storagePath,
+        },
+      });
+    } catch {}
+
+    return NextResponse.json(
+      {
+        ok: true,
+        requestId,
+        fileId,
+        folderId,
+        md5,
+        pages,
+        chunkCount,
+        storage: { bucket: UPLOAD_BUCKET, path: storagePath },
+      },
+      { status: 200 },
+    );
   } catch (e: any) {
-    const msg = String(e?.message ?? "");
-    if (!msg.toLowerCase().includes("unauthorized")) console.error("[trainer/upload] requireUser crash:", e);
-    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    console.error("[trainer/upload] route error:", errInfo(e));
+    return NextResponse.json({ ok: false, error: e?.message ?? "Uventet fejl i upload.", requestId }, { status: 500 });
   }
-
-  const formData = await req.formData();
-  const file = formData.get("file");
-  const folderIdRaw = formData.get("folderId") ?? formData.get("folder_id");
-
-  if (!(file instanceof File)) {
-    return Response.json({ ok: false, error: "Ingen fil modtaget i upload." }, { status: 400 });
-  }
-
-  const folderId =
-    typeof folderIdRaw === "string" && folderIdRaw.trim().length > 0 ? folderIdRaw.trim() : null;
-
-  // 1) Quota gate
-  let quota: QuotaResult;
-  try {
-    quota = await assertImportQuota(sb, ownerId);
-  } catch (e: any) {
-    console.error("[trainer/upload] quota check failed:", e);
-    const msg = String(e?.message ?? e);
-    const isMissing = msg.includes("PLAN_LIMITS_MISSING");
-    return Response.json(
-      {
-        ok: false,
-        code: isMissing ? "PLAN_LIMITS_MISSING" : "QUOTA_CHECK_FAILED",
-        message: isMissing
-          ? "Plan limits for upload mangler. Tjek plan_limits-tabellen."
-          : "Kunne ikke validere din månedlige upload-kvote. Prøv igen.",
-      },
-      { status: 500 },
-    );
-  }
-
-  if (quota.blocked) {
-    return Response.json(
-      {
-        ok: false,
-        code: "QUOTA_EXCEEDED",
-        message: "Du har nået din månedlige upload-kvote.",
-        plan: quota.plan,
-        usedThisMonth: quota.usedThisMonth,
-        monthlyLimit: quota.monthlyLimit,
-        monthStart: quota.monthStart,
-        monthEnd: quota.monthEnd,
-        resetAt: quota.resetAt,
-      },
-      { status: 402 },
-    );
-  }
-
-  // 2) Hard limits
-  const hard = limitsForPlan(quota.plan);
-  const maxBytes = hard.maxBytes;
-  const maxPages = hard.maxPdfPages;
-  const maxChunks = hard.maxChunks;
-
-  const isPdf =
-    (file.type || "").toLowerCase().includes("pdf") || (file.name || "").toLowerCase().endsWith(".pdf");
-
-  if (!isPdf) {
-    return Response.json(
-      { ok: false, code: "UNSUPPORTED_FILE_TYPE", message: "Kun PDF-filer er understøttet lige nu." },
-      { status: 415 },
-    );
-  }
-
-  const sizeBytes = typeof file.size === "number" ? file.size : 0;
-  if (sizeBytes > maxBytes) {
-    return Response.json(
-      {
-        ok: false,
-        code: "FILE_TOO_LARGE",
-        message: `Filen er for stor til din plan (${quota.plan}). Maks ${Math.floor(maxBytes / (1024 * 1024))} MB pr. fil.`,
-        limit: { maxBytes, maxMb: Math.floor(maxBytes / (1024 * 1024)) },
-        file: { name: file.name, sizeBytes },
-      },
-      { status: 413 },
-    );
-  }
-
-  const safeName = file.name || "upload.pdf";
-  const buffer = Buffer.from(await file.arrayBuffer());
-
-  // 3) Page count
-  let pageCount = 0;
-  try {
-    const pdf = await loadPdf(buffer);
-    pageCount = Number(pdf.numPages ?? 0);
-  } catch (e: any) {
-    return Response.json(
-      {
-        ok: false,
-        code: "PDF_READ_FAILED",
-        message: "Vi kunne ikke læse PDF’en. Prøv at gemme den igen som PDF og upload på ny.",
-        details: String(e?.message ?? e),
-      },
-      { status: 400 },
-    );
-  }
-
-  if (pageCount > maxPages) {
-    return Response.json(
-      {
-        ok: false,
-        code: "PDF_TOO_MANY_PAGES",
-        message: `PDF’en er for lang (${pageCount} sider). Maks ${maxPages} sider pr. fil på din plan (${quota.plan}). Del den op og upload igen.`,
-        limit: { maxPages },
-        file: { name: safeName, pageCount },
-      },
-      { status: 413 },
-    );
-  }
-
-  // 4) Extract + chunk
-  let extractedText = "";
-  try {
-    const r = await extractTextFromPdf({ buffer, maxPages });
-    extractedText = r.text;
-  } catch (e: any) {
-    return Response.json(
-      {
-        ok: false,
-        code: "PDF_TEXT_EXTRACT_FAILED",
-        message: "Vi kunne ikke udtrække tekst fra PDF’en. Hvis den er scannet, prøv en tekst-baseret PDF.",
-        details: String(e?.message ?? e),
-      },
-      { status: 400 },
-    );
-  }
-
-  const chunks = splitIntoChunks(extractedText, CHUNK_LEN);
-  if (chunks.length > maxChunks) {
-    return Response.json(
-      {
-        ok: false,
-        code: "TOO_MANY_CHUNKS",
-        message: `Filen indeholder meget tekst og bliver for stor at gøre klar (${chunks.length} dele). Del filen op og upload igen.`,
-        limit: { maxChunks, chunkLen: CHUNK_LEN },
-        file: { name: safeName, pageCount, chunkCount: chunks.length },
-      },
-      { status: 413 },
-    );
-  }
-
-  // 5) Storage
-  const fileId = randomUUID();
-  const storagePath = `${ownerId}/${fileId}/${safeName}`;
-
-  const { error: storageError } = await sb.storage.from(TRAINER_BUCKET).upload(storagePath, buffer, {
-    contentType: file.type || "application/pdf",
-    upsert: false,
-  });
-
-  if (storageError) {
-    console.error("[trainer/upload] storage upload error:", storageError);
-    return Response.json(
-      { ok: false, code: "STORAGE_UPLOAD_FAILED", message: "Kunne ikke uploade filen. Tjek bucket + adgang." },
-      { status: 500 },
-    );
-  }
-
-  // 6) files row
-  const { data: fileRow, error: filesError } = await sb
-    .from("files")
-    .insert({
-      id: fileId,
-      owner_id: ownerId,
-      folder_id: folderId,
-      name: safeName,
-      original_name: safeName,
-      storage_path: storagePath,
-      uploaded_at: new Date().toISOString(),
-      size_bytes: buffer.length,
-    })
-    .select()
-    .single();
-
-  if (filesError) {
-    console.error("[trainer/upload] files insert error:", filesError);
-    await sb.storage.from(TRAINER_BUCKET).remove([storagePath]); // best effort cleanup
-    return Response.json(
-      { ok: false, code: "FILES_INSERT_FAILED", message: "Kunne ikke gemme fil-metadata." },
-      { status: 500 },
-    );
-  }
-
-  // 7) doc_chunks
-  await insertDocChunks({ sb, ownerId, folderId, fileId, chunks });
-
-  // 8) jobs “succeeded”
-  const { error: jobErr } = await sb.from("jobs").insert({
-    owner_id: ownerId,
-    kind: "import",
-    status: "succeeded",
-    queued_at: new Date().toISOString(),
-    payload: {
-      source: "trainer/upload",
-      fileId,
-      storagePath,
-      mode,
-      fileName: safeName,
-      sizeBytes: buffer.length,
-      pageCount,
-      chunkCount: chunks.length,
-    },
-  });
-
-  if (jobErr) console.error("[trainer/upload] jobs insert error:", jobErr);
-
-  return Response.json(
-    {
-      ok: true,
-      fileId,
-      file: fileRow,
-      quota: {
-        plan: quota.plan,
-        usedThisMonth: quota.usedThisMonth + 1,
-        monthlyLimit: quota.monthlyLimit,
-        monthStart: quota.monthStart,
-        monthEnd: quota.monthEnd,
-        resetAt: quota.resetAt,
-      },
-      limits: {
-        maxBytes,
-        maxPdfPages: maxPages,
-        maxChunks,
-        chunkLen: CHUNK_LEN,
-      },
-      stats: {
-        sizeBytes: buffer.length,
-        pageCount,
-        chunkCount: chunks.length,
-      },
-    },
-    { status: 200 },
-  );
 }
-

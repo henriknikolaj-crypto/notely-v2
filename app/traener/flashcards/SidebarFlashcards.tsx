@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 type SessionRow = {
@@ -43,7 +44,6 @@ function localMidnightISO() {
   return d.toISOString();
 }
 
-// Robust JSON read (undgår "Unexpected token '<'" ved HTML 404/500)
 async function readJsonSafe(res: Response) {
   const text = await res.text();
   try {
@@ -54,10 +54,17 @@ async function readJsonSafe(res: Response) {
   }
 }
 
-// Dit UI bruger scope=<folderId>
+// scope kan være "id1,id2" eller enkelt id
 function buildQs(scope: string | null, base: Record<string, string> = {}) {
   const qs = new URLSearchParams(base);
-  if (scope) qs.append("scopeFolderIds[]", scope);
+  const raw = (scope ?? "").trim();
+  if (raw) {
+    const ids = raw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    for (const id of ids) qs.append("scopeFolderIds[]", id);
+  }
   return qs.toString();
 }
 
@@ -103,6 +110,11 @@ export default function SidebarFlashcards() {
 
   const lastSessionAt = sessions[0]?.created_at ?? null;
 
+  const historyHref = React.useMemo(() => {
+    const qs = sp?.toString() ?? "";
+    return qs ? `/traener/flashcards/historik?${qs}` : "/traener/flashcards/historik";
+  }, [sp]);
+
   const refresh = React.useCallback(async () => {
     setErr(null);
     setLoading(true);
@@ -138,13 +150,16 @@ export default function SidebarFlashcards() {
     refresh();
   }, [refresh]);
 
-  // Auto-refresh når FlashcardsClient har genereret/gemt noget
   React.useEffect(() => {
     function onChanged() {
       void refresh();
     }
-    window.addEventListener("flashcards:changed", onChanged);
-    return () => window.removeEventListener("flashcards:changed", onChanged);
+    window.addEventListener("notely-quota-changed", onChanged);
+    window.addEventListener("flashcards:changed", onChanged); // legacy
+    return () => {
+      window.removeEventListener("notely-quota-changed", onChanged);
+      window.removeEventListener("flashcards:changed", onChanged);
+    };
   }, [refresh]);
 
   return (
@@ -155,10 +170,7 @@ export default function SidebarFlashcards() {
         <div className="space-y-1 text-zinc-700">
           <div>
             Dagens flashcards:{" "}
-            <span className="font-semibold">
-              {Math.min(done, goal)}
-            </span>
-            /{goal}
+            <span className="font-semibold">{Math.min(done, goal)}</span>/{goal}
           </div>
           <div>
             Seneste session:{" "}
@@ -175,19 +187,22 @@ export default function SidebarFlashcards() {
           >
             Opdatér
           </button>
-
-          {loading ? (
-            <span className="text-[11px] text-zinc-400">Henter…</span>
-          ) : null}
+          {loading ? <span className="text-[11px] text-zinc-400">Henter…</span> : null}
         </div>
 
-        {err ? (
-          <div className="mt-2 text-[11px] text-red-600">{err}</div>
-        ) : null}
+        {err ? <div className="mt-2 text-[11px] text-red-600">{err}</div> : null}
       </div>
 
       <div>
-        <div className="mb-1 font-semibold text-zinc-800">Seneste sessions</div>
+        <div className="mb-1 flex items-center justify-between">
+          <div className="font-semibold text-zinc-800">Seneste sessions</div>
+          <Link
+            href={historyHref}
+            className="text-[11px] text-zinc-500 hover:text-zinc-700"
+          >
+            Se alle
+          </Link>
+        </div>
 
         {sessions.length === 0 ? (
           <div className="text-[11px] text-zinc-400">Ingen sessions endnu.</div>

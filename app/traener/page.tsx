@@ -76,8 +76,7 @@ export default async function Page({
       <header>
         <h1 className="text-lg font-semibold text-zinc-900">Træner</h1>
         <p className="mt-1 text-sm text-zinc-600 max-w-2xl">
-          Træn eksamenslignende spørgsmål og få feedback på dine svar – på sigt
-          baseret på dit eget pensum og faglige kilder.
+          Træn eksamenslignende spørgsmål og få feedback på dine svar – baseret på dit eget pensum og faglige kilder.
         </p>
         <div className="mt-3 h-px w-full bg-zinc-200" />
       </header>

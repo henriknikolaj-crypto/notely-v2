@@ -25,55 +25,26 @@ type FileOption = {
 /**
  * Henter filer til Noter-siden.
  *
- * Hvis folderIds er tom, viser vi INGEN filer (brugeren skal vælge fag/mappe
- * i venstre side).
+ * Hvis folderIds er tom, viser vi INGEN filer (brugeren skal vælge fag/mappe i venstre side).
  *
- * Hvis der er valgt mapper, henter vi filer fra ALLE de mapper (IN),
- * baseret på doc_chunks + files.
+ * Hvis der er valgt mapper, henter vi filer fra files-tabellen (folder_id IN folderIds)
+ * og kræver samtidig at filen har doc_chunks via inner join:
+ * files -> doc_chunks (doc_chunks.file_id = files.id)
  */
-async function listFilesForScope(
-  sb: any,
-  ownerId: string,
-  folderIds: string[]
-): Promise<FileOption[]> {
-  // Ingen scope = ingen filer i dropdown
-  if (!folderIds || folderIds.length === 0) {
-    return [];
-  }
+async function listFilesForScope(sb: any, ownerId: string, folderIds: string[]): Promise<FileOption[]> {
+  if (!folderIds || folderIds.length === 0) return [];
 
-  // 1) Find alle file_id'er, der har doc_chunks i de valgte mapper
-  const dcRes = await sb
-    .from("doc_chunks")
-    .select("file_id")
-    .eq("owner_id", ownerId)
-    .in("folder_id", folderIds);
-
-  if (dcRes.error) {
-    console.error("listFilesForScope: doc_chunks error", dcRes.error);
-    return [];
-  }
-
-  const fileIds = Array.from(
-    new Set(
-      (dcRes.data ?? [])
-        .map((row: any) => row.file_id as string | null)
-        .filter(Boolean)
-    )
-  );
-
-  if (fileIds.length === 0) {
-    return [];
-  }
-
-  // 2) Slå filnavne op i files-tabellen
+  // ✅ Robust: hent direkte fra files, men kun hvis der findes mindst én doc_chunk til filen
+  // NB: doc_chunks har IKKE folder_id, så vi filtrerer på files.folder_id.
   const fRes = await sb
     .from("files")
-    .select("id, name, original_name")
-    .in("id", fileIds)
+    .select("id, name, original_name, folder_id, doc_chunks!inner(id)")
+    .eq("owner_id", ownerId)
+    .in("folder_id", folderIds)
     .order("name", { ascending: true });
 
   if (fRes.error) {
-    console.error("listFilesForScope: files error", fRes.error);
+    console.error("listFilesForScope: files+doc_chunks join error", fRes.error);
     return [];
   }
 

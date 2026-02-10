@@ -1,227 +1,166 @@
 ﻿"use client";
 
-import Link from "next/link";
-import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-type Props = {
-  feature: "import" | "evaluate";
-  upgradeHref?: string;
-  refreshMs?: number;
-};
-
-type QuotaBlock = {
-  usedThisMonth: number;
-  totalAllTime?: number;
-  limitPerMonth: number | null;
-};
-
-type QuotaResp = {
+type Status = {
   ok: boolean;
-  mode?: string;
-  plan?: "freemium" | "basis" | "pro" | string;
-  monthEnd?: string; // debug
-  resetAt?: string; // nulstilling (næste måned)
-  import?: QuotaBlock;
-  evaluate?: QuotaBlock;
-  message?: string;
-  error?: string;
+
+  plan?: string | null;
+
+  usedThisMonth?: number | null;
+  monthlyLimit?: number | null;
+
+  // fallback hvis du havde gamle feltnavne
+  used?: number | null;
+  limit?: number | null;
+  month?: { used?: number | null; limit?: number | null } | null;
+
+  resetAt?: string | null;
+  resetAtNice?: string | null;
+
+  quotaReached?: boolean | null;
+
+  filesTotal?: number | null;
+  latestFile?: { name?: string | null; uploadedAt?: string | null } | null;
+
+  error?: string | null;
 };
 
-function fmtDaDate(iso?: string) {
+function n0(v: any) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtDa(iso: string | null | undefined) {
   if (!iso) return "";
-  try {
-    return new Date(iso).toLocaleDateString("da-DK", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("da-DK", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
 }
 
-async function fetchQuota(): Promise<{ res: Response; json: QuotaResp | null }> {
-  // Primær (ny)
-  const res1 = await fetch("/api/quota/current", {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-
-  if (res1.status !== 404) {
-    const json1 = (await res1.json().catch(() => null)) as QuotaResp | null;
-    return { res: res1, json: json1 };
-  }
-
-  // Fallback (hvis du stadig har gammel route i nogle miljøer)
-  const res2 = await fetch("/api/quota-status", {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-
-  const json2 = (await res2.json().catch(() => null)) as QuotaResp | null;
-  return { res: res2, json: json2 };
-}
-
-export default function QuotaStatus({
-  feature,
-  upgradeHref = "/pricing",
-  refreshMs = 15000,
-}: Props) {
-  const pathname = usePathname();
-
-  const [data, setData] = useState<QuotaResp | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+export default function QuotaStatus() {
   const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState<Status | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const parseUsedLimit = useCallback((j: Status) => {
+    const used =
+      j.usedThisMonth ?? j.used ?? j.month?.used ?? 0;
+
+    const limit =
+      j.monthlyLimit ?? j.limit ?? j.month?.limit ?? null;
+
+    return { used: n0(used), limit: limit == null ? null : n0(limit) };
+  }, []);
 
   const load = useCallback(async () => {
+    setErr(null);
     try {
-      setErr(null);
+      const res = await fetch("/api/import-status", { method: "GET", cache: "no-store" });
 
-      const { res, json } = await fetchQuota();
+      const text = await res.text();
+      const json: any = (() => {
+        try { return text ? JSON.parse(text) : null; } catch { return null; }
+      })();
 
-      if (!res.ok || !json?.ok) {
-        setData(json);
-        setErr(
-          json?.message ||
-            json?.error ||
-            `Kunne ikke hente kvote (status ${res.status}).`,
-        );
+      if (!res.ok || !json) {
+        setStatus(null);
+        setErr(`Kunne ikke hente status (${res.status}).`);
+        return;
+      }
+      if (json.ok === false) {
+        setStatus(json);
+        setErr(String(json.error ?? "Kunne ikke hente status."));
         return;
       }
 
-      setData(json);
-    } catch (e: unknown) {
-      const msg =
-        e instanceof Error ? e.message : "Kunne ikke hente kvote (ukendt fejl).";
-      setErr(msg);
+      setStatus(json);
+    } catch {
+      setStatus(null);
+      setErr("Kunne ikke hente status.");
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    let alive = true;
-
-    const run = async () => {
-      if (!alive) return;
-      await load();
-    };
-
-    void run();
-
-    const intervalMs = Math.max(5000, Number(refreshMs || 0));
-    const t = intervalMs > 0 ? setInterval(() => void run(), intervalMs) : null;
-
+    void load();
+    const t = setInterval(() => void load(), 5000);
+    const onEvt = () => void load();
+    window.addEventListener("notely:import-status-refresh", onEvt);
+    window.addEventListener("notely-quota-changed", onEvt);
     return () => {
-      alive = false;
-      if (t) clearInterval(t);
+      clearInterval(t);
+      window.removeEventListener("notely:import-status-refresh", onEvt);
+      window.removeEventListener("notely-quota-changed", onEvt);
     };
-  }, [load, refreshMs, feature]);
+  }, [load]);
 
-  // Upload-siden har allerede ImportStatusBox (kvote + filer + seneste),
-  // så vi skjuler import-kortet her for at undgå dobbelt UI.
-  const hideOnUploadPage =
-    feature === "import" && (pathname ?? "").includes("/traener/upload");
-
-  const planLabel = useMemo(() => {
-    const p = (data?.plan ?? "freemium").toLowerCase();
-    if (p === "pro") return "Pro";
-    if (p === "basis") return "Basis";
-    return "Freemium";
-  }, [data?.plan]);
-
-  const block = feature === "import" ? data?.import : data?.evaluate;
-  const used = Number(block?.usedThisMonth ?? 0);
-  const limit = typeof block?.limitPerMonth === "number" ? block.limitPerMonth : null;
+  const { used, limit } = useMemo(() => parseUsedLimit(status ?? { ok: false }), [status, parseUsedLimit]);
 
   const pct = useMemo(() => {
     if (!limit || limit <= 0) return 0;
-    return Math.min(100, Math.round((used / limit) * 100));
+    return Math.max(0, Math.min(100, Math.round((used / limit) * 100)));
   }, [used, limit]);
 
-  const title =
-    feature === "import"
-      ? `Din månedlige upload-kvote (${planLabel})`
-      : `Din månedlige evaluering-kvote (${planLabel})`;
+  const plan = (status?.plan ?? "Freemium").toString();
+  const resetNice = status?.resetAtNice ?? (status?.resetAt ? fmtDa(status.resetAt) : "");
 
-  const subtitle =
-    feature === "import"
-      ? "Gælder materiale der gøres klar til brug i Træner, Noter og Multiple Choice."
-      : "Træner-evalueringer (skriftlig feedback). Hver vurdering tæller som én evaluering.";
+  const quotaReached =
+    typeof status?.quotaReached === "boolean"
+      ? status!.quotaReached
+      : (limit != null && limit > 0 ? used >= limit : false);
 
-  const resetLabel =
-    data?.resetAt ? fmtDaDate(data.resetAt) : data?.monthEnd ? fmtDaDate(data.monthEnd) : "";
-
-  const metricLabel =
-    feature === "import" ? "Materiale gjort klar denne måned" : "Evalueringer denne måned";
-
-  const showUpgrade = (data?.plan ?? "freemium").toLowerCase() !== "pro";
-
-  if (hideOnUploadPage) return null;
-
-  if (loading) {
-    return (
-      <section className="rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm">
-        <div className="text-sm font-semibold">{title}</div>
-        <div className="mt-2 text-xs text-zinc-500">Henter kvote…</div>
-      </section>
-    );
-  }
+  const latestName = status?.latestFile?.name ?? null;
+  const latestAt = status?.latestFile?.uploadedAt ?? null;
+  const filesTotal = status?.filesTotal ?? 0;
 
   return (
-    <section className="rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="text-sm font-semibold">{title}</div>
-          <p className="mt-1 text-xs text-zinc-600">{subtitle}</p>
-          {resetLabel ? (
-            <p className="mt-2 text-[11px] text-zinc-500">
-              Nulstilles omkring {resetLabel}.
-            </p>
-          ) : null}
-        </div>
+    <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+      <div className="text-sm font-semibold text-zinc-900">Plan: {plan}</div>
 
-        {showUpgrade ? (
-          <Link
-            href={upgradeHref}
-            className="inline-flex items-center rounded-full bg-black px-4 py-2 text-xs font-semibold text-white hover:opacity-90"
-          >
-            Opgrader nu
-          </Link>
-        ) : null}
+      <div className="mt-4 text-sm font-semibold text-zinc-900">Materiale gjort klar denne måned</div>
+
+      <div className="mt-1 flex items-center justify-between text-sm text-zinc-700">
+        <div />
+        <div className="font-medium">
+          {limit != null ? `${used} / ${limit}` : `${used}`}
+        </div>
       </div>
 
-      {err ? (
-        <p className="mt-3 text-xs font-medium text-red-600">{err}</p>
-      ) : (
-        <>
-          <div className="mt-4 flex items-center justify-between text-xs text-zinc-600">
-            <span>{metricLabel}</span>
-            {limit ? <span>{used} / {limit}</span> : <span>{used}</span>}
-          </div>
+      <div className="mt-2 h-2 w-full rounded-full bg-zinc-100">
+        <div className="h-2 rounded-full bg-zinc-900" style={{ width: `${pct}%` }} />
+      </div>
 
-          {limit ? (
-            <div className="mt-2 h-2 w-full rounded-full bg-zinc-100">
-              <div className="h-2 rounded-full bg-black" style={{ width: `${pct}%` }} />
-            </div>
-          ) : null}
+      {resetNice ? <div className="mt-2 text-xs text-zinc-500">Nulstilles: {resetNice}</div> : null}
 
-          {limit && used >= limit ? (
-            <p className="mt-3 text-xs font-medium text-red-600">
-              Du har nået din {feature === "import" ? "upload" : "evaluering"}-grænse:{" "}
-              {used}/{limit} denne måned.
-              {resetLabel ? ` Nulstilles omkring ${resetLabel}.` : ""}
-            </p>
-          ) : null}
+      {quotaReached ? (
+        <div className="mt-4 rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-800">
+          Grænse nået. Du kan uploade igen efter nulstilling ({resetNice || "snart"}).
+        </div>
+      ) : null}
 
-          {limit && used < limit ? (
-            <p className="mt-2 text-[11px] text-zinc-500">{pct}% brugt</p>
-          ) : null}
-        </>
-      )}
-    </section>
+      <div className="mt-4 rounded-xl border border-zinc-200 bg-white px-4 py-3">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold text-zinc-900">Filer i alt</div>
+          <div className="text-sm font-semibold text-zinc-900">{n0(filesTotal)}</div>
+        </div>
+        <div className="mt-1 text-xs text-zinc-600">
+          {latestName ? (
+            <>Senest: {latestName}{latestAt ? ` · ${fmtDa(latestAt)}` : ""}</>
+          ) : (
+            <>Ingen filer endnu.</>
+          )}
+        </div>
+      </div>
+
+      {loading ? null : err ? <div className="mt-3 text-xs text-red-600">{err}</div> : null}
+    </div>
   );
 }

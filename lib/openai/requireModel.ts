@@ -7,12 +7,17 @@ export function requireFlowModel(flow: NotelyFlow): string {
     flow === "trainer"
       ? "OPENAI_MODEL_TRAINER"
       : flow === "simulator"
-      ? "OPENAI_MODEL_SIMULATOR"
-      : "OPENAI_MODEL_ORAL";
+        ? "OPENAI_MODEL_SIMULATOR"
+        : "OPENAI_MODEL_ORAL";
 
-  const value = process.env[key];
-  if (!value || !value.trim()) {
-    throw new Error(`Missing ${key} (required for ${flow})`);
-  }
-  return value.trim();
+  const primary = (process.env[key] ?? "").trim();
+  if (primary) return primary;
+
+  // Fallback (så dev ikke dør, hvis en flow-variabel mangler)
+  const fallback = (process.env.OPENAI_MODEL ?? "").trim();
+  if (fallback) return fallback;
+
+  throw new Error(
+    `Missing ${key} (required for ${flow}). Also missing OPENAI_MODEL fallback.`,
+  );
 }
