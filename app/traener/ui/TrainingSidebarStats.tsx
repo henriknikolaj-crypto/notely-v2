@@ -309,11 +309,15 @@ export default function TrainingSidebarStats({
 
   // --- EKSAMEN (Skrift + Mundtlig) ---
   if (pathname.startsWith("/traener/simulator") || pathname.startsWith("/traener/mundtlig")) {
+    const examMode: "skrift" | "mundtlig" = pathname.startsWith("/traener/mundtlig")
+      ? "mundtlig"
+      : "skrift";
+
     return (
       <div className="mt-4 space-y-4 px-2 text-[12px]">
         <div>
           <div className="mb-1 font-semibold text-zinc-800">Eksamen</div>
-          <SidebarExamInfo />
+          <SidebarExamInfo mode={examMode} />
         </div>
 
         <SidebarQuotaBox />

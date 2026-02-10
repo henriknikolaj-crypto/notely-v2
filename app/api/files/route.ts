@@ -152,7 +152,7 @@ export async function GET(req: NextRequest) {
         storage_path: asStr(t.storage_path),
         created_at: created,
         uploaded_at: uploaded ?? created,
-        source_table: "training_files",
+        source_table: "training_files" as const,
       };
     }),
 
@@ -171,7 +171,7 @@ export async function GET(req: NextRequest) {
         storage_path: asStr(f.storage_path),
         created_at: created,
         uploaded_at: uploaded ?? created,
-        source_table: "files",
+        source_table: "files" as const,
       };
     }),
   ];

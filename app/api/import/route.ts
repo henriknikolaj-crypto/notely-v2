@@ -45,7 +45,7 @@ type ImportPayload = {
     | null;
 };
 
-type SB = ReturnType<typeof createClient>;
+type SB = any;
 
 function ok(data: unknown, status = 200) {
   return NextResponse.json(data, { status });
@@ -120,7 +120,7 @@ async function resolveOwnerId(sb: SB, userEmail?: string): Promise<string | null
 }
 
 async function safeJobUpdate(sb: SB, jobId: string, patch: Record<string, unknown>) {
-  const r1 = await sb.from("jobs").update(patch).eq("id", jobId);
+  const r1 = await (sb.from("jobs") as any).update(patch).eq("id", jobId);
   if (!r1.error) return;
 
   const msg = String((r1.error as any)?.message ?? "");
@@ -129,7 +129,7 @@ async function safeJobUpdate(sb: SB, jobId: string, patch: Record<string, unknow
   if (msg.includes('column "started_at"') && "started_at" in retryPatch) delete retryPatch.started_at;
   if (msg.includes('column "finished_at"') && "finished_at" in retryPatch) delete retryPatch.finished_at;
 
-  await sb.from("jobs").update(retryPatch).eq("id", jobId);
+  await (sb.from("jobs") as any).update(retryPatch).eq("id", jobId);
 }
 
 export async function GET() {

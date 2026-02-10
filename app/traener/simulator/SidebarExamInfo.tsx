@@ -39,13 +39,12 @@ function labelForItem(s: Item): string {
   return "Valgte mapper";
 }
 
-export default function SidebarExamInfo() {
+export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | "mundtlig" }) {
   const pathname = usePathname() || "";
   const sp = useSearchParams();
 
-  const mode: "skrift" | "mundtlig" = pathname.startsWith("/traener/mundtlig")
-    ? "mundtlig"
-    : "skrift";
+  const mode: "skrift" | "mundtlig" =
+    modeProp ?? (pathname.startsWith("/traener/mundtlig") ? "mundtlig" : "skrift");
 
   const qs = useMemo(() => (sp ? sp.toString() : ""), [sp]);
   const withQS = (href: string) => (qs ? `${href}?${qs}` : href);
