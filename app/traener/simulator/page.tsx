@@ -1,6 +1,7 @@
 import "server-only";
 
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ClientWrittenExam from "./ClientWrittenExam";
 
@@ -37,6 +38,7 @@ function buildHref(
   const params = new URLSearchParams();
 
   for (const [k, v] of Object.entries(sp)) {
+    if (k === "mode") continue;
     if (typeof v === "string" && v.trim()) params.set(k, v);
     else if (Array.isArray(v) && v.length) params.set(k, v.join(","));
   }
@@ -47,6 +49,30 @@ function buildHref(
   return qs ? `${basePath}?${qs}` : basePath;
 }
 
+function normalizeIds(ids: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of ids) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function compactFolderLabel(folderIds: string[], folderMap: Map<string, string>): string | null {
+  const ids = normalizeIds(folderIds);
+  if (ids.length === 0) return null;
+
+  const names = ids.map((id) => folderMap.get(id)).filter((x): x is string => !!x);
+  if (names.length === 0) return null;
+  const first = names[0];
+  const extra = ids.length - 1;
+  return extra > 0 ? `${first} +${extra}` : first;
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -55,7 +81,7 @@ export default async function Page({
   const sp = (await searchParams) ?? {};
 
   const modeRaw = pickString(sp, "mode").toLowerCase();
-  const mode: "skrift" | "mundtlig" = modeRaw === "mundtlig" ? "mundtlig" : "skrift";
+  const isMundtlig = modeRaw === "mundtlig";
 
   const activeFolderId = pickString(sp, "folder") || null;
 
@@ -64,6 +90,14 @@ export default async function Page({
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  const hrefSkrift = buildHref("/traener/simulator", sp, {});
+  const hrefMundtlig = buildHref("/traener/mundtlig", sp, {});
+
+  // Hvis nogen rammer den gamle “mundtlig” variant på simulator-siden → send dem til den rigtige side
+  if (isMundtlig) {
+    redirect(hrefMundtlig);
+  }
 
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
@@ -76,16 +110,27 @@ export default async function Page({
     );
   }
 
-  const scopeLabel = (() => {
-    if (scopeIds.length > 1) return `Eksamen vil bruge ${scopeIds.length} valgte mapper som grundlag.`;
-    if (scopeIds.length === 1) return "Eksamen vil bruge 1 valgt mappe som grundlag.";
-    if (activeFolderId) return "Eksamen vil tage udgangspunkt i den mappe du har valgt i venstre side.";
-    return "Vælg mapper i venstre side for at bestemme hvad eksamensforløbet skal dække.";
-  })();
+  // ✅ Byg “Samfund +1” label ud fra scope/folder
+  const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);
+  const folderMap = new Map<string, string>();
 
-  const basePath = "/traener/simulator";
-  const hrefSkrift = buildHref(basePath, sp, { mode: "skrift" });
-  const hrefMundtlig = buildHref(basePath, sp, { mode: "mundtlig" });
+  if (trainingFolderIds.length > 0) {
+    const fr = await sb
+      .from("folders")
+      .select("id, name")
+      .eq("owner_id", ownerId)
+      .in("id", trainingFolderIds);
+
+    if (!fr.error && Array.isArray(fr.data)) {
+      for (const f of fr.data as any[]) {
+        if (f?.id && f?.name) folderMap.set(String(f.id), String(f.name));
+      }
+    }
+  }
+
+  const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
+
+  const scopeHelp = "Hele pensum";
 
   return (
     <main>
@@ -98,50 +143,37 @@ export default async function Page({
       </header>
 
       <section className="mt-2 space-y-4">
-        {/* ✅ Skrift/Mundtlig toggle (grå, sort tekst) */}
+        {/* ✅ Skrift/Mundtlig toggle */}
         <div className="inline-flex overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
-  <Link
-    href={hrefSkrift}
-    className={cx(
-      "px-4 py-2 text-sm text-zinc-900",
-      mode === "skrift" ? "bg-zinc-200 text-zinc-900" : "bg-white text-zinc-900 hover:bg-zinc-50"
-    )}
-  >
-    Skrift
-  </Link>
+          <Link
+            href={hrefSkrift}
+            className={cx("px-4 py-2 text-sm text-zinc-900", "bg-zinc-200 text-zinc-900")}
+          >
+            Skrift
+          </Link>
 
-  <Link
-    href={hrefMundtlig}
-    className={cx(
-      "border-l border-zinc-200 px-4 py-2 text-sm text-zinc-900",
-      mode === "mundtlig" ? "bg-zinc-200" : "bg-white hover:opacity-90",
-    )}
-  >
-    Mundtlig
-  </Link>
-</div>
+          <Link
+            href={hrefMundtlig}
+            className={cx(
+              "border-l border-zinc-200 px-4 py-2 text-sm text-zinc-900",
+              "bg-white text-zinc-900 hover:bg-zinc-50",
+            )}
+          >
+            Mundtlig
+          </Link>
+        </div>
 
-        {mode === "mundtlig" ? (
-          <>
-            <p className="text-sm text-zinc-600">Mundtlig eksamen er på vej. (V1: fokus på Skrift)</p>
-            <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-              <h2 className="mb-1 text-sm font-semibold">Mundtlig</h2>
-              <p className="text-xs text-zinc-600">Spørgsmål + svar (kommer snart)</p>
-            </section>
-          </>
-        ) : (
-          <>
-            <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-              <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
-              <p className="text-xs text-zinc-600">{scopeLabel}</p>
-              <p className="mt-1 text-[11px] text-zinc-500">
-                Vi bruger de mapper du vælger i venstre side – ligesom i Træner, Multiple Choice og Flashcards.
-              </p>
-            </section>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+          <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
 
-            <ClientWrittenExam scopeFolderIds={scopeIds} activeFolderId={activeFolderId} />
-          </>
-        )}
+          {scopeCompact ? (
+            <p className="text-xs text-zinc-600">{scopeCompact}</p>
+          ) : (
+            <p className="text-xs text-zinc-600">{scopeHelp}</p>
+          )}
+        </section>
+
+        <ClientWrittenExam scopeFolderIds={scopeIds} activeFolderId={activeFolderId} />
       </section>
     </main>
   );
