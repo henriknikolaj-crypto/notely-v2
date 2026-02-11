@@ -15,6 +15,10 @@ type Body = {
   folderId?: string | null;
   history?: Array<{ role: "assistant" | "user"; text: string }>;
   turnIndex?: number;
+  remainingSeconds?: number;
+  threadId?: string;
+  followupCount?: number;
+  lastAnswerText?: string;
 };
 
 async function readJsonBody<T>(req: NextRequest) {
@@ -38,6 +42,18 @@ function normalizeHistory(raw: unknown) {
     })
     .filter((x): x is { role: "assistant" | "user"; text: string } => !!x)
     .slice(-12);
+}
+
+function makeThreadId() {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `oral_thread_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+}
+
+function normalizeKind(raw: unknown): "followup" | "new" {
+  return String(raw ?? "").trim().toLowerCase() === "followup" ? "followup" : "new";
 }
 
 export async function POST(req: NextRequest) {
@@ -89,15 +105,26 @@ export async function POST(req: NextRequest) {
           role: "system",
           content: [
             "Du er dansk eksaminator til mundtlig eksamen.",
-            "Stil ét kort, klart spørgsmål på dansk (kun ét spørgsmål).",
+            "Du skal returnere KUN JSON: {\"kind\":\"new|followup\",\"questionText\":\"...\",\"threadId\":\"...\",\"followupCount\":0|1}.",
+            "kind='followup' bruges kun ved uklart/overfladisk svar eller manglende nøglepunkt (definition, begrundelse, eksempel, modargument, belæg).",
+            "Followup skal være meget kort (1 sætning).",
+            "kind='new' bruges når der skal videre til næste hovedspørgsmål.",
+            "Spørgsmål skal altid være på dansk og kun ét spørgsmål ad gangen.",
             "Brug kontekst fra materialet og elevens tidligere svar.",
-            "Svar KUN som JSON: {\"question\":\"...\"}.",
           ].join(" "),
         },
         {
           role: "user",
           content: JSON.stringify({
             turnIndex: Number.isFinite(Number(body.turnIndex)) ? Math.max(0, Math.floor(Number(body.turnIndex))) : 0,
+            remainingSeconds: Number.isFinite(Number(body.remainingSeconds))
+              ? Math.max(0, Math.floor(Number(body.remainingSeconds)))
+              : null,
+            threadId: String(body.threadId ?? "").trim() || null,
+            followupCount: Number.isFinite(Number(body.followupCount))
+              ? Math.max(0, Math.floor(Number(body.followupCount)))
+              : 0,
+            lastAnswerText: String(body.lastAnswerText ?? "").trim() || null,
             history,
             context: ctx.contextText || null,
           }),
@@ -112,8 +139,28 @@ export async function POST(req: NextRequest) {
     } catch {
       parsedQ = {};
     }
-    const questionText =
-      String(parsedQ?.question ?? "").trim() || "Forklar kort den vigtigste pointe i materialet med et konkret eksempel.";
+    const requestedThreadId = String(body.threadId ?? "").trim() || null;
+    const requestedFollowupCount = Number.isFinite(Number(body.followupCount))
+      ? Math.max(0, Math.floor(Number(body.followupCount)))
+      : 0;
+    const remainingSeconds = Number.isFinite(Number(body.remainingSeconds))
+      ? Math.max(0, Math.floor(Number(body.remainingSeconds)))
+      : null;
+    const lastAnswerText = String(body.lastAnswerText ?? "").trim();
+
+    const llmKind = normalizeKind(parsedQ?.kind);
+    const followupsAllowed = requestedFollowupCount < 1 && !!lastAnswerText && (remainingSeconds == null || remainingSeconds >= 120);
+    const kind: "followup" | "new" = llmKind === "followup" && followupsAllowed ? "followup" : "new";
+
+    const threadId =
+      kind === "followup" ? requestedThreadId || String(parsedQ?.threadId ?? "").trim() || makeThreadId() : makeThreadId();
+    const followupCount = kind === "followup" ? 1 : 0;
+    const rawQuestion = String(parsedQ?.questionText ?? parsedQ?.question ?? "").trim();
+    const fallbackQuestion =
+      kind === "followup"
+        ? "Kan du uddybe med et konkret eksempel og en kort begrundelse?"
+        : "Forklar kort den vigtigste pointe i materialet med et konkret eksempel.";
+    const questionText = rawQuestion || fallbackQuestion;
 
     const ttsModel = String(process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts").trim() || "gpt-4o-mini-tts";
     const ttsVoice = String(process.env.OPENAI_TTS_VOICE ?? "marin").trim() || "marin";
@@ -128,6 +175,9 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
+      kind,
+      threadId,
+      followupCount,
       questionText,
       audioBase64,
       mime: "audio/mpeg",
