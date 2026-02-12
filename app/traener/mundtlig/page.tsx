@@ -119,7 +119,7 @@ export default async function Page({
 
   const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
 
-  const scopeHelp = "Hele pensum";
+  const scopeHelp = "Vælg mappe";
 
   return (
     <main>

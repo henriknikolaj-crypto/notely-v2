@@ -9,14 +9,13 @@ export default function TrainingSidebarMainNav() {
   const p = raw.replace(/\/+$/, ""); // fjern trailing slash
 
   const onOverview = p === "/overblik";
-
   const onTraining =
     p === "/traener" ||
     p.startsWith("/traener/noter") ||
     p.startsWith("/traener/mc") ||
     p.startsWith("/traener/flashcards") ||
     p.startsWith("/traener/simulator") ||
-    p.startsWith("/traener/mundtlig"); // ✅ oral side hører også til “Noter / træning”
+    p.startsWith("/traener/mundtlig");
 
   const onUpload = p.startsWith("/traener/upload");
   const onAccount = p === "/konto" || p.startsWith("/konto/");

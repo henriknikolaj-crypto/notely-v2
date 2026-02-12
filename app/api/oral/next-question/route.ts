@@ -35,7 +35,8 @@ function normalizeHistory(raw: unknown) {
   if (!Array.isArray(raw)) return [] as Array<{ role: "assistant" | "user"; text: string }>;
   return raw
     .map((x) => {
-      const role = (x as any)?.role === "assistant" ? "assistant" : (x as any)?.role === "user" ? "user" : null;
+      const role =
+        (x as any)?.role === "assistant" ? "assistant" : (x as any)?.role === "user" ? "user" : null;
       const text = String((x as any)?.text ?? "").trim();
       if (!role || !text) return null;
       return { role, text };
@@ -69,6 +70,7 @@ export async function POST(req: NextRequest) {
     const body = parsed.value;
 
     const { sb, id: ownerId } = await requireUser(req);
+
     const rl = await enforceRateLimit(
       ownerId,
       "oral_next_question",
@@ -83,19 +85,32 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const scopeFolderIds = Array.isArray(body.scopeFolderIds) ? body.scopeFolderIds : [];
+    const folderId = body.folderId ?? null;
+
     const ctx = await buildOralContext({
       sb,
       ownerId,
-      input: {
-        scopeFolderIds: Array.isArray(body.scopeFolderIds) ? body.scopeFolderIds : [],
-        folderId: body.folderId ?? null,
-      },
+      input: { scopeFolderIds, folderId },
       maxChars: 8000,
     });
 
     const history = normalizeHistory(body.history);
+
     const model = requireFlowModel("oral");
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const turnIndex = Number.isFinite(Number(body.turnIndex)) ? Math.max(0, Math.floor(Number(body.turnIndex))) : 0;
+    const remainingSeconds = Number.isFinite(Number(body.remainingSeconds))
+      ? Math.max(0, Math.floor(Number(body.remainingSeconds)))
+      : null;
+
+    const requestedThreadId = String(body.threadId ?? "").trim() || null;
+    const requestedFollowupCount = Number.isFinite(Number(body.followupCount))
+      ? Math.max(0, Math.floor(Number(body.followupCount)))
+      : 0;
+
+    const lastAnswerText = String(body.lastAnswerText ?? "").trim();
 
     const completion = await openai.chat.completions.create({
       model,
@@ -105,7 +120,7 @@ export async function POST(req: NextRequest) {
           role: "system",
           content: [
             "Du er dansk eksaminator til mundtlig eksamen.",
-            "Du skal returnere KUN JSON: {\"kind\":\"new|followup\",\"questionText\":\"...\",\"threadId\":\"...\",\"followupCount\":0|1}.",
+            "Returnér KUN JSON: {\"kind\":\"new|followup\",\"questionText\":\"...\",\"threadId\":\"...\",\"followupCount\":0|1}.",
             "kind='followup' bruges kun ved uklart/overfladisk svar eller manglende nøglepunkt (definition, begrundelse, eksempel, modargument, belæg).",
             "Followup skal være meget kort (1 sætning).",
             "kind='new' bruges når der skal videre til næste hovedspørgsmål.",
@@ -116,15 +131,11 @@ export async function POST(req: NextRequest) {
         {
           role: "user",
           content: JSON.stringify({
-            turnIndex: Number.isFinite(Number(body.turnIndex)) ? Math.max(0, Math.floor(Number(body.turnIndex))) : 0,
-            remainingSeconds: Number.isFinite(Number(body.remainingSeconds))
-              ? Math.max(0, Math.floor(Number(body.remainingSeconds)))
-              : null,
-            threadId: String(body.threadId ?? "").trim() || null,
-            followupCount: Number.isFinite(Number(body.followupCount))
-              ? Math.max(0, Math.floor(Number(body.followupCount)))
-              : 0,
-            lastAnswerText: String(body.lastAnswerText ?? "").trim() || null,
+            turnIndex,
+            remainingSeconds,
+            threadId: requestedThreadId,
+            followupCount: requestedFollowupCount,
+            lastAnswerText: lastAnswerText || null,
             history,
             context: ctx.contextText || null,
           }),
@@ -139,37 +150,41 @@ export async function POST(req: NextRequest) {
     } catch {
       parsedQ = {};
     }
-    const requestedThreadId = String(body.threadId ?? "").trim() || null;
-    const requestedFollowupCount = Number.isFinite(Number(body.followupCount))
-      ? Math.max(0, Math.floor(Number(body.followupCount)))
-      : 0;
-    const remainingSeconds = Number.isFinite(Number(body.remainingSeconds))
-      ? Math.max(0, Math.floor(Number(body.remainingSeconds)))
-      : null;
-    const lastAnswerText = String(body.lastAnswerText ?? "").trim();
 
     const llmKind = normalizeKind(parsedQ?.kind);
-    const followupsAllowed = requestedFollowupCount < 1 && !!lastAnswerText && (remainingSeconds == null || remainingSeconds >= 120);
+
+    const followupsAllowed =
+      requestedFollowupCount < 1 &&
+      !!lastAnswerText &&
+      (remainingSeconds == null || remainingSeconds >= 120);
+
     const kind: "followup" | "new" = llmKind === "followup" && followupsAllowed ? "followup" : "new";
 
     const threadId =
-      kind === "followup" ? requestedThreadId || String(parsedQ?.threadId ?? "").trim() || makeThreadId() : makeThreadId();
+      kind === "followup"
+        ? requestedThreadId || String(parsedQ?.threadId ?? "").trim() || makeThreadId()
+        : makeThreadId();
+
     const followupCount = kind === "followup" ? 1 : 0;
+
     const rawQuestion = String(parsedQ?.questionText ?? parsedQ?.question ?? "").trim();
     const fallbackQuestion =
       kind === "followup"
         ? "Kan du uddybe med et konkret eksempel og en kort begrundelse?"
         : "Forklar kort den vigtigste pointe i materialet med et konkret eksempel.";
+
     const questionText = rawQuestion || fallbackQuestion;
 
     const ttsModel = String(process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts").trim() || "gpt-4o-mini-tts";
     const ttsVoice = String(process.env.OPENAI_TTS_VOICE ?? "marin").trim() || "marin";
+
     const speech = await openai.audio.speech.create({
       model: ttsModel,
       voice: ttsVoice as any,
       input: questionText,
       response_format: "mp3",
     });
+
     const ab = await speech.arrayBuffer();
     const audioBase64 = Buffer.from(ab).toString("base64");
 

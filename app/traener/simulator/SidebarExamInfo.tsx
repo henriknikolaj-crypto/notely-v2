@@ -29,13 +29,8 @@ function formatScore(score: number | null): string {
 }
 
 function labelForItem(s: Item): string {
-  // Vis kun mappe-navn når vi faktisk har det.
-  // Ellers: neutral fallback (undgår misvisende “Flere mapper”).
   const name = (s.folder_name ?? "").trim();
   if (name) return name;
-
-  // Hvis vi har folder_id men ikke name, er det typisk schema-cache/RLS/lookup.
-  // Stadig neutral tekst:
   return "Valgte mapper";
 }
 
@@ -53,9 +48,6 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
     mode === "mundtlig"
       ? withQS("/traener/mundtlig/historik")
       : withQS("/traener/simulator/historik");
-
-  const skriftHref = withQS("/traener/simulator");
-  const mundtligHref = withQS("/traener/mundtlig");
 
   const [items, setItems] = useState<Item[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
@@ -77,7 +69,6 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
           headers: { Accept: "application/json" },
         });
 
-        // robust JSON parse (også ved ikke-JSON / 500)
         const data = (await res.json().catch(() => null)) as ApiResponse | null;
         if (cancelled) return;
 
@@ -159,28 +150,6 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
           <p className="text-[11px] text-zinc-500">Ingen runder endnu.</p>
         )
       ) : null}
-
-      <div className="pt-1 text-[11px]">
-        <Link
-          href={skriftHref}
-          className={[
-            "underline decoration-zinc-300 underline-offset-2 hover:decoration-zinc-600",
-            mode === "skrift" ? "text-zinc-900" : "text-zinc-500",
-          ].join(" ")}
-        >
-          Skrift
-        </Link>
-        <span className="px-2 text-zinc-300">·</span>
-        <Link
-          href={mundtligHref}
-          className={[
-            "underline decoration-zinc-300 underline-offset-2 hover:decoration-zinc-600",
-            mode === "mundtlig" ? "text-zinc-900" : "text-zinc-500",
-          ].join(" ")}
-        >
-          Mundtlig
-        </Link>
-      </div>
     </div>
   );
 }

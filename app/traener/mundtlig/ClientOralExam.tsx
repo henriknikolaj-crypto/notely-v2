@@ -39,6 +39,11 @@ type NextQuestionOk = {
   mime: string;
 };
 
+type SubmitTurnOk = { ok: true; transcript: { text: string; segments: Segment[] } };
+type SubmitFinalOk = { ok: true; result: SubmitResult };
+type SubmitErr = { ok: false; error?: string };
+type SubmitResp = SubmitTurnOk | SubmitFinalOk | SubmitErr;
+
 type Props = {
   scopeFolderIds: string[];
   activeFolderId: string | null;
@@ -142,17 +147,22 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
   const currentQuestionKindRef = useRef<"followup" | "new">("new");
   const currentThreadIdRef = useRef<string | null>(null);
   const currentFollowupCountRef = useRef(0);
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
+
   const vadContextRef = useRef<AudioContext | null>(null);
   const vadFrameRef = useRef<number | null>(null);
   const vadHasSpeechRef = useRef(false);
   const vadSilenceFromRef = useRef<number | null>(null);
   const vadStartedAtRef = useRef(0);
+  const vadLastSpeechAtRef = useRef<number | null>(null); // ✅ ny: robust “sidst tale” tracking
   const stopRequestedRef = useRef(false);
+  const stopAndSubmitRef = useRef<(() => void) | null>(null);
   const mimeType = useMemo(() => pickMimeType(), []);
   const busyRef = useRef(false);
 
@@ -190,17 +200,6 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
   useEffect(() => {
     currentFollowupCountRef.current = followupCount;
   }, [followupCount]);
-
-  useEffect(() => {
-    if (remainingMs > 0) return;
-    if (busyRef.current) return;
-    if (phase === "listening") {
-      void onStopAndAflever();
-      return;
-    }
-    if (turns.length > 0 && phase !== "evaluating" && phase !== "thinking" && phase !== "speaking") setPhase("done");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [remainingMs, phase, turns.length]);
 
   useEffect(() => {
     return () => {
@@ -287,68 +286,133 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
     const stream = await ensureMicStream();
     chunksRef.current = [];
     const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
     mr.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
     };
+
     recorderRef.current = mr;
-    mr.start();
+
+    // timeslice giver mere robuste chunks (mindre risiko for “corrupted/unsupported”)
+    try {
+      mr.start(250);
+    } catch {
+      mr.start();
+    }
+
     setPhase("listening");
     startVadMonitor(stream);
   }
 
   function startVadMonitor(stream: MediaStream) {
-    cleanupVad();
-    const Ctx = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext | undefined;
-    if (!Ctx) return;
+  cleanupVad();
 
-    const ctx = new Ctx();
-    vadContextRef.current = ctx;
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyser.smoothingTimeConstant = 0.85;
-    source.connect(analyser);
+  const Ctx = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext | undefined;
+  if (!Ctx) return;
 
-    const data = new Float32Array(analyser.fftSize);
-    const threshold = 0.018;
-    const silenceMs = 1400;
-    const maxRecordingMs = 90_000;
-    vadStartedAtRef.current = performance.now();
-    vadHasSpeechRef.current = false;
-    vadSilenceFromRef.current = null;
+  const ctx = new Ctx();
+  vadContextRef.current = ctx;
 
-    const tick = () => {
-      if (!recorderRef.current || recorderRef.current.state !== "recording") return;
+  // Vigtigt: nogle browsere kan starte/sætte ctx i "suspended" efter første turn
+  void ctx.resume().catch(() => {});
 
-      analyser.getFloatTimeDomainData(data);
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-      const rms = Math.sqrt(sum / data.length);
-      const nowPerf = performance.now();
+  const source = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.85;
+  source.connect(analyser);
 
-      if (rms >= threshold) {
-        vadHasSpeechRef.current = true;
-        vadSilenceFromRef.current = null;
-      } else if (vadHasSpeechRef.current) {
-        if (vadSilenceFromRef.current == null) vadSilenceFromRef.current = nowPerf;
-        if (nowPerf - (vadSilenceFromRef.current ?? nowPerf) >= silenceMs && !stopRequestedRef.current) {
-          stopRequestedRef.current = true;
-          void onStopAndAflever();
-          return;
-        }
+  const data = new Float32Array(analyser.fftSize);
+
+  // Tuning (robust mod “står grøn”)
+  const SILENCE_MS = 2000;      // hvor længe stilhed efter tale før vi afleverer
+  const MIN_RECORD_MS = 1200;   // undgå for hurtige stops
+  const MAX_RECORD_MS = 120_000; // hard cap
+  const CALIBRATE_MS = 450;     // støj-kalibrering i starten
+  const NO_SPEECH_FAILSAFE_MS = 12_000; // hvis vi aldrig registrerer tale
+
+  let noiseSum = 0;
+  let noiseN = 0;
+  let speechThreshold = 0.012;
+
+  vadStartedAtRef.current = performance.now();
+  vadHasSpeechRef.current = false;
+  vadSilenceFromRef.current = null;
+  vadLastSpeechAtRef.current = null;
+
+  const tick = () => {
+    const mr = recorderRef.current;
+    if (!mr || mr.state !== "recording") return;
+
+    analyser.getFloatTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+
+    const t = performance.now();
+    const sinceStart = t - vadStartedAtRef.current;
+
+    // 1) Kalibrér noise floor først
+    if (sinceStart <= CALIBRATE_MS) {
+      noiseSum += rms;
+      noiseN += 1;
+      const noiseAvg = noiseSum / Math.max(1, noiseN);
+      speechThreshold = Math.max(0.008, noiseAvg * 3.0);
+    }
+
+    // 2) Brug en “weak” threshold til at tracke “sidst vi hørte tale”
+    const weakThreshold = Math.max(0.006, speechThreshold * 0.7);
+
+    if (rms >= speechThreshold) {
+      vadHasSpeechRef.current = true;
+      vadSilenceFromRef.current = null;
+      vadLastSpeechAtRef.current = t;
+    } else if (rms >= weakThreshold) {
+      // stadig sandsynlig tale (bare lavt)
+      vadLastSpeechAtRef.current = t;
+    } else {
+      // under threshold: stilhed
+      if (vadHasSpeechRef.current) {
+        if (vadSilenceFromRef.current == null) vadSilenceFromRef.current = t;
       }
+    }
 
-      if (nowPerf - vadStartedAtRef.current >= maxRecordingMs && !stopRequestedRef.current) {
-        stopRequestedRef.current = true;
-        void onStopAndAflever();
-        return;
-      }
+    // 3) Stop når der har været stilhed længe efter “sidst tale”
+    const lastSpeechAt = vadLastSpeechAtRef.current;
+    if (
+      lastSpeechAt != null &&
+      t - lastSpeechAt >= SILENCE_MS &&
+      sinceStart >= MIN_RECORD_MS &&
+      !stopRequestedRef.current
+    ) {
+      stopRequestedRef.current = true;
+      stopAndSubmitRef.current?.();
+      return;
+    }
 
-      vadFrameRef.current = requestAnimationFrame(tick);
-    };
+    // 4) Hvis vi aldrig registrerer tale (pga. mic/threshold), fail-safe stop
+    if (
+      lastSpeechAt == null &&
+      sinceStart >= NO_SPEECH_FAILSAFE_MS &&
+      !stopRequestedRef.current
+    ) {
+      stopRequestedRef.current = true;
+      void onStopAndAflever();
+      return;
+    }
+
+    // 5) Hard cap
+    if (sinceStart >= MAX_RECORD_MS && !stopRequestedRef.current) {
+      stopRequestedRef.current = true;
+      void onStopAndAflever();
+      return;
+    }
 
     vadFrameRef.current = requestAnimationFrame(tick);
-  }
+  };
+
+  vadFrameRef.current = requestAnimationFrame(tick);
+}
 
   function stopRecorder(): Promise<Blob> {
     return new Promise((resolve, reject) => {
@@ -357,7 +421,9 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
         reject(new Error("Ingen aktiv optagelse."));
         return;
       }
+
       cleanupVad();
+
       mr.onstop = () => {
         try {
           const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
@@ -370,7 +436,14 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
           reject(e);
         }
       };
+
       try {
+        // hjælper på “tom/corrupt” blob i nogle browsere
+        try {
+          mr.requestData?.();
+        } catch {
+          // ignore
+        }
         mr.stop();
       } catch (e) {
         reject(e);
@@ -389,6 +462,7 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
 
   async function fetchAndPlayQuestion(nextTurnIndex: number, lastAnswerText?: string) {
     setPhase("thinking");
+
     const res = await fetch("/api/oral/next-question", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -415,13 +489,16 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
     currentFollowupCountRef.current = json.followupCount;
     setThreadId(json.threadId);
     setFollowupCount(json.followupCount);
+
     currentQuestionRef.current = json.questionText;
+
     const blob = b64ToBlob(json.audioBase64, json.mime || "audio/mpeg");
     cleanupPlayback();
     const url = URL.createObjectURL(blob);
     audioUrlRef.current = url;
     const audio = new Audio(url);
     audioRef.current = audio;
+
     setPhase("speaking");
 
     await new Promise<void>((resolve, reject) => {
@@ -446,6 +523,7 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
   async function onStart() {
     if (phase !== "idle") return;
     if (busyRef.current) return;
+
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices?.getUserMedia ||
@@ -457,6 +535,7 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
 
     const sid = makeSessionId();
     const t0 = Date.now();
+
     setSessionId(sid);
     setTurns([]);
     setSubmitted(null);
@@ -464,11 +543,14 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
     setEndAt(t0 + durationMs);
     setNow(t0);
     setTurnIndex(0);
+
     setThreadId(null);
     setFollowupCount(0);
     currentThreadIdRef.current = null;
     currentFollowupCountRef.current = 0;
+
     setError(null);
+
     busyRef.current = true;
     try {
       await startTurn(0);
@@ -482,13 +564,19 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
     }
   }
 
-  async function onStopAndAflever() {
-    if (phase !== "listening") return;
+  // Stop + håndtér tur: transcribe -> enten næste spørgsmål eller final evaluering
+  async function stopAndHandleTurn(forceFinal?: boolean) {
+    const mr = recorderRef.current;
+    if (!mr || mr.state !== "recording") return; // <-- vigtig: ikke afhængig af React phase
     if (busyRef.current) return;
+
     busyRef.current = true;
-    stopRequestedRef.current = true;
-    setPhase("evaluating");
     setError(null);
+
+    const hardNow = Date.now();
+    const timeIsUp = forceFinal || (endAt != null && hardNow >= endAt);
+
+    setPhase(timeIsUp ? "evaluating" : "thinking");
 
     try {
       const audioBlob = await stopRecorder();
@@ -510,19 +598,46 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
       fd.append("notes", notes);
       fd.append("sessionId", sessionId ?? "");
       fd.append("turnIndex", String(turnIndex));
+      fd.append("final", timeIsUp ? "1" : "0");
+
+      if (timeIsUp) {
+        // send hele historikken til final evaluering
+        fd.append(
+          "turns",
+          JSON.stringify([
+            ...turns,
+            {
+              questionText: currentQuestionRef.current,
+              transcriptText: "", // udfyldes server-side via transcribe af denne tur
+              notes: notes || "",
+              kind: currentQuestionKindRef.current,
+              threadId: currentThreadIdRef.current,
+              followupCount: currentFollowupCountRef.current,
+            },
+          ]),
+        );
+      }
 
       const res = await fetch("/api/oral/submit", { method: "POST", body: fd });
-      const json = (await res.json().catch(() => null)) as
-        | { ok: true; result: SubmitResult }
-        | { ok: false; error?: string }
-        | null;
+      const json = (await res.json().catch(() => null)) as SubmitResp | null;
 
-      if (!res.ok || !json || json.ok !== true) {
+      if (!res.ok || !json || (json as any).ok !== true) {
         throw new Error(String((json as any)?.error ?? "Aflevering fejlede."));
       }
 
-      setSubmitted(json.result);
-      const transcriptText = json.result.transcript.text;
+      if ("result" in json) {
+        // FINAL: evaluering
+        setPhase("done");
+        setSubmitted(json.result);
+
+        window.dispatchEvent(new Event("notely:exam-updated"));
+        window.dispatchEvent(new Event("notely:simulator-updated"));
+        return;
+      }
+
+      // TURN: kun transkript
+      const transcriptText = (json as SubmitTurnOk).transcript.text;
+
       setTurns((prev) => [
         ...prev,
         {
@@ -535,13 +650,13 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
         },
       ]);
 
-      window.dispatchEvent(new Event("notely:exam-updated"));
-      window.dispatchEvent(new Event("notely:simulator-updated"));
-
-      if (Date.now() < (endAt ?? 0)) {
+      // Hvis der stadig er tid tilbage: næste spørgsmål automatisk
+      const stillTimeLeft = endAt != null ? Date.now() < endAt - 300 : true;
+      if (stillTimeLeft) {
         await startTurn(turnIndex + 1, transcriptText);
       } else {
-        setPhase("done");
+        // tid er lige løbet ud mellem stop og næste turn -> final uden lyd
+        await finalizeWithoutAudio();
       }
     } catch (e: any) {
       setPhase("done");
@@ -551,6 +666,68 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
       busyRef.current = false;
     }
   }
+
+  async function finalizeWithoutAudio() {
+    if (busyRef.current) return;
+    if (!startedAt) return;
+    if (submitted) return;
+
+    busyRef.current = true;
+    setPhase("evaluating");
+    setError(null);
+
+    try {
+      const fd = new FormData();
+      fd.append("final", "1");
+      fd.append("question", "");
+      fd.append("durationMin", String(durationMin));
+      fd.append("startedAt", String(startedAt));
+      fd.append("endedAt", String(Date.now()));
+      fd.append("scopeFolderIds", JSON.stringify(effectiveScopeFolderIds));
+      if (activeFolderId) fd.append("folderId", activeFolderId);
+      fd.append("notes", notes);
+      fd.append("sessionId", sessionId ?? "");
+      fd.append("turnIndex", String(turnIndex));
+      fd.append("turns", JSON.stringify(turns));
+
+      const res = await fetch("/api/oral/submit", { method: "POST", body: fd });
+      const json = (await res.json().catch(() => null)) as SubmitResp | null;
+
+      if (!res.ok || !json || (json as any).ok !== true || !("result" in (json as any))) {
+        throw new Error(String((json as any)?.error ?? "Kunne ikke afslutte evaluering."));
+      }
+
+      setSubmitted((json as SubmitFinalOk).result);
+      setPhase("done");
+
+      window.dispatchEvent(new Event("notely:exam-updated"));
+      window.dispatchEvent(new Event("notely:simulator-updated"));
+    } catch (e: any) {
+      setPhase("done");
+      setError(e?.message ?? "Kunne ikke afslutte evaluering.");
+    } finally {
+      busyRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    // Når tiden er slut: hvis vi stadig lytter, så stop + final; ellers finaliser uden lyd
+    if (!endAt) return;
+    if (remainingMs > 0) return;
+    if (busyRef.current) return;
+
+    const mr = recorderRef.current;
+    if (mr && mr.state === "recording") {
+      stopRequestedRef.current = true;
+      void stopAndHandleTurn(true);
+      return;
+    }
+
+    if (startedAt && !submitted) {
+      void finalizeWithoutAudio();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remainingMs, endAt]);
 
   function onReset() {
     cleanupPlayback();
@@ -666,26 +843,33 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
             <button
               type="button"
               onClick={() => {
-                if (phase === "listening") void onStopAndAflever();
+                // Klik stopper kun hvis vi faktisk optager
+                const mr = recorderRef.current;
+                if (mr && mr.state === "recording" && !busyRef.current) {
+                  stopRequestedRef.current = true;
+                  void stopAndHandleTurn();
+                }
               }}
-              disabled={phase !== "listening"}
-              className={cx("rounded-xl", phase === "listening" ? "cursor-pointer" : "cursor-default")}
-              aria-label={phase === "listening" ? "Stop optagelse" : "Mikrofonstatus"}
-              title={phase === "listening" ? "Klik for at stoppe optagelse" : undefined}
+              disabled={!(recorderRef.current && recorderRef.current.state === "recording")}
+              className={cx(
+                "rounded-xl",
+                recorderRef.current && recorderRef.current.state === "recording" ? "cursor-pointer" : "cursor-default",
+              )}
+              aria-label={recorderRef.current && recorderRef.current.state === "recording" ? "Stop optagelse" : "Mikrofonstatus"}
+              title={recorderRef.current && recorderRef.current.state === "recording" ? "Klik for at stoppe optagelse" : undefined}
             >
               <MicStatusIcon state={micState} className="h-[190px] w-[150px] text-black" />
             </button>
           </div>
 
-          {/* ✅ EN BOKS: textarea har nu selv border+shadow (ingen ydre boks, ingen label) */}
           <div className="h-[400px] w-full md:w-[340px] md:justify-self-start">
-  <textarea
-    value={notes}
-    onChange={(e) => setNotes(e.target.value)}
-    placeholder="Noter"
-    className="h-full w-full md:ml-12 md:w-[290px] resize-none rounded-2xl border border-zinc-200 bg-white p-4 text-sm shadow-sm outline-none placeholder:text-zinc-400 focus:border-zinc-500"
-  />
-</div>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Noter"
+              className="h-full w-full md:ml-12 md:w-[290px] resize-none rounded-2xl border border-zinc-200 bg-white p-4 text-sm shadow-sm outline-none placeholder:text-zinc-400 focus:border-zinc-500"
+            />
+          </div>
         </div>
       </div>
 
@@ -721,20 +905,9 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId }: Props
           <details className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
             <summary className="cursor-pointer text-sm font-semibold text-zinc-800">Vis afskrift</summary>
             <div className="mt-3 space-y-2">
-              {submitted.transcript.segments.length > 0 ? (
-                submitted.transcript.segments.map((segment, i) => (
-                  <div key={`${segment.start}-${i}`} className="rounded-xl border border-zinc-200 bg-white p-3 text-sm">
-                    <div className="text-xs text-zinc-500">
-                      {formatMMSS(segment.start * 1000)} - {formatMMSS(segment.end * 1000)}
-                    </div>
-                    <div className="mt-1 text-zinc-800">{segment.text}</div>
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-xl border border-zinc-200 bg-white p-3 text-sm text-zinc-800">
-                  {submitted.transcript.text}
-                </div>
-              )}
+              <div className="rounded-xl border border-zinc-200 bg-white p-3 text-sm text-zinc-800">
+                {submitted.transcript.text}
+              </div>
             </div>
           </details>
         </>
