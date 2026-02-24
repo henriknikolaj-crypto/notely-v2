@@ -23,19 +23,21 @@ const TABS: TabDef[] = [
   // Eksamen samler Skrift + Mundtlig
   {
     label: "Eksamen",
-    href: "/traener/simulator", // Skrift i v1
+    href: "/exam",
     pro: true,
-    activePrefixes: ["/traener/simulator", "/traener/mundtlig"],
+    activePrefixes: ["/exam", "/traener/simulator", "/traener/mundtlig"],
   },
 ];
 
-export default function TrainingTabs() {
+export default function TrainingTabs({ isPro = false }: { isPro?: boolean }) {
   const pathname = (usePathname() || "").replace(/\/+$/, "");
   const sp = useSearchParams();
 
   // Skjul tabs på upload + historik-sider
   const hideTabs =
     !pathname ||
+    pathname === "/traener/overblik" ||
+    pathname.startsWith("/traener/mappe/") ||
     pathname.startsWith("/traener/upload") ||
     pathname.includes("/historik");
 
@@ -45,31 +47,52 @@ export default function TrainingTabs() {
   const qs = baseParams.toString();
   const withQs = (href: string) => (qs ? `${href}?${qs}` : href);
 
+  // ✅ Vis alle tabs (inkl. Pro). Pro-tabs styles som locked hvis !isPro
+  const visibleTabs = TABS;
+
   return (
     <div className="mb-4 rounded-2xl border border-zinc-200 bg-white shadow-sm">
       <div className="flex items-center gap-2 overflow-x-auto overflow-y-hidden px-3 py-2">
-        {TABS.map((tab) => {
+        {visibleTabs.map((tab) => {
           const isActive = tab.activePrefixes?.length
-            ? tab.activePrefixes.some((pre) => pathname === pre || pathname.startsWith(pre + "/") || pathname.startsWith(pre))
+            ? tab.activePrefixes.some(
+                (pre) =>
+                  pathname === pre ||
+                  pathname.startsWith(pre + "/") ||
+                  pathname.startsWith(pre)
+              )
             : pathname === tab.href;
+
+          const locked = !!tab.pro && !isPro;
 
           return (
             <Link
               key={tab.href}
-              href={withQs(tab.href)}
+              href={withQs(tab.href)} // ✅ stadig klikbar -> paywall/disabled inde på siden
+              title={locked ? "Kræver Pro" : undefined}
               className={cn(
-                "whitespace-nowrap rounded-lg px-3 py-2 text-sm border",
+                "whitespace-nowrap rounded-lg px-3 py-2 text-sm border inline-flex items-center",
                 isActive
-                  ? "border-black bg-black text-white"
-                  : "border-zinc-300 bg-white text-black hover:bg-zinc-50"
+                  ? locked
+                    ? "border-zinc-300 bg-zinc-50 text-zinc-700"
+                    : "border-black bg-black text-white"
+                  : locked
+                    ? "border-zinc-200 bg-white text-zinc-400 hover:bg-zinc-50"
+                    : "border-zinc-300 bg-white text-black hover:bg-zinc-50"
               )}
+              aria-disabled={locked ? true : undefined}
             >
               {tab.label}
+
               {tab.pro && (
                 <span
                   className={cn(
                     "ml-2 rounded border px-1 py-[1px] text-[11px]",
-                    isActive ? "border-white/60 text-white/90" : "border-zinc-300 text-zinc-700"
+                    locked
+                      ? "border-zinc-200 text-zinc-500"
+                      : isActive
+                        ? "border-white/60 text-white/90"
+                        : "border-zinc-300 text-zinc-700"
                   )}
                 >
                   Pro
