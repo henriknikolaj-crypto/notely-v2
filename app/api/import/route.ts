@@ -120,7 +120,7 @@ async function resolveOwnerId(sb: SB, userEmail?: string): Promise<string | null
 }
 
 async function safeJobUpdate(sb: SB, jobId: string, patch: Record<string, unknown>) {
-  const r1 = await sb.from("jobs").update(patch).eq("id", jobId);
+  const r1 = await sb.from("jobs").update(patch as never).eq("id", jobId);
   if (!r1.error) return;
 
   const msg = String((r1.error as any)?.message ?? "");
@@ -129,7 +129,7 @@ async function safeJobUpdate(sb: SB, jobId: string, patch: Record<string, unknow
   if (msg.includes('column "started_at"') && "started_at" in retryPatch) delete retryPatch.started_at;
   if (msg.includes('column "finished_at"') && "finished_at" in retryPatch) delete retryPatch.finished_at;
 
-  await sb.from("jobs").update(retryPatch).eq("id", jobId);
+  await sb.from("jobs").update(retryPatch as never).eq("id", jobId);
 }
 
 export async function GET() {
