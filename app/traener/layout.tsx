@@ -172,7 +172,7 @@ export default async function TraenerLayout({
       {/* Topbar */}
       <header className="border-b border-zinc-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-          <Link href="/overblik" className="logo-script text-4xl leading-none">
+          <Link href="/traener" className="logo-script text-4xl leading-none">
             Notely.
           </Link>
           <div className="flex items-center gap-3">

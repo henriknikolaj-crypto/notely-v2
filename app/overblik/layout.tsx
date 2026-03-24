@@ -2,6 +2,7 @@
 import "server-only";
 
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import TrainingSidebarMainNav from "../traener/ui/TrainingSidebarMainNav";
 import TrainingSidebarFolders from "../traener/ui/TrainingSidebarFolders";
@@ -42,30 +43,10 @@ export default async function OverblikLayout({
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
-    return (
-      <main className="min-h-screen bg-[#fffef9]">
-        <header className="border-b border-zinc-200 bg-white">
-          <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-            <Link href="/" className="logo-script text-4xl leading-none">
-              Notely.
-            </Link>
-            <Link
-              href="/auth/login"
-              className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50"
-            >
-              Log ind
-            </Link>
-          </div>
-        </header>
-        <div className="mx-auto max-w-6xl p-6">
-          <h1 className="mb-2 text-2xl font-semibold">Overblik</h1>
-          <p className="text-sm text-red-600">
-            Mangler bruger-id (hverken login eller DEV_USER_ID sat).
-          </p>
-        </div>
-      </main>
-    );
+    redirect("/auth/login");
   }
+
+  redirect("/traener");
 
   // ---- Mapper til venstre træ ----
   const { data: foldersData, error: foldersError } = await sb

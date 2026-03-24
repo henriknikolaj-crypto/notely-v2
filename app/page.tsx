@@ -13,10 +13,10 @@ export default function Home() {
 
         <div className="mt-6 flex flex-wrap gap-3">
           <Link
-            href="/overblik"
+            href="/traener"
             className="rounded-full bg-black px-5 py-2 text-sm font-semibold text-white"
           >
-            Gå til Overblik
+            Gå til Træner
           </Link>
 
           <Link
