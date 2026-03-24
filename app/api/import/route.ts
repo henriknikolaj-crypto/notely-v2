@@ -158,17 +158,19 @@ export async function POST(req: NextRequest) {
     return fail("Kunne ikke resolve owner_id (mangler bruger eller DEV_USER_ID).", 401, { requestId });
   }
 
+  const jobInsertPayload = {
+    owner_id: ownerId,
+    kind: "import",
+    status: "queued",
+    queued_at: new Date().toISOString(),
+    payload, // hele payload som før
+    result: null,
+    error: null,
+  };
+
   const jobInsert = await sb
     .from("jobs")
-    .insert({
-      owner_id: ownerId,
-      kind: "import",
-      status: "queued",
-      queued_at: new Date().toISOString(),
-      payload, // hele payload som før
-      result: null,
-      error: null,
-    })
+    .insert(jobInsertPayload as never)
     .select("id")
     .single();
 
