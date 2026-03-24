@@ -3,6 +3,13 @@
 import { useState } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
 
+function getAuthBaseUrl() {
+  const envBase = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+  if (envBase) return envBase.replace(/\/+$/, "");
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
 export default function SignupPage() {
   const supabase = createBrowserClient();
   const [email, setEmail] = useState("");
@@ -20,7 +27,7 @@ export default function SignupPage() {
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
-        options: { emailRedirectTo: `${location.origin}/auth/callback` }
+        options: { emailRedirectTo: `${getAuthBaseUrl()}/auth/callback?next=/traener` }
       });
       if (error) throw error;
 
@@ -29,7 +36,7 @@ export default function SignupPage() {
         setMsg("Tjek din mail for at bekræfte og logge ind.");
       } else {
         // Hvis bekræftelse er slået FRA, er man logget ind med det samme
-        location.href = "/exam";
+        location.href = "/traener";
       }
     } catch (e:any) {
       setMsg(e.message ?? "Kunne ikke oprette konto");
@@ -61,5 +68,4 @@ export default function SignupPage() {
     </div>
   );
 }
-
 

@@ -5,7 +5,7 @@ import { supabaseServerRSC } from "@/lib/supabase/server-rsc"
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const code = searchParams.get("code")
-  const next = searchParams.get("next") || "/overblik";
+  const next = searchParams.get("next") || "/traener";
 
 
   const supabase = await supabaseServerRSC()
@@ -20,7 +20,6 @@ export async function GET(request: Request) {
 
   return NextResponse.redirect(new URL(next, request.url))
 }
-
 
 
 

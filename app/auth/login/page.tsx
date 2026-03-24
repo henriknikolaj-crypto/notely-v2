@@ -3,6 +3,13 @@
 import { useState } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
 
+function getAuthBaseUrl() {
+  const envBase = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+  if (envBase) return envBase.replace(/\/+$/, "");
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
 export default function LoginPage() {
   const supabase = createBrowserClient();
   const [tab, setTab] = useState<"password"|"magic">("password");
@@ -32,7 +39,7 @@ if (data?.user) {
 }
 
 // send brugeren til træneren
-window.location.href = "/overblik";
+window.location.href = "/traener";
 
     } catch (e:any) { setMsg(e.message ?? "Login-fejl"); }
     finally { setLoading(false); }
@@ -42,7 +49,7 @@ window.location.href = "/overblik";
     e.preventDefault(); setMsg(null); setLoading(true);
     try {
       const { error } = await supabase.auth.signInWithOtp({
-        email, options: { emailRedirectTo: `${location.origin}/auth/callback` }
+        email, options: { emailRedirectTo: `${getAuthBaseUrl()}/auth/callback?next=/traener` }
       });
       if (error) throw error;
       setMsg("Tjek din mail for login-link.");
@@ -54,7 +61,7 @@ window.location.href = "/overblik";
     e.preventDefault(); setMsg(null); setLoading(true);
     try {
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${location.origin}/auth/reset`
+        redirectTo: `${getAuthBaseUrl()}/auth/reset`
       });
       if (error) throw error;
       setMsg("Hvis e-mail findes, er der sendt en reset-mail.");
@@ -101,5 +108,3 @@ window.location.href = "/overblik";
     </div>
   );
 }
-
-
