@@ -207,7 +207,7 @@ export async function POST(req: NextRequest) {
           course_id: courseId,
           folder_id: folderId,
           kind: file.kind ?? "unknown",
-        },
+        } as never,
         { onConflict: "md5" },
       )
       .select("id")
@@ -231,7 +231,7 @@ export async function POST(req: NextRequest) {
           page: typeof t?.page === "number" ? t.page : idx + 1,
         }));
 
-        const ocrIns = await sb.from("ocr_texts").insert(ocrRows);
+        const ocrIns = await sb.from("ocr_texts").insert(ocrRows as never);
         if (ocrIns.error) throw new Error(`ocr_texts insert failed: ${ocrIns.error.message}`);
       }
     }
@@ -247,7 +247,7 @@ export async function POST(req: NextRequest) {
         content: String(n?.content ?? ""),
       }));
 
-      const noteIns = await sb.from("notes").insert(noteRows);
+      const noteIns = await sb.from("notes").insert(noteRows as never);
       if (noteIns.error) throw new Error(`notes insert failed: ${noteIns.error.message}`);
     }
 
@@ -262,7 +262,7 @@ export async function POST(req: NextRequest) {
         back: String(f?.back ?? f?.answer ?? ""),
       }));
 
-      const fcIns = await sb.from("flashcards").insert(fcRows);
+      const fcIns = await sb.from("flashcards").insert(fcRows as never);
       if (fcIns.error) throw new Error(`flashcards insert failed: ${fcIns.error.message}`);
     }
 
@@ -308,7 +308,7 @@ export async function POST(req: NextRequest) {
 
       const qzIns = await sb
         .from("quizzes")
-        .insert({ owner_id: ownerId, course_id: courseId, title })
+        .insert({ owner_id: ownerId, course_id: courseId, title } as never)
         .select("id")
         .single();
 
@@ -316,7 +316,7 @@ export async function POST(req: NextRequest) {
       const quizId = String((qzIns.data as any).id);
 
       const qRows = payload.quiz.questions.map((q) => ({ quiz_id: quizId, prompt: String(q.prompt ?? "") }));
-      const qIns = await sb.from("quiz_questions").insert(qRows).select("id");
+      const qIns = await sb.from("quiz_questions").insert(qRows as never).select("id");
 
       if (qIns.error) throw new Error(`quiz_questions insert failed: ${qIns.error.message}`);
 
@@ -337,7 +337,7 @@ export async function POST(req: NextRequest) {
       });
 
       if (aRows.length) {
-        const aIns = await sb.from("quiz_answers").insert(aRows);
+        const aIns = await sb.from("quiz_answers").insert(aRows as never);
         if (aIns.error) throw new Error(`quiz_answers insert failed: ${aIns.error.message}`);
       }
     }
