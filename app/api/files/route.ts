@@ -16,6 +16,11 @@ type NormalizedFileItem = {
   storage_path: string | null;
   created_at: string | null;
   uploaded_at: string | null;
+  page_count?: number | null;
+  ocr_pages?: number | null;
+  extraction_method?: string | null;
+  extraction_quality?: string | null;
+  extraction_meta?: Record<string, unknown> | null;
   source_table: "files" | "training_files";
 };
 
@@ -136,7 +141,7 @@ export async function GET(req: NextRequest) {
 
   // normalize
   const normalized: NormalizedFileItem[] = [
-    ...trainingRes.data.map((t: any) => {
+    ...trainingRes.data.map((t: any): NormalizedFileItem => {
       const created = pickTs(t.created_at, t.inserted_at, t.uploaded_at);
       const uploaded = pickTs(t.uploaded_at, t.created_at, t.inserted_at);
 
@@ -156,7 +161,7 @@ export async function GET(req: NextRequest) {
       };
     }),
 
-    ...filesRes.data.map((f: any) => {
+    ...filesRes.data.map((f: any): NormalizedFileItem => {
       const created = pickTs(f.created_at, f.inserted_at, f.uploaded_at);
       const uploaded = pickTs(f.uploaded_at, f.created_at, f.inserted_at);
 
