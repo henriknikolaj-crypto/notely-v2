@@ -104,7 +104,21 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) return null;
+  if (!ownerId) {
+    return (
+      <section className="space-y-4">
+        <header className="mb-2 border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold">Multiple Choice</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            Træn på dit eget pensum. Vælg eller skift mappe her, og start når du er klar.
+          </p>
+        </header>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
+          Multiple Choice-indholdet opdateres lige nu.
+        </section>
+      </section>
+    );
+  }
 
   const sp = (await searchParams) ?? {};
   const requestedScopeFolderIds = parseScopeFolderIds(sp);

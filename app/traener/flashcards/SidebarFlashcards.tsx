@@ -134,7 +134,10 @@ export default function SidebarFlashcards() {
       setDone(stats.todayUsed);
       setLastSessionAt(stats.lastSessionAt);
     } catch (e: any) {
-      setErr(String(e?.message ?? e));
+      setErr(null);
+      setSessions([]);
+      setDone(0);
+      setLastSessionAt(null);
     } finally {
       setLoading(false);
     }
@@ -186,7 +189,7 @@ export default function SidebarFlashcards() {
 
         {loading ? <div className="mt-2 text-[11px] text-zinc-400">Henter…</div> : null}
 
-        {err ? <div className="mt-2 text-[11px] text-red-600">{err}</div> : null}
+        {err ? <div className="mt-2 text-[11px] text-zinc-500">{err}</div> : null}
       </div>
 
       <div>

@@ -218,7 +218,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       if (res.status === 401) {
         setFolders([]);
-        setFoldersError("Login mangler i denne browser. Mapper kan ikke hentes endnu.");
+        setFoldersError("Mapper opdateres lige nu.");
         setUploadFolderId(null);
         setListFolderId(null);
         return;
@@ -226,8 +226,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       if (!res.ok) {
         setFolders([]);
-        const msg = (json && (json.error || json.message)) || `Kunne ikke hente mapper (${res.status}).`;
-        setFoldersError(String(msg));
+        setFoldersError("Mapper opdateres lige nu.");
         setUploadFolderId(null);
         setListFolderId(null);
         return;
@@ -235,7 +234,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       if (!json || json.ok === false) {
         setFolders([]);
-        setFoldersError(String(json?.error ?? json?.message ?? "Kunne ikke hente mapper."));
+        setFoldersError("Mapper opdateres lige nu.");
         setUploadFolderId(null);
         setListFolderId(null);
         return;
@@ -279,7 +278,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       setFolders([]);
       setUploadFolderId(null);
       setListFolderId(null);
-      setFoldersError("Kunne ikke hente mapper.");
+      setFoldersError("Mapper opdateres lige nu.");
     } finally {
       setFoldersLoading(false);
     }
@@ -302,19 +301,19 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       if (res.status === 401) {
         setFiles([]);
-        setFilesError("Login mangler i denne browser. Filer kan ikke hentes endnu.");
+        setFilesError("Filer opdateres lige nu.");
         return;
       }
 
       if (!res.ok) {
         setFiles([]);
-        setFilesError(String((json && (json.error || json.message)) || `Kunne ikke hente filer (${res.status}).`));
+        setFilesError("Filer opdateres lige nu.");
         return;
       }
 
       if (!json || json.ok === false) {
         setFiles([]);
-        setFilesError(String(json?.error ?? json?.message ?? "Kunne ikke hente filer."));
+        setFilesError("Filer opdateres lige nu.");
         return;
       }
 
@@ -324,7 +323,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     } catch (e) {
       console.error("[UploadClient] loadFiles error", e);
       setFiles([]);
-      setFilesError("Kunne ikke hente filer.");
+      setFilesError("Filer opdateres lige nu.");
     } finally {
       setFilesLoading(false);
     }
@@ -612,7 +611,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           <div className="mt-1 text-[11px] text-zinc-500">
             Mapper styrer, hvilket fag/forløb materialet bliver knyttet til.
           </div>
-          {foldersError ? <div className="mt-2 text-[11px] text-red-600">{foldersError}</div> : null}
+          {foldersError ? <div className="mt-2 text-[11px] text-zinc-600">{foldersError}</div> : null}
           {!foldersLoading && !hasValidUploadFolder ? (
             <div className="mt-2 text-[11px] text-amber-700">
               <div>Du skal oprette eller vælge en mappe, før du kan uploade materiale.</div>
@@ -781,7 +780,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           </select>
         </div>
 
-        {filesError ? <div className="mt-3 text-xs text-red-600">{filesError}</div> : null}
+        {filesError ? <div className="mt-3 text-xs text-zinc-600">{filesError}</div> : null}
         {deleteError ? <div className="mt-3 text-xs text-red-600">{deleteError}</div> : null}
         {moveError ? <div className="mt-3 text-xs text-red-600">{moveError}</div> : null}
         {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}

@@ -102,7 +102,20 @@ export default async function Page({
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
-    return null;
+    return (
+      <main>
+        <header>
+          <h1 className="text-lg font-semibold text-zinc-900">Træner</h1>
+          <p className="mt-1 max-w-2xl text-sm text-zinc-600">
+            Træn eksamenslignende spørgsmål og få feedback på dine svar – baseret på dit eget pensum og faglige kilder.
+          </p>
+          <div className="mt-3 h-px w-full bg-zinc-200" />
+        </header>
+        <section className="mt-2 rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
+          Træner-indholdet opdateres lige nu.
+        </section>
+      </main>
+    );
   }
 
   const { data, error } = await sb

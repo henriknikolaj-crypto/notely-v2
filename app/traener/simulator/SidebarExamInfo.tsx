@@ -75,8 +75,7 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
         if (cancelled) return;
 
         if (!res.ok || !data || (data as any).ok === false) {
-          const msg = (data as any)?.error ?? `Kunne ikke hente runder (${res.status}).`;
-          setError(String(msg));
+          setError(null);
           setItems([]);
           setTotal(0);
           return;
@@ -92,7 +91,7 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
       } catch (err) {
         console.error("SidebarExamInfo fetch error:", err);
         if (!cancelled) {
-          setError("Kunne ikke hente runder.");
+          setError(null);
           setItems([]);
           setTotal(0);
         }
@@ -133,7 +132,7 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
       </div>
 
       {loading ? <p className="text-[11px] text-zinc-500">Henter runder …</p> : null}
-      {error && !loading ? <p className="text-[11px] text-red-600">{error}</p> : null}
+      {error && !loading ? <p className="text-[11px] text-zinc-500">{error}</p> : null}
 
       {!loading && !error ? (
         (items ?? []).length ? (

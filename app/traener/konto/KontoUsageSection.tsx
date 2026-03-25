@@ -24,6 +24,13 @@ function formatUsage(feature: FeatureQuota | undefined, fallbackUnlimited = fals
   return limit == null ? "Ubegrænset" : `${used} / ${limit}`;
 }
 
+function normalizeQuotaError(err: unknown) {
+  const msg = String((err as any)?.message ?? err ?? "").trim().toLowerCase();
+  if (!msg) return "Forbrug opdateres snart.";
+  if (msg.includes("unauthorized") || msg.includes("login")) return "Forbrug opdateres snart.";
+  return "Forbrug opdateres snart.";
+}
+
 export default function KontoUsageSection({
   plan,
 }: {
@@ -47,7 +54,7 @@ export default function KontoUsageSection({
         setData(json);
       } catch (err: any) {
         if (!active) return;
-        setError(String(err?.message ?? "Kunne ikke hente forbrug."));
+        setError(normalizeQuotaError(err));
       } finally {
         if (active) setLoading(false);
       }

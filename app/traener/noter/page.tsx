@@ -89,7 +89,22 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) return null;
+  if (!ownerId) {
+    return (
+      <section className="space-y-4">
+        <header className="mb-2 border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold">Noter</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            Venstre kolonne vælger scope. De mapper, du har valgt til træning,
+            styrer hvilke filer der kan vælges som kilde her.
+          </p>
+        </header>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
+          Noter-indholdet opdateres lige nu.
+        </section>
+      </section>
+    );
+  }
 
   const sp = (await searchParams) ?? {};
   const scopeRaw = sp.scope;

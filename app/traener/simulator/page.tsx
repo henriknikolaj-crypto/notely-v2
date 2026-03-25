@@ -134,7 +134,22 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) return null;
+  if (!ownerId) {
+    return (
+      <main>
+        <header>
+          <h1 className="text-lg font-semibold text-zinc-900">Eksamen</h1>
+          <p className="mt-1 max-w-2xl text-sm text-zinc-600">
+            Tidsbegrænsede eksamensforløb med flere spørgsmål i træk – samme følelse som en rigtig prøve.
+          </p>
+          <div className="mt-3 h-px w-full bg-zinc-200" />
+        </header>
+        <section className="mt-2 rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
+          Eksamen-indholdet opdateres lige nu.
+        </section>
+      </main>
+    );
+  }
 
   // ✅ Byg “Samfund +1” label ud fra scope/folder
   const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);

@@ -1,6 +1,5 @@
 import "server-only";
 
-import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { getCanonicalUserPlan, getPlanLimits, normalizePlanCode } from "@/lib/plan/limits";
 import KontoUsageSection from "./KontoUsageSection";
@@ -50,7 +49,21 @@ export default async function TrainerAccountPage() {
   } = await sb.auth.getUser();
 
   const ownerId = user?.id ?? process.env.DEV_USER_ID ?? null;
-  if (!ownerId) redirect("/auth/login");
+  if (!ownerId) {
+    return (
+      <main className="space-y-6">
+        <section className="border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold text-zinc-900">Konto</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            En enkel oversigt over din konto, dit forbrug og din plan i Notely.
+          </p>
+        </section>
+        <section className="rounded-2xl border border-zinc-200 bg-white p-5 text-sm text-zinc-600 shadow-sm">
+          Kontooplysningerne opdateres lige nu.
+        </section>
+      </main>
+    );
+  }
 
   const planInfo = await getCanonicalUserPlan(sb, ownerId);
   const plan = normalizePlanCode(planInfo.normalizedPlan);

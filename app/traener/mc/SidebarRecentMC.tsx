@@ -74,7 +74,7 @@ export default function SidebarRecentMC({
       } catch (err) {
         console.error("SidebarRecentMC fetch error:", err);
         if (!cancelled) {
-          setError("Kunne ikke hente MC-historik.");
+          setError(null);
           setItems([]);
           setTotal(0);
           onCountChange?.(0);
@@ -107,10 +107,6 @@ export default function SidebarRecentMC({
         Henter dine MC-forsøg …
       </p>
     );
-  }
-
-  if (error) {
-    return <p className="text-[11px] text-red-600">{error}</p>;
   }
 
   const all = items ?? [];

@@ -116,19 +116,19 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
 
       if (statusRes.status === 401 || quotaRes.status === 401) {
         setData(null);
-        setErr("Login mangler i denne browser. Upload-status kan ikke vises uden en gyldig session.");
+        setErr("Upload-status opdateres lige nu.");
         return;
       }
 
       if (!statusRes.ok || !statusJson) {
         setData(null);
-        setErr(`Kunne ikke hente status (${statusRes.status}).`);
+        setErr("Upload-status opdateres lige nu.");
         return;
       }
 
       if (statusJson.ok === false) {
         setData(null);
-        setErr(String(statusJson.error ?? "Kunne ikke hente status."));
+        setErr("Upload-status opdateres lige nu.");
         return;
       }
 
@@ -155,7 +155,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
     } catch (e) {
       console.error("[ImportStatusBox] load error", e);
       setData(null);
-      setErr("Kunne ikke hente status.");
+      setErr("Upload-status opdateres lige nu.");
     } finally {
       setLoading(false);
     }
@@ -255,7 +255,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
       </div>
 
       {loading ? <div className="mt-3 text-xs text-zinc-500">Indlæser…</div> : null}
-      {err ? <div className="mt-3 text-xs text-red-600">{err}</div> : null}
+      {err ? <div className="mt-3 text-xs text-zinc-600">{err}</div> : null}
     </div>
   );
 }

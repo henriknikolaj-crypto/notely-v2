@@ -425,12 +425,16 @@ export default function OverblikClient() {
         });
         const payload = (await res.json().catch(() => ({}))) as OverviewResponse;
 
-        if (res.status === 401) {
-          throw new Error("Login mangler i denne browser. Overblik kan ikke hentes uden en gyldig session.");
+        if (res.status === 401 || res.status === 403) {
+          if (active) {
+            setItems([]);
+            setError(null);
+          }
+          return;
         }
 
         if (!res.ok) {
-          throw new Error(payload?.error || "Kunne ikke hente overblik.");
+          throw new Error("Kunne ikke hente overblik.");
         }
 
         if (active) {
@@ -467,8 +471,8 @@ export default function OverblikClient() {
       {loading ? <p className="text-sm text-zinc-600">Henter overblik...</p> : null}
 
       {!loading && error ? (
-        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-          Fejl ved hentning af overblik: {error}
+        <div className="rounded-xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
+          Overblik opdateres lige nu.
         </div>
       ) : null}
 
