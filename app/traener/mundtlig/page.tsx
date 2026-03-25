@@ -141,13 +141,7 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) {
-    return (
-      <main className="p-6 text-sm text-red-600">
-        Du skal være logget ind for at åbne Træner.
-      </main>
-    );
-  }
+  if (!ownerId) return null;
 
   // ✅ “Samfund +1” label ud fra scope/folder
   const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);

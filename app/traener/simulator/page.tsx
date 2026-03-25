@@ -134,13 +134,7 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) {
-    return (
-      <main className="p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
-      </main>
-    );
-  }
+  if (!ownerId) return null;
 
   // ✅ Byg “Samfund +1” label ud fra scope/folder
   const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);

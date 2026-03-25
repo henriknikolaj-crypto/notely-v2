@@ -95,13 +95,7 @@ export default async function Page({
 }) {
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
-  if (!ownerId) {
-    return (
-      <section className="p-6 text-sm text-red-600">
-        Du skal være logget ind for at åbne Flashcards.
-      </section>
-    );
-  }
+  if (!ownerId) return null;
 
   const sp = (await searchParams) ?? {};
   const requestedScopeFolderIds = parseScopeIds(sp.scope);
