@@ -101,7 +101,9 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) redirect("/auth/login");
+  if (!ownerId) {
+    return null;
+  }
 
   const { data, error } = await sb
     .from("folders")
