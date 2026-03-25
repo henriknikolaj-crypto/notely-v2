@@ -18,8 +18,6 @@ const TABS: TabDef[] = [
   { label: "Noter", href: "/traener/noter" },
   { label: "Multiple Choice", href: "/traener/mc" },
   { label: "Flashcards", href: "/traener/flashcards" },
-  // Træner bruger /traener-siden (PoC)
-  { label: "Træner", href: "/traener", pro: true },
   { label: "Simulator", href: "/traener/simulator", pro: true },
 ];
 

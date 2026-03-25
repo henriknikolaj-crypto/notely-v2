@@ -200,26 +200,31 @@ export default async function TraenerLayout({
       <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6 md:px-6">
         {/* VENSTRE SIDEBAR */}
         <aside className="w-64 shrink-0">
-          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
-            <div className="px-2 pt-1 pb-1 font-semibold text-zinc-800">
-              Mit Notely
+          <div className="space-y-3 text-sm">
+            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
+              <div className="px-2 pt-1 pb-1 font-semibold text-zinc-800">
+                Mit Notely
+              </div>
+              <TrainingSidebarMainNav />
             </div>
 
-            <TrainingSidebarMainNav />
-
-            <div className="px-2 pt-2 font-semibold text-zinc-800">
-              Dine fag
+            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
+              <div className="px-2 pt-1 pb-1 font-semibold text-zinc-800">
+                Dine fag
+              </div>
+              <TrainingSidebarFolders folders={folders} />
             </div>
-            <TrainingSidebarFolders folders={folders} />
 
-            <TrainingSidebarStats
-              latestNotes={latestNotes}
-              latestEvals={latestEvals}
-              notesCount={trainerNotesCount}
-              evalCount={evalCount}
-              resumeCount={resumeCount}
-              focusCount={focusCount}
-            />
+            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
+              <TrainingSidebarStats
+                latestNotes={latestNotes}
+                latestEvals={latestEvals}
+                notesCount={trainerNotesCount}
+                evalCount={evalCount}
+                resumeCount={resumeCount}
+                focusCount={focusCount}
+              />
+            </div>
           </div>
         </aside>
 

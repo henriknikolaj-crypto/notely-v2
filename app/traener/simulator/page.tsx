@@ -1,5 +1,6 @@
 // app/traener/simulator/page.tsx
 import "server-only";
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
 export const dynamic = "force-dynamic";
@@ -11,9 +12,9 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {
-    // DEV fallback
+    // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 export default async function SimulatorPage({
@@ -40,11 +41,7 @@ export default async function SimulatorPage({
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
-    return (
-      <main className="p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
-      </main>
-    );
+    redirect("/auth/login");
   }
 
   const scopeLabel = (() => {

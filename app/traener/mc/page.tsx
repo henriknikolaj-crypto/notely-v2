@@ -1,6 +1,7 @@
 // app/traener/mc/page.tsx
 import "server-only";
 
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ClientMC from "./ClientMC";
 
@@ -19,9 +20,9 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {
-    // falder igennem til DEV
+    // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 export default async function MCPage({
@@ -49,11 +50,7 @@ export default async function MCPage({
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
-    return (
-      <main className="p-4 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
-      </main>
-    );
+    redirect("/auth/login");
   }
 
   const { data: folders } = await sb

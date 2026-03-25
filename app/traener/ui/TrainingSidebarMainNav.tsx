@@ -8,9 +8,7 @@ export default function TrainingSidebarMainNav() {
   const raw = usePathname() || "/";
   const p = raw.replace(/\/+$/, ""); // fjern trailing slash
 
-  const onOverview = p === "/traener";
   const onTraining =
-    p === "/traener" ||
     p.startsWith("/traener/noter") ||
     p.startsWith("/traener/mc") ||
     p.startsWith("/traener/flashcards") ||
@@ -25,20 +23,11 @@ export default function TrainingSidebarMainNav() {
   return (
     <nav className="space-y-1 px-2 text-xs">
       <Link
-        href="/traener"
-        className={`${base} ${onOverview ? active : inactive}`}
-        aria-current={onOverview ? "page" : undefined}
-      >
-        Træner
-      </Link>
-
-      {/* Samler alle træningssider under én aktiv tilstand */}
-      <Link
         href="/traener/noter"
         className={`${base} ${onTraining ? active : inactive}`}
         aria-current={onTraining ? "page" : undefined}
       >
-        Noter / træning
+        Noter
       </Link>
 
       <Link
