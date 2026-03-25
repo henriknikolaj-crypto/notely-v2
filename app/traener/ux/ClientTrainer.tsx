@@ -650,6 +650,47 @@ export default function ClientTrainer({
         </section>
       ) : null}
 
+      <TrainingScopeCard
+        names={selectedScopeNames}
+        className="hidden md:block"
+        emptyLabel={scopeEmptyLabel}
+      >
+        {demoMode ? (
+          <div
+            className="inline-flex rounded-full border px-2 py-1 text-[11px] font-medium"
+            style={{
+              borderColor: "#ffbf00",
+              backgroundColor: "#ffbf00",
+              color: "#000000",
+            }}
+          >
+            Demo-materiale
+          </div>
+        ) : null}
+        {!demoMode ? (
+          <label className="mt-3 inline-flex items-start gap-2 text-xs text-zinc-700">
+            <input
+              type="checkbox"
+              checked={effectiveFocusMode === "weakest"}
+              disabled={!hasSelectedFolder}
+              onChange={(e) => setFocusMode(e.target.checked ? "weakest" : "normal")}
+              className="mt-0.5 h-4 w-4 rounded border-zinc-300 accent-black text-zinc-900 focus:ring-zinc-900/20 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <span>
+              <span className="block font-medium">Træn på mine svage punkter</span>
+              <span className="block text-zinc-500">Bruger seneste vurderinger i valgt mappe.</span>
+            </span>
+          </label>
+        ) : null}
+        {effectiveFocusMode === "weakest" ? (
+          <div className="mt-2">
+            <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-medium text-emerald-700">
+              Målrettet
+            </span>
+          </div>
+        ) : null}
+      </TrainingScopeCard>
+
       <TrainingScopeCard names={selectedScopeNames} className="p-4 md:hidden" emptyLabel={scopeEmptyLabel}>
         {!demoMode ? (
           <FeatureScopePicker selectedNames={selectedScopeNames} selectedScopeIds={effectiveScopeFolderIds} />

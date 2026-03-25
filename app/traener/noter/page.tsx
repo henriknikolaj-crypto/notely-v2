@@ -1,6 +1,7 @@
 // app/traener/noter/page.tsx
 import "server-only";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import GenerateFromSource from "./ui/GenerateFromSource";
 
 export const dynamic = "force-dynamic";
@@ -56,6 +57,30 @@ async function listFilesForScope(sb: any, ownerId: string, folderIds: string[]):
   }));
 }
 
+async function getScopeNames(sb: any, ownerId: string, folderIds: string[]): Promise<string[]> {
+  if (!folderIds.length) return [];
+
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .in("id", folderIds);
+
+  if (error) {
+    console.error("[traener/noter] folders load error:", error);
+    return [];
+  }
+
+  const map = new Map<string, string>();
+  for (const row of (data ?? []) as any[]) {
+    const id = String(row.id ?? "").trim();
+    const name = String(row.name ?? "").trim();
+    if (id && name) map.set(id, name);
+  }
+
+  return folderIds.filter((id) => map.has(id)).map((id) => map.get(id) as string);
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -91,6 +116,7 @@ export default async function Page({
   }
 
   const primaryFolderId = scopeFolderIds[0] ?? null;
+  const scopeNames = await getScopeNames(sb, ownerId, scopeFolderIds);
   const files = await listFilesForScope(sb, ownerId, scopeFolderIds);
   const hasScope = scopeFolderIds.length > 0;
 
@@ -103,6 +129,13 @@ export default async function Page({
           styrer hvilke filer der kan vælges som kilde her.
         </p>
       </header>
+
+      <TrainingScopeCard
+        names={scopeNames}
+        className="hidden md:block"
+        emptyLabel="Vælg en mappe i venstre side."
+        helpText={!hasScope ? "Noter er låst, indtil du har valgt en mappe." : undefined}
+      />
 
       <GenerateFromSource
         ownerId={ownerId}

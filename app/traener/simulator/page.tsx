@@ -195,6 +195,12 @@ export default async function Page({
           />
           <div id="written-exam-training-area-slot" />
         </TrainingScopeCard>
+        <TrainingScopeCard
+          names={scopeCompact ? [scopeCompact] : []}
+          className="hidden md:block"
+          emptyLabel="Vælg en mappe i venstre side."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        />
 
         <ClientWrittenExam
           scopeFolderIds={resolvedTrainingFolderIds}
