@@ -81,6 +81,29 @@ function normalizePlan(raw: any) {
   return p;
 }
 
+async function listFolderOptions(sb: any, ownerId: string) {
+  const { data, error } = await sb
+    .from("folders")
+    .select("id, name")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) {
+    console.error("[simulator/page] folder options load error:", error);
+    return [] as Array<{ id: string; name: string }>;
+  }
+
+  return ((data ?? []) as any[])
+    .map((row) => {
+      const id = String(row?.id ?? "").trim();
+      const name = String(row?.name ?? "").trim();
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean) as Array<{ id: string; name: string }>;
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -140,6 +163,7 @@ export default async function Page({
   const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
   const resolvedTrainingFolderIds = trainingFolderIds.filter((id) => folderMap.has(id));
   const resolvedActiveFolderId = resolvedTrainingFolderIds[0] ?? null;
+  const folderOptions = await listFolderOptions(sb, ownerId);
   const { data: profile } = await sb
     .from("profiles")
     .select("plan")
@@ -192,6 +216,7 @@ export default async function Page({
           <FeatureScopePicker
             selectedNames={scopeCompact ? [scopeCompact] : []}
             selectedScopeIds={resolvedTrainingFolderIds}
+            initialFolders={folderOptions}
           />
           <div id="written-exam-training-area-slot" />
         </TrainingScopeCard>

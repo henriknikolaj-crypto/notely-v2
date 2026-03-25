@@ -693,7 +693,11 @@ export default function ClientTrainer({
 
       <TrainingScopeCard names={selectedScopeNames} className="p-4 md:hidden" emptyLabel={scopeEmptyLabel}>
         {!demoMode ? (
-          <FeatureScopePicker selectedNames={selectedScopeNames} selectedScopeIds={effectiveScopeFolderIds} />
+          <FeatureScopePicker
+            selectedNames={selectedScopeNames}
+            selectedScopeIds={effectiveScopeFolderIds}
+            initialFolders={(folders ?? []).map((folder) => ({ id: folder.id, name: folder.name }))}
+          />
         ) : null}
         {demoMode ? (
           <div

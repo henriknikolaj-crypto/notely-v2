@@ -65,6 +65,29 @@ async function getResolvedScope(sb: any, ownerId: string, folderIds: string[]) {
   return { scopeFolderIds, names };
 }
 
+async function listFolderOptions(sb: any, ownerId: string) {
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) {
+    console.error("[flashcards/page] folder options load error:", error);
+    return [] as Array<{ id: string; name: string }>;
+  }
+
+  return ((data ?? []) as any[])
+    .map((row) => {
+      const id = String(row?.id ?? "").trim();
+      const name = String(row?.name ?? "").trim();
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean) as Array<{ id: string; name: string }>;
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -82,6 +105,7 @@ export default async function Page({
 
   const sp = (await searchParams) ?? {};
   const requestedScopeFolderIds = parseScopeIds(sp.scope);
+  const folderOptions = await listFolderOptions(sb, ownerId);
   const resolvedScope = await getResolvedScope(sb, ownerId, requestedScopeFolderIds);
   const scopeFolderIds = resolvedScope.scopeFolderIds;
   const names = resolvedScope.names;
@@ -103,7 +127,7 @@ export default async function Page({
         emptyLabel="Vælg en mappe direkte her."
         helpText={!hasScope ? "Flashcards er låst, indtil du har valgt en mappe." : undefined}
       >
-        <FeatureScopePicker selectedNames={names} selectedScopeIds={scopeFolderIds} />
+        <FeatureScopePicker selectedNames={names} selectedScopeIds={scopeFolderIds} initialFolders={folderOptions} />
       </TrainingScopeCard>
       <TrainingScopeCard
         names={names}

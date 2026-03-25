@@ -13,6 +13,7 @@ type Props = {
   selectedNames: string[];
   selectedScopeIds?: string[];
   disabled?: boolean;
+  initialFolders?: FolderOption[];
 };
 
 function parseJson(text: string) {
@@ -50,17 +51,25 @@ export default function FeatureScopePicker({
   selectedNames,
   selectedScopeIds = [],
   disabled = false,
+  initialFolders,
 }: Props) {
   const pathname = usePathname() || "/";
   const searchParams = useSearchParams();
   const router = useRouter();
 
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !Array.isArray(initialFolders));
   const [error, setError] = useState<string | null>(null);
-  const [folders, setFolders] = useState<FolderOption[]>([]);
+  const [folders, setFolders] = useState<FolderOption[]>(() => (Array.isArray(initialFolders) ? initialFolders : []));
 
   useEffect(() => {
+    if (Array.isArray(initialFolders)) {
+      setFolders(initialFolders);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
     let alive = true;
 
     void (async () => {
@@ -79,7 +88,7 @@ export default function FeatureScopePicker({
 
         if (res.status === 401) {
           setFolders([]);
-          setError("Login mangler i denne browser, så du kan ikke vælge mappe her endnu.");
+          setError("Mapper kan ikke opdateres i denne browser lige nu.");
           return;
         }
 
@@ -150,12 +159,7 @@ export default function FeatureScopePicker({
       ) : null}
 
       {error ? (
-        <p className="text-xs text-zinc-600">
-          {error}{" "}
-          <Link href="/auth/login" className="underline underline-offset-2">
-            Log ind
-          </Link>
-        </p>
+        <p className="text-xs text-zinc-600">{error}</p>
       ) : null}
 
       {!loading && !error && folders.length === 0 ? (
