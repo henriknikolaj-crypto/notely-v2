@@ -40,12 +40,23 @@ function normalizePlan(raw: unknown): "pro" | "basis" | "freemium" | null {
   return null;
 }
 
-export default function TrainingTabs({ isPro: _isPro = false }: { isPro?: boolean }) {
+export default function TrainingTabs({
+  isPro: _isPro = false,
+  disableLiveFetch = false,
+}: {
+  isPro?: boolean;
+  disableLiveFetch?: boolean;
+}) {
   const pathname = (usePathname() || "").replace(/\/+$/, "");
   const sp = useSearchParams();
   const [planFromApi, setPlanFromApi] = useState<"pro" | "basis" | "freemium" | null>(null);
 
   useEffect(() => {
+    if (disableLiveFetch) {
+      setPlanFromApi(null);
+      return;
+    }
+
     let active = true;
 
     if (typeof window !== "undefined") {
@@ -96,7 +107,7 @@ export default function TrainingTabs({ isPro: _isPro = false }: { isPro?: boolea
       document.removeEventListener("visibilitychange", onVisibility);
       window.clearInterval(intervalId);
     };
-  }, []);
+  }, [disableLiveFetch]);
 
   const effectiveIsPro = planFromApi ? planFromApi === "pro" : !!_isPro;
   const examActive =

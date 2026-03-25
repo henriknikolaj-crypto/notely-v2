@@ -58,8 +58,12 @@ function isAuthError(msg: string | null | undefined) {
 
 export default function SidebarQuotaBox({
   compact = false,
+  disableLiveFetch = false,
+  planLabel = null,
 }: {
   compact?: boolean;
+  disableLiveFetch?: boolean;
+  planLabel?: string | null;
 }) {
   const [data, setData] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +95,12 @@ export default function SidebarQuotaBox({
   }
 
   useEffect(() => {
+    if (disableLiveFetch) {
+      setData(null);
+      setError(null);
+      return;
+    }
+
     let cancelled = false;
 
     const safeLoad = async () => {
@@ -118,11 +128,20 @@ export default function SidebarQuotaBox({
       document.removeEventListener("visibilitychange", onVis);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [disableLiveFetch]);
 
   let body: ReactNode = null;
 
-  if (!data && !error) {
+  if (disableLiveFetch) {
+    body = (
+      <>
+        <div className="mb-1 text-[12px] font-semibold text-zinc-800">
+          Månedligt forbrug{planLabel ? ` (${planLabel})` : ""}
+        </div>
+        <div className="text-[11px] text-zinc-500">Forbrug opdateres automatisk, når preview-sessionen er stabil.</div>
+      </>
+    );
+  } else if (!data && !error) {
     body = <div className="text-[11px] text-zinc-500">Henter månedligt forbrug …</div>;
   } else if (error || !data?.ok) {
     body = <div className="text-[11px] text-zinc-500">{error ?? "Forbrug opdateres snart."}</div>;

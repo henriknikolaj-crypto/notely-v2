@@ -71,6 +71,7 @@ export default async function TraenerLayout({
   if (!ownerId) redirect("/auth/login");
 
   let isPro = false;
+  let planLabel: string | null = null;
   try {
     const admin = supabaseAdmin();
     const { data: profileData, error: profileError } = await admin
@@ -81,10 +82,15 @@ export default async function TraenerLayout({
     if (profileError) throw profileError;
     const planNorm = normalizePlan((profileData as any)?.plan ?? null);
     isPro = planNorm === "pro";
+    planLabel =
+      planNorm === "pro" ? "Pro" : planNorm === "basis" ? "Basis" : planNorm === "freemium" ? "Freemium" : null;
   } catch (e) {
     console.error("TRÆNER layout pro lookup error:", e);
     isPro = false;
+    planLabel = null;
   }
+
+  const disableLiveQuotaFetch = process.env.VERCEL_ENV === "preview";
 
   // ---- Mapper i venstre træ ----
   const { data: foldersData, error: foldersError } = await sb
@@ -225,6 +231,8 @@ export default async function TraenerLayout({
               evalCount={evalCount}
               resumeCount={resumeCount}
               focusCount={focusCount}
+              planLabel={planLabel}
+              disableLiveQuotaFetch={disableLiveQuotaFetch}
             />
           </div>
         </aside>
@@ -234,7 +242,7 @@ export default async function TraenerLayout({
           <div className="mx-auto w-full max-w-3xl">
             <MobileBackToMenu />
             <div className="hidden md:block">
-              <TrainingTabs isPro={isPro} />
+              <TrainingTabs isPro={isPro} disableLiveFetch={disableLiveQuotaFetch} />
             </div>
             {children}
           </div>

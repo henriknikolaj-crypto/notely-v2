@@ -88,6 +88,8 @@ export default function TrainingSidebarStats({
   evalCount,
   resumeCount,
   focusCount,
+  planLabel = null,
+  disableLiveQuotaFetch = false,
 }: {
   latestNotes: Note[];
   latestEvals: Eval[];
@@ -97,6 +99,8 @@ export default function TrainingSidebarStats({
   resumeCount?: number;
   /** Antal fokus-noter i alt */
   focusCount?: number;
+  planLabel?: string | null;
+  disableLiveQuotaFetch?: boolean;
 }) {
   const pathname = usePathname() || "";
   const sp = useSearchParams();
@@ -168,7 +172,7 @@ export default function TrainingSidebarStats({
           <div className="mt-1 text-[10px] text-zinc-400">I alt {totalEvals} evalueringer</div>
         </div>
 
-        <SidebarQuotaBox />
+        <SidebarQuotaBox disableLiveFetch={disableLiveQuotaFetch} planLabel={planLabel} />
       </div>
     );
   }
@@ -247,7 +251,7 @@ export default function TrainingSidebarStats({
           <div className="mt-1 text-[10px] text-zinc-400">I alt {totalFocus} fokus-noter</div>
         </div>
 
-        <SidebarQuotaBox />
+        <SidebarQuotaBox disableLiveFetch={disableLiveQuotaFetch} planLabel={planLabel} />
       </div>
     );
   }
@@ -268,7 +272,7 @@ export default function TrainingSidebarStats({
           <SidebarRecentMC onCountChange={setMcTotal} />
         </div>
 
-        <SidebarQuotaBox />
+        <SidebarQuotaBox disableLiveFetch={disableLiveQuotaFetch} planLabel={planLabel} />
       </div>
     );
   }
@@ -278,7 +282,7 @@ export default function TrainingSidebarStats({
     return (
       <div className="mt-4 space-y-4 px-2 text-[12px]">
         <SidebarFlashcards />
-        <SidebarQuotaBox />
+        <SidebarQuotaBox disableLiveFetch={disableLiveQuotaFetch} planLabel={planLabel} />
       </div>
     );
   }
@@ -296,7 +300,7 @@ export default function TrainingSidebarStats({
           <SidebarExamInfo mode={examMode} />
         </div>
 
-        <SidebarQuotaBox />
+        <SidebarQuotaBox disableLiveFetch={disableLiveQuotaFetch} planLabel={planLabel} />
       </div>
     );
   }
