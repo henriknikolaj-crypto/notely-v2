@@ -134,9 +134,7 @@ export default function TrainingSidebarFolders({ folders }: Props) {
       : `${selectedCount} mapper`;
 
   return (
-    <div className="mt-4 text-xs text-zinc-800">
-      <p className="mb-2 font-semibold">Dine fag</p>
-
+    <div className="text-xs text-zinc-800">
       <ul className="mb-2 list-none pl-0">
         {tree.map((node) => renderNode(node, false))}
       </ul>
