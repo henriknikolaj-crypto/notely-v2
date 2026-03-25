@@ -104,21 +104,6 @@ export default function LoginPageClient() {
         error: error?.message ?? null,
       });
       if (error) throw error;
-      if (data?.user) {
-        console.info("[auth-debug] login profile upsert:start", { userId: data.user.id });
-        const profileUpsert = await supabase.from("profiles").upsert({
-          id: data.user.id, email: data.user.email, plan: "Freemium",
-        });
-        if (profileUpsert.error) {
-          console.warn("[auth-debug] login profile upsert failed (non-blocking)", {
-            userId: data.user.id,
-            message: profileUpsert.error.message,
-            status: (profileUpsert.error as any)?.status ?? null,
-          });
-        } else {
-          console.info("[auth-debug] login profile upsert:done", { userId: data.user.id });
-        }
-      }
       await trackLoginCompleted(data.user?.id ?? null, { feature: "auth_login", method: "password" });
       console.info("[auth-debug] login redirect target", { target });
       await redirectAfterAuth(target);
