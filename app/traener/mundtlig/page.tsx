@@ -4,6 +4,7 @@ import "server-only";
 import Link from "next/link";
 import { unstable_noStore as noStore } from "next/cache";
 import { createClient } from "@supabase/supabase-js";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ClientOralExam from "./ClientOralExam";
 import TrainingScopeCard from "../_ui/TrainingScopeCard";
@@ -11,16 +12,6 @@ import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {}
-  return null;
-}
 
 function supabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -139,24 +130,8 @@ export default async function Page({
   const hrefMundtlig = buildHref("/traener/mundtlig", sp, {});
 
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return (
-      <main>
-        <header>
-          <h1 className="text-lg font-semibold text-zinc-900">Eksamen</h1>
-          <p className="mt-1 max-w-2xl text-sm text-zinc-600">
-            Tidsbegrænsede eksamensforløb med flere spørgsmål i træk – samme følelse som en rigtig prøve.
-          </p>
-          <div className="mt-3 h-px w-full bg-zinc-200" />
-        </header>
-        <section className="mt-2 rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
-          Mundtlig eksamen opdateres lige nu.
-        </section>
-      </main>
-    );
-  }
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
 
   // ✅ “Samfund +1” label ud fra scope/folder
   const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);

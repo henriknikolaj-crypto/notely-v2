@@ -1,24 +1,13 @@
 // app/traener/mc/page.tsx
 import "server-only";
 
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import ClientMC from "./ClientMC";
 import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
 
 function parseScopeFolderIds(sp: Record<string, string | string[]>) {
   const scopeRaw = (sp as any)?.scope;
@@ -102,23 +91,8 @@ export default async function Page({
   searchParams?: Promise<Record<string, string | string[]>>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return (
-      <section className="space-y-4">
-        <header className="mb-2 border-b border-zinc-200 pb-3">
-          <h1 className="text-lg font-semibold">Multiple Choice</h1>
-          <p className="mt-1 text-sm text-zinc-600">
-            Træn på dit eget pensum. Vælg eller skift mappe her, og start når du er klar.
-          </p>
-        </header>
-        <section className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
-          Multiple Choice-indholdet opdateres lige nu.
-        </section>
-      </section>
-    );
-  }
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
 
   const sp = (await searchParams) ?? {};
   const requestedScopeFolderIds = parseScopeFolderIds(sp);

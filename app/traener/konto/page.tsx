@@ -1,5 +1,6 @@
 import "server-only";
 
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { getCanonicalUserPlan, getPlanLimits, normalizePlanCode } from "@/lib/plan/limits";
 import KontoUsageSection from "./KontoUsageSection";
@@ -44,31 +45,13 @@ function buildMailtoHref(email: string, subject: string, bodyLines: string[]) {
 
 export default async function TrainerAccountPage() {
   const sb = await supabaseServerRSC();
-  const {
-    data: { user },
-  } = await sb.auth.getUser();
-
-  const ownerId = user?.id ?? process.env.DEV_USER_ID ?? null;
-  if (!ownerId) {
-    return (
-      <main className="space-y-6">
-        <section className="border-b border-zinc-200 pb-3">
-          <h1 className="text-lg font-semibold text-zinc-900">Konto</h1>
-          <p className="mt-1 text-sm text-zinc-600">
-            En enkel oversigt over din konto, dit forbrug og din plan i Notely.
-          </p>
-        </section>
-        <section className="rounded-2xl border border-zinc-200 bg-white p-5 text-sm text-zinc-600 shadow-sm">
-          Kontooplysningerne opdateres lige nu.
-        </section>
-      </main>
-    );
-  }
+  const { ownerId, email } = await getTrainerSession();
+  if (!ownerId) return null;
 
   const planInfo = await getCanonicalUserPlan(sb, ownerId);
   const plan = normalizePlanCode(planInfo.normalizedPlan);
   const limits = await getPlanLimits(sb, plan);
-  const email = user?.email ?? "Ikke tilgængelig";
+  const accountEmail = email ?? "Ikke tilgængelig";
   const supportEmail = resolveSupportEmail();
   const deleteAccountHref = buildMailtoHref(
     supportEmail,
@@ -97,7 +80,7 @@ export default async function TrainerAccountPage() {
         <dl className="space-y-3">
           <div className="flex items-center justify-between gap-4 border-b border-zinc-100 pb-3">
             <dt className="text-sm text-zinc-600">E-mail</dt>
-            <dd className="text-sm font-medium text-zinc-900">{email}</dd>
+            <dd className="text-sm font-medium text-zinc-900">{accountEmail}</dd>
           </div>
           <div className="flex items-center justify-between gap-4">
             <dt className="text-sm text-zinc-600">Plan</dt>

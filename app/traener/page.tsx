@@ -1,5 +1,6 @@
 ﻿// app/traener/page.tsx
 import "server-only";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { redirect } from "next/navigation";
 import ClientTrainer from "./ux/ClientTrainer";
@@ -53,18 +54,6 @@ async function hasOwnUsableMaterial(sb: any, ownerId: string): Promise<boolean> 
   );
 }
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
 export default async function Page({
   searchParams,
 }: {
@@ -99,24 +88,8 @@ export default async function Page({
   }
 
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    return (
-      <main>
-        <header>
-          <h1 className="text-lg font-semibold text-zinc-900">Træner</h1>
-          <p className="mt-1 max-w-2xl text-sm text-zinc-600">
-            Træn eksamenslignende spørgsmål og få feedback på dine svar – baseret på dit eget pensum og faglige kilder.
-          </p>
-          <div className="mt-3 h-px w-full bg-zinc-200" />
-        </header>
-        <section className="mt-2 rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
-          Træner-indholdet opdateres lige nu.
-        </section>
-      </main>
-    );
-  }
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
 
   const { data, error } = await sb
     .from("folders")

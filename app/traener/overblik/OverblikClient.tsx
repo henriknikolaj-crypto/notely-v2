@@ -472,7 +472,7 @@ export default function OverblikClient() {
 
       {!loading && error ? (
         <div className="rounded-xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600">
-          Overblik opdateres lige nu.
+          Kunne ikke hente overblik endnu.
         </div>
       ) : null}
 

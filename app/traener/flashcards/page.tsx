@@ -1,5 +1,6 @@
 import "server-only";
 
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import FlashcardsClient from "./FlashcardsClient";
@@ -26,18 +27,6 @@ function parseScopeIds(scopeRaw: unknown): string[] {
       .filter(Boolean);
   }
   return [];
-}
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
 }
 
 async function getResolvedScope(sb: any, ownerId: string, folderIds: string[]) {
@@ -94,23 +83,8 @@ export default async function Page({
   searchParams?: Promise<SearchParams>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
-  if (!ownerId) {
-    return (
-      <section className="space-y-4">
-        <header className="mb-2 border-b border-zinc-200 pb-3">
-          <h1 className="text-lg font-semibold">Flashcards</h1>
-          <p className="mt-1 text-sm text-zinc-600">
-            Træn på dit eget pensum. Generér kort til hurtig repetition af begreber,
-            formler og nøglepointer.
-          </p>
-        </header>
-        <section className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-600 shadow-sm">
-          Flashcards-indholdet opdateres lige nu.
-        </section>
-      </section>
-    );
-  }
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
 
   const sp = (await searchParams) ?? {};
   const requestedScopeFolderIds = parseScopeIds(sp.scope);

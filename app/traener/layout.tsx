@@ -5,6 +5,7 @@ import Link from "next/link";
 import { unstable_noStore as noStore } from "next/cache";
 import { redirect } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import TrainingSidebarMainNav from "./ui/TrainingSidebarMainNav";
@@ -56,17 +57,7 @@ export default async function TraenerLayout({
 }) {
   noStore();
   const sb = await supabaseServerRSC();
-  let ownerId: string | null = null;
-  let currentUserEmail: string | null = null;
-  try {
-    const { data, error } = await sb.auth.getUser();
-    if (!error && data?.user?.id) {
-      ownerId = String(data.user.id);
-      currentUserEmail = data.user.email ?? null;
-    }
-  } catch {
-    ownerId = null;
-  }
+  const { ownerId, email: currentUserEmail } = await getTrainerSession();
 
   if (!ownerId) redirect("/auth/login");
 
