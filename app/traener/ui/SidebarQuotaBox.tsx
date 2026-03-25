@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type FeatureQuota = {
   usedThisMonth: number;
@@ -17,6 +18,8 @@ type ApiResponse = {
   trainer_round?: FeatureQuota;
   mc_generate?: FeatureQuota;
   flashcards_generate?: FeatureQuota;
+  notes_summary_generate?: FeatureQuota;
+  notes_focus_generate?: FeatureQuota;
 
   error?: string;
 };
@@ -48,26 +51,25 @@ function normalizePlan(raw: any) {
   return p;
 }
 
-export default function SidebarQuotaBox() {
+export default function SidebarQuotaBox({
+  compact = false,
+}: {
+  compact?: boolean;
+}) {
   const [data, setData] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
 
-  async function load() {
+  async function load(force = false) {
     if (loadingRef.current) return;
     loadingRef.current = true;
 
     try {
-      const res = await fetch("/api/quota/current", {
-        cache: "no-store",
-        headers: { "cache-control": "no-cache" },
-      });
+      const json = (await fetchQuotaCurrent({ force })) as ApiResponse | null;
 
-      const json = (await res.json().catch(() => null)) as ApiResponse | null;
-
-      if (!res.ok) {
-        setData(json);
-        setError(json?.error ?? `HTTP ${res.status}`);
+      if (!json) {
+        setData(null);
+        setError(null);
         return;
       }
 
@@ -93,7 +95,7 @@ export default function SidebarQuotaBox() {
 
     void safeLoad();
 
-    const onQuotaChanged = () => void safeLoad();
+    const onQuotaChanged = () => void load(true);
     window.addEventListener("notely-quota-changed", onQuotaChanged);
 
     const onFocus = () => void safeLoad();
@@ -118,10 +120,11 @@ export default function SidebarQuotaBox() {
   if (!data && !error) {
     body = <div className="text-[11px] text-zinc-500">Henter månedligt forbrug …</div>;
   } else if (error || !data?.ok) {
-    body = <div className="text-[11px] text-red-600">{error ?? "Kunne ikke hente forbrug."}</div>;
+    body = <div className="text-[11px] text-zinc-500">{error ?? "Forbrug opdateres snart."}</div>;
   } else {
     const planNorm = normalizePlan(data.plan);
     const isPaid = planNorm === "basis" || planNorm === "pro";
+    const isFreemium = planNorm === "freemium";
 
     const planLabel =
       planNorm === "pro" ? "Pro" : planNorm === "basis" ? "Basis" : planNorm === "freemium" ? "Freemium" : data.plan ?? "";
@@ -130,6 +133,8 @@ export default function SidebarQuotaBox() {
     const trainerRoundQ = data.trainer_round ?? asQuota();
     const mcQ = data.mc_generate ?? asQuota();
     const flashGenQ = data.flashcards_generate ?? asQuota();
+    const summaryNotesQ = data.notes_summary_generate ?? asQuota();
+    const focusNotesQ = data.notes_focus_generate ?? asQuota();
 
     body = (
       <>
@@ -142,8 +147,10 @@ export default function SidebarQuotaBox() {
         {!isPaid ? (
           <>
             <p>{formatLine("Træner (runder)", trainerRoundQ)}</p>
-            <p>{formatLine("Multiple Choice", mcQ)}</p>
+            <p>{formatLine("Multiple Choice (generering)", mcQ)}</p>
             <p>{formatLine("Flashcards (generering)", flashGenQ)}</p>
+            {isFreemium ? <p>{formatLine("Resuméer", summaryNotesQ)}</p> : null}
+            {isFreemium ? <p>{formatLine("Fokus-noter", focusNotesQ)}</p> : null}
           </>
         ) : null}
       </>
@@ -151,7 +158,14 @@ export default function SidebarQuotaBox() {
   }
 
   return (
-    <div id="notely-quota-box" className="mt-3 border-t border-zinc-200 pt-3 text-[11px] text-zinc-600">
+    <div
+      id="notely-quota-box"
+      className={
+        compact
+          ? "text-[11px] text-zinc-600"
+          : "mt-3 border-t border-zinc-200 pt-3 text-[11px] text-zinc-600"
+      }
+    >
       {body}
     </div>
   );

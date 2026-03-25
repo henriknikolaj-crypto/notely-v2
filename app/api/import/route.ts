@@ -1,9 +1,10 @@
-﻿// app/api/import/route.ts
+// app/api/import/route.ts
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "node:crypto";
+import { captureException } from "@/lib/monitoring/error";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,7 +12,6 @@ export const dynamic = "force-dynamic";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const IMPORT_SHARED_SECRET = process.env.IMPORT_SHARED_SECRET ?? "";
-const DEV_USER_ID = (process.env.DEV_USER_ID ?? "").trim();
 
 type ImportPayload = {
   requestId?: string;
@@ -26,6 +26,11 @@ type ImportPayload = {
     course_id?: string | null;
     kind?: string;
     folder_id?: string | null;
+    page_count?: number | null;
+    ocr_pages?: number | null;
+    extraction_method?: "text" | "ocr" | "mixed" | null;
+    extraction_quality?: "high" | "medium" | "low" | null;
+    extraction_meta?: Record<string, unknown> | null;
   };
 
   ocr_texts?: Array<{ text: string; page?: number; engine?: string }>;
@@ -116,7 +121,7 @@ async function resolveOwnerId(sb: SB, userEmail?: string): Promise<string | null
     if (!r2.error && r2.data && (r2.data as any).id) return String((r2.data as any).id);
   }
 
-  return DEV_USER_ID || null;
+  return null;
 }
 
 async function safeJobUpdate(sb: SB, jobId: string, patch: Record<string, unknown>) {
@@ -140,6 +145,11 @@ export async function POST(req: NextRequest) {
   if (!checkAuth(req)) return fail("Unauthorized", 401);
   if (!IMPORT_SHARED_SECRET) return fail("Server config mangler (IMPORT_SHARED_SECRET).", 500);
 
+  let ownerId: string | null = null;
+  let jobId: string | null = null;
+  let folderId: string | null = null;
+  let fileId: string | null = null;
+
   let sb: SB;
   try {
     sb = adminClient();
@@ -153,9 +163,9 @@ export async function POST(req: NextRequest) {
   const payload = (parsed.value ?? {}) as ImportPayload;
   const requestId = (payload.requestId ?? "").trim() || `imp_${randomUUID()}`;
 
-  const ownerId = await resolveOwnerId(sb, payload.userEmail);
+  ownerId = await resolveOwnerId(sb, payload.userEmail);
   if (!ownerId) {
-    return fail("Kunne ikke resolve owner_id (mangler bruger eller DEV_USER_ID).", 401, { requestId });
+    return fail("Kunne ikke finde en profil for userEmail.", 401, { requestId });
   }
 
   const jobInsert = await sb
@@ -179,7 +189,7 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  const jobId = String((jobInsert.data as any).id);
+  jobId = String((jobInsert.data as any).id);
 
   try {
     await safeJobUpdate(sb, jobId, { status: "started", started_at: new Date().toISOString() });
@@ -190,7 +200,7 @@ export async function POST(req: NextRequest) {
     const fileMd5 = String(file.md5).trim();
     const fileName = String(file.name ?? "file").trim() || "file";
     const courseId = file.course_id ?? null;
-    const folderId = file.folder_id ?? null;
+    folderId = file.folder_id ?? null;
 
     const fileUpsert = await sb
       .from("files")
@@ -205,6 +215,11 @@ export async function POST(req: NextRequest) {
           course_id: courseId,
           folder_id: folderId,
           kind: file.kind ?? "unknown",
+          page_count: typeof file.page_count === "number" ? file.page_count : null,
+          ocr_pages: typeof file.ocr_pages === "number" ? file.ocr_pages : null,
+          extraction_method: file.extraction_method ?? null,
+          extraction_quality: file.extraction_quality ?? null,
+          extraction_meta: file.extraction_meta ?? null,
         },
         { onConflict: "md5" },
       )
@@ -214,7 +229,7 @@ export async function POST(req: NextRequest) {
     if (fileUpsert.error) throw new Error(`files upsert failed: ${fileUpsert.error.message}`);
 
     const picked = pickIdRow(fileUpsert.data);
-    const fileId = picked?.id ?? null;
+    fileId = picked?.id ?? null;
 
     if (payload.ocr_texts?.length) {
       await sb.from("ocr_texts").delete().eq("owner_id", ownerId).eq("file_md5", fileMd5);
@@ -351,6 +366,18 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const detail = getErrMsg(e) || "Import failed";
 
+    captureException(e, {
+      flow: "import_webhook",
+      route: "/api/import",
+      ownerId,
+      fileId,
+      folderId,
+      jobId,
+      requestId,
+      status: 500,
+      code: "IMPORT_FAILED",
+    });
+
     await safeJobUpdate(sb, jobId, {
       status: "failed",
       finished_at: new Date().toISOString(),
@@ -361,3 +388,5 @@ export async function POST(req: NextRequest) {
     return fail("Import failed", 500, { requestId, detail });
   }
 }
+
+

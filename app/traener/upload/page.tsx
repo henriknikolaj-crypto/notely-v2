@@ -3,9 +3,9 @@ import "server-only";
 
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
-import UploadClient from "./UploadClient";
-import FolderManagerClient from "./FolderManagerClient";
 import ImportStatusBox from "./ImportStatusBox";
+import UploadPageClient from "./UploadPageClient";
+import AuthStateNotice from "@/components/ui/AuthStateNotice";
 
 export const dynamic = "force-dynamic";
 
@@ -57,6 +57,21 @@ export default async function UploadPage({
 
   const ownerId = owner.ownerId;
 
+  if (owner.mode === "dev") {
+    return (
+      <section className="space-y-6">
+        <header className="border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            Mobil-LAN kraever en rigtig login-session for stabile uploads, mapper og status-kald.
+          </p>
+        </header>
+
+        <AuthStateNotice message="Denne browser koerer kun paa serverens DEV_USER_ID fallback. Derfor vil klientkald til mapper, upload-status og filer ende i unauthorized. Log ind i samme browser for at bruge upload sikkert." />
+      </section>
+    );
+  }
+
   const { data: foldersData, error: foldersError } = await sb
     .from("folders")
     .select("id,name,parent_id,start_date,end_date,archived_at")
@@ -95,37 +110,19 @@ export default async function UploadPage({
   if (!initialFolderId && folders.length > 0) initialFolderId = folders[0].id;
 
   return (
-    <main className="min-h-screen bg-[#fffef9]">
-      <div className="mx-auto max-w-6xl space-y-8 px-4 py-6 md:px-6">
-        <section className="space-y-4">
-          <header className="border-b border-zinc-200 pb-3">
-            <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
-            <p className="mt-1 text-sm text-zinc-600">
-              Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
-            </p>
+    <section className="space-y-8">
+      <section className="space-y-4">
+        <header className="border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
+          </p>
+        </header>
 
-            {owner.mode === "dev" && (
-              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                Du kører i <b>DEV</b> (DEV_USER_ID). Log ind for at se dine egne data.
-              </div>
-            )}
-          </header>
+        <ImportStatusBox folderId={null} />
+      </section>
 
-          <ImportStatusBox folderId={null} />
-        </section>
-
-        <section>
-          <UploadClient
-            folders={folders.map((f) => ({ id: f.id, name: f.name }))}
-            initialFolderId={initialFolderId}
-            ownerId={ownerId}
-          />
-        </section>
-
-        <section>
-          <FolderManagerClient ownerId={ownerId} initialFolders={folders} />
-        </section>
-      </div>
-    </main>
+      <UploadPageClient ownerId={ownerId} initialFolderId={initialFolderId} initialFolders={folders} />
+    </section>
   );
 }

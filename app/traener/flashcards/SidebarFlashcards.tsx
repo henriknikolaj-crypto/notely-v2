@@ -10,18 +10,26 @@ type SessionRow = {
   requested: number;
   returned: number;
   created_at: string;
+  scope_label?: string | null;
 };
 
 type SessionsResp = {
   ok: boolean;
   sessions?: SessionRow[];
+  scope?: {
+    requested?: boolean;
+    applied?: boolean;
+    hadInvalidValues?: boolean;
+    label?: string | null;
+  };
   error?: string;
 };
 
-type ProgressResp = {
+type StatsResp = {
   ok: boolean;
-  doneToday?: number;
-  dailyGoal?: number;
+  todayUsed?: number;
+  lastSessionAt?: string | null;
+  dayStartDK?: string;
   error?: string;
 };
 
@@ -38,12 +46,6 @@ function fmtDMY(iso?: string | null) {
   }
 }
 
-function localMidnightISO() {
-  const now = new Date();
-  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  return d.toISOString();
-}
-
 async function readJsonSafe(res: Response) {
   const text = await res.text();
   try {
@@ -54,38 +56,46 @@ async function readJsonSafe(res: Response) {
   }
 }
 
-// scope kan være "id1,id2" eller enkelt id
-function buildQs(scope: string | null, base: Record<string, string> = {}) {
+function buildQs(base: Record<string, string> = {}) {
   const qs = new URLSearchParams(base);
-  const raw = (scope ?? "").trim();
-  if (raw) {
-    const ids = raw
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-    for (const id of ids) qs.append("scopeFolderIds[]", id);
-  }
   return qs.toString();
 }
 
-async function fetchSessions(scope: string | null) {
+async function fetchSessions() {
   const r = await fetch(
-    `/api/flashcards/sessions?${buildQs(scope, { limit: "5" })}`,
+    `/api/flashcards/sessions?${buildQs({ limit: "3" })}`,
     { cache: "no-store" }
   );
   const j = (await readJsonSafe(r)) as SessionsResp;
   if (!r.ok || !j?.ok) throw new Error(j?.error ?? `HTTP ${r.status}`);
-  return { sessions: j.sessions ?? [] };
+  return j.sessions ?? [];
 }
 
-async function fetchProgress(scope: string | null, since: string) {
+async function fetchStats() {
   const r = await fetch(
-    `/api/flashcards/progress?${buildQs(scope, { since })}`,
+    `/api/flashcards/stats`,
     { cache: "no-store" }
   );
-  const j = (await readJsonSafe(r)) as ProgressResp;
+  const j = (await readJsonSafe(r)) as StatsResp;
   if (!r.ok || !j?.ok) throw new Error(j?.error ?? `HTTP ${r.status}`);
-  return { doneToday: j.doneToday ?? 0, dailyGoal: j.dailyGoal ?? 20 };
+  return {
+    todayUsed: Math.max(0, Math.round(Number(j?.todayUsed ?? 0) || 0)),
+    lastSessionAt: j?.lastSessionAt ?? null,
+  };
+}
+
+function dedupeSessionsById(rows: SessionRow[]): SessionRow[] {
+  const map = new Map<string, SessionRow>();
+  const noId: SessionRow[] = [];
+  for (const row of rows) {
+    const id = String(row?.id ?? "").trim();
+    if (!id) {
+      noId.push(row);
+      continue;
+    }
+    if (!map.has(id)) map.set(id, row);
+  }
+  return [...Array.from(map.values()), ...noId];
 }
 
 async function deleteSession(id: string) {
@@ -99,16 +109,13 @@ async function deleteSession(id: string) {
 
 export default function SidebarFlashcards() {
   const sp = useSearchParams();
-  const scope = sp.get("scope");
-  const since = React.useMemo(() => localMidnightISO(), []);
 
   const [done, setDone] = React.useState(0);
-  const [goal, setGoal] = React.useState(20);
   const [sessions, setSessions] = React.useState<SessionRow[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
-  const lastSessionAt = sessions[0]?.created_at ?? null;
+  const [lastSessionAt, setLastSessionAt] = React.useState<string | null>(null);
 
   const historyHref = React.useMemo(() => {
     const qs = sp?.toString() ?? "";
@@ -119,19 +126,19 @@ export default function SidebarFlashcards() {
     setErr(null);
     setLoading(true);
     try {
-      const [s, p] = await Promise.all([
-        fetchSessions(scope),
-        fetchProgress(scope, since),
-      ]);
-      setSessions(s.sessions);
-      setDone(p.doneToday);
-      setGoal(p.dailyGoal);
+      const [latestRows, stats] = await Promise.all([fetchSessions(), fetchStats()]);
+      const uniqueSessions = dedupeSessionsById(latestRows).sort((a, b) =>
+        String(b?.created_at ?? "").localeCompare(String(a?.created_at ?? "")),
+      );
+      setSessions(uniqueSessions);
+      setDone(stats.todayUsed);
+      setLastSessionAt(stats.lastSessionAt);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
     } finally {
       setLoading(false);
     }
-  }, [scope, since]);
+  }, []);
 
   async function onDelete(id: string) {
     setErr(null);
@@ -165,12 +172,11 @@ export default function SidebarFlashcards() {
   return (
     <div className="mt-4 space-y-4 px-2 text-[12px]">
       <div>
-        <div className="mb-1 font-semibold text-zinc-800">Flashcards i dag</div>
+        <div className="mb-1 font-semibold text-zinc-800">Genererede kort i dag</div>
 
         <div className="space-y-1 text-zinc-700">
           <div>
-            Dagens flashcards:{" "}
-            <span className="font-semibold">{Math.min(done, goal)}</span>/{goal}
+            I dag: <span className="font-semibold">{done}</span> kort
           </div>
           <div>
             Seneste session:{" "}
@@ -178,17 +184,7 @@ export default function SidebarFlashcards() {
           </div>
         </div>
 
-        <div className="mt-2 flex items-center gap-2">
-          <button
-            className="text-[11px] text-zinc-500 underline hover:text-zinc-700 disabled:opacity-50"
-            onClick={refresh}
-            disabled={loading}
-            type="button"
-          >
-            Opdatér
-          </button>
-          {loading ? <span className="text-[11px] text-zinc-400">Henter…</span> : null}
-        </div>
+        {loading ? <div className="mt-2 text-[11px] text-zinc-400">Henter…</div> : null}
 
         {err ? <div className="mt-2 text-[11px] text-red-600">{err}</div> : null}
       </div>
@@ -196,34 +192,36 @@ export default function SidebarFlashcards() {
       <div>
         <div className="mb-1 flex items-center justify-between">
           <div className="font-semibold text-zinc-800">Seneste sessions</div>
-          <Link
-            href={historyHref}
-            className="text-[11px] text-zinc-500 hover:text-zinc-700"
-          >
-            Se alle
-          </Link>
+          {sessions.length > 0 ? (
+            <Link
+              href={historyHref}
+              className="text-[11px] text-zinc-500 hover:text-zinc-700"
+            >
+              Se alle
+            </Link>
+          ) : null}
         </div>
 
         {sessions.length === 0 ? (
           <div className="text-[11px] text-zinc-400">Ingen sessions endnu.</div>
         ) : (
-          <ul className="space-y-2">
-            {sessions.slice(0, 5).map((s) => (
+          <ul className="space-y-1">
+            {sessions.slice(0, 3).map((s) => (
               <li
                 key={s.id}
-                className="flex items-center justify-between gap-2 rounded-lg border border-zinc-200 p-2"
+                className="flex items-center justify-between gap-2 py-1"
               >
                 <div className="min-w-0">
-                  <div className="truncate font-medium text-zinc-800">
-                    {fmtDMY(s.created_at)} · {s.difficulty}
-                  </div>
                   <div className="text-[11px] text-zinc-500">
-                    {s.returned}/{s.requested} kort
+                    {fmtDMY(s.created_at)} — {s.returned} kort
                   </div>
+                  {s.scope_label ? (
+                    <div className="truncate text-[11px] text-zinc-400">{s.scope_label}</div>
+                  ) : null}
                 </div>
 
                 <button
-                  className="shrink-0 text-[11px] text-red-600 underline hover:text-red-700 disabled:opacity-50"
+                  className="shrink-0 text-[11px] text-slate-700 hover:text-slate-900 disabled:opacity-50"
                   onClick={() => onDelete(s.id)}
                   disabled={loading}
                   type="button"

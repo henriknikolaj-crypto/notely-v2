@@ -1,5 +1,6 @@
 ﻿import "server-only";
 
+import { createClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { getOwnerCtx } from "@/lib/auth/owner";
@@ -38,6 +39,13 @@ function isMissingTableErr(err: any) {
   const code = String(err?.code ?? "");
   const msg = String(err?.message ?? "").toLowerCase();
   return code === "42P01" || msg.includes('relation "training_files" does not exist');
+}
+
+function supabaseAdminOrThrow() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
 // Flyt fil til anden mappe (bruges af dropdownen i UI)
@@ -160,11 +168,18 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   const ownerId = await resolveOwnerId(req, sb);
 
   if (!ownerId) {
-    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
+    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kr?ves." }, { status: 401 });
   }
 
-  // 1) hent storage_path (best effort)
-  const rFile = await sb
+  let admin: any;
+  try {
+    admin = supabaseAdminOrThrow();
+  } catch (error) {
+    console.error("/api/files/[id] DELETE admin init fejl", error);
+    return NextResponse.json({ ok: false, code: "SERVER_CONFIG_MISSING", error: "Server config mangler." }, { status: 500 });
+  }
+
+  const rFile = await admin
     .from("files")
     .select("id, storage_path")
     .eq("owner_id", ownerId)
@@ -173,14 +188,22 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
 
   if (rFile.error) {
     console.error("/api/files/[id] DELETE file lookup fejl", rFile.error);
-    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke læse filen." }, { status: 500 });
+    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke l?se filen." }, { status: 500 });
   }
 
-  // 2) slet i files (doc_chunks ryger via FK ON DELETE CASCADE)
-  const rDelFiles = await sb.from("files").delete().eq("owner_id", ownerId).eq("id", fileId);
+  if (!rFile.data?.id) {
+    return NextResponse.json({ ok: false, code: "NOT_FOUND", error: "Filen blev ikke fundet." }, { status: 404 });
+  }
 
-  // 3) slet i training_files (legacy) — best effort
-  const rDelTraining = await sb.from("training_files").delete().eq("owner_id", ownerId).eq("id", fileId);
+  const rDelFiles = await admin
+    .from("files")
+    .delete()
+    .eq("owner_id", ownerId)
+    .eq("id", fileId)
+    .select("id")
+    .maybeSingle();
+
+  const rDelTraining = await admin.from("training_files").delete().eq("owner_id", ownerId).eq("id", fileId);
 
   const legacyOk = !rDelTraining.error || isMissingTableErr(rDelTraining.error);
 
@@ -189,9 +212,13 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette filen." }, { status: 500 });
   }
 
+  if (!rDelFiles.data?.id) {
+    return NextResponse.json({ ok: false, code: "NOT_FOUND", error: "Filen blev ikke fundet." }, { status: 404 });
+  }
+
   if (rFile.data?.storage_path) {
     try {
-      await sb.storage.from("trainer_uploads").remove([String(rFile.data.storage_path)]);
+      await admin.storage.from("trainer_uploads").remove([String(rFile.data.storage_path)]);
     } catch (e) {
       console.warn("/api/files/[id] DELETE storage cleanup warning", e);
     }

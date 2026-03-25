@@ -9,6 +9,9 @@ import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
 import { calcSessionGrade } from "@/lib/grading/sessionGrade";
 import { danish7ToScore100, type Danish7Grade } from "@/lib/grading/danish7";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
+import { ensureProfile } from "@/lib/server/ensureProfile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -53,6 +56,7 @@ type SubmitErr = {
   ok: false;
   requestId: string;
   error: string;
+  code?: string;
   debug?: any;
 };
 
@@ -98,6 +102,13 @@ function fileTitle(row: any) {
   return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
 }
 
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 const ALLOWED_GRADES = new Set(["-3", "00", "02", "4", "7", "10", "12"]);
 
 function normalizeGrade(raw: any): Danish7Grade {
@@ -136,10 +147,36 @@ function pickPayload(json: any) {
   return json;
 }
 
-function isSamplingUnsupportedModel(model: string) {
-  const m = (model || "").toLowerCase().trim();
-  // o*-modeller (reasoning) understøtter typisk ikke temperature/top_p
-  return /^o\d/.test(m) || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4");
+function buildWrittenQuestionText(answered: Array<{ id: string; prompt: string }>) {
+  return answered
+    .map((item, index) => `Spørgsmål ${index + 1}\n${item.prompt}`)
+    .join("\n\n");
+}
+
+function buildWrittenAnswerText(answered: Array<{ id: string; prompt: string; text: string }>) {
+  return answered
+    .map((item, index) => `Svar ${index + 1}\n${item.text}`)
+    .join("\n\n");
+}
+
+function buildWrittenFeedbackText(opts: {
+  summary: string;
+  strengths: string[];
+  improvements: string[];
+  items: Array<{ id: string; grade: string; feedback: string }>;
+}) {
+  const parts = [
+    opts.summary ? `Samlet vurdering\n${opts.summary}` : "",
+    opts.strengths.length ? `Styrker\n- ${opts.strengths.join("\n- ")}` : "",
+    opts.improvements.length ? `Det kan forbedres\n- ${opts.improvements.join("\n- ")}` : "",
+    opts.items.length
+      ? `Delvurderinger\n${opts.items
+          .map((item, index) => `Del ${index + 1}${item.grade ? ` (${item.grade})` : ""}\n${item.feedback}`)
+          .join("\n\n")}`
+      : "",
+  ];
+
+  return parts.filter(Boolean).join("\n\n");
 }
 
 export async function POST(req: NextRequest) {
@@ -199,6 +236,21 @@ export async function POST(req: NextRequest) {
         error: "Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.",
       };
       return NextResponse.json(err, { status: 500 });
+    }
+
+    await ensureProfile(admin, ownerId);
+
+    // Why: Eksamen skal håndhæves server-side som Pro-only, så client-bypass ikke virker.
+    const { data: profile } = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+    const plan = normalizePlan((profile as any)?.plan);
+    if (plan !== "pro") {
+      const err: SubmitErr = {
+        ok: false,
+        requestId,
+        error: "Kræver Pro",
+        code: "PRO_REQUIRED",
+      };
+      return NextResponse.json(err, { status: 403 });
     }
 
     const durationMin = clampInt(body.durationMin, 5, 180, 20);
@@ -310,28 +362,24 @@ export async function POST(req: NextRequest) {
       "- Medtag både strengths og improvements (mindst 3 improvements hvis karakter < 12).",
     ].join("\n");
 
-    const model = process.env.OPENAI_MODEL_EXAM || process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const model = resolveModelForFeature("simulator");
 
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       { role: "system", content: system },
       { role: "user", content: user },
     ];
 
-    const base: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
-      model,
-      response_format: { type: "json_object" },
-      messages,
-    };
-
-    const completion = await openai.chat.completions.create(
-      isSamplingUnsupportedModel(model)
-        ? base
-        : {
-            ...base,
-            temperature: 0.2,
-            top_p: 0.9,
-          },
-    );
+    const { completion } = await createChatCompletion(openai, {
+      feature: "simulator",
+      purpose: "json",
+      modelOverride: model,
+      payload: {
+        response_format: { type: "json_object" },
+        messages,
+        temperature: 0.2,
+        top_p: 0.9,
+      },
+    });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
     let payload: any = {};
@@ -410,6 +458,15 @@ export async function POST(req: NextRequest) {
       },
     };
 
+    const questionText = buildWrittenQuestionText(answered);
+    const answerText = buildWrittenAnswerText(answered);
+    const feedbackText = buildWrittenFeedbackText({
+      summary,
+      strengths,
+      improvements,
+      items,
+    });
+
     // Best-effort: gem exam_session (stabilt scope)
     try {
       const sourceType = mode === "oral" ? "oral" : "simulator";
@@ -417,6 +474,9 @@ export async function POST(req: NextRequest) {
 
       const { error: insertError } = await admin.from("exam_sessions").insert({
         owner_id: ownerId,
+        question: questionText,
+        answer: answerText,
+        feedback: feedbackText,
         score,
         folder_id: sessionFolderId,
         source_type: sourceType,
@@ -429,6 +489,7 @@ export async function POST(req: NextRequest) {
           answeredCount,
           qualityGrade,
           finalGrade,
+          result: out.result,
           scopeFolderIds,
           ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
         },

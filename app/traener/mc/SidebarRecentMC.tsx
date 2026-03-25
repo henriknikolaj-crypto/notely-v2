@@ -36,7 +36,11 @@ function formatResult(score: number | null): string {
  * Sidebar-liste med MC-forsøg (kun de seneste 5).
  * Overskrift + "Se alle" håndteres i TrainingSidebarStats.
  */
-export default function SidebarRecentMC() {
+export default function SidebarRecentMC({
+  onCountChange,
+}: {
+  onCountChange?: (count: number) => void;
+}) {
   const [items, setItems] = useState<Item[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -61,7 +65,9 @@ export default function SidebarRecentMC() {
           typeof data.total === "number" ? data.total : list.length;
 
         // Vi viser aldrig højere tal end 50 (vores max-historik).
-        setTotal(Math.min(rawTotal, 50));
+        const cappedTotal = Math.min(rawTotal, 50);
+        setTotal(cappedTotal);
+        onCountChange?.(cappedTotal);
 
         setError(null);
         setLoading(false);
@@ -71,6 +77,7 @@ export default function SidebarRecentMC() {
           setError("Kunne ikke hente MC-historik.");
           setItems([]);
           setTotal(0);
+          onCountChange?.(0);
           setLoading(false);
         }
       }
@@ -92,7 +99,7 @@ export default function SidebarRecentMC() {
         window.removeEventListener("notely:mc-updated", handleRefresh);
       }
     };
-  }, []);
+  }, [onCountChange]);
 
   if (loading) {
     return (

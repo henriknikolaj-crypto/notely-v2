@@ -37,23 +37,41 @@ function buildUrl(pathname: string, sp: URLSearchParams, patch: Record<string, s
   return qs ? `${pathname}?${qs}` : pathname;
 }
 
+const DEMO_SCOPE_ID = "demo-samfund";
+const DEMO_SCOPE_NAME = "Samfund";
+
 export default function TrainingSidebarFolders({ folders }: { folders: FolderRow[] }) {
   const pathname = usePathname() || "/traener";
   const sp = useSearchParams();
   const router = useRouter();
+  const isDemoRoute = pathname.startsWith("/traener/ux");
+  const isDemoMode = isDemoRoute || sp?.get("demo") === "1" || sp?.get("demo") === "true";
+  const validFolderIds = useMemo(() => new Set(folders.map((folder) => folder.id)), [folders]);
 
-  const activeFolderId = sp?.get("folder") || "";
+  const activeFolderId = isDemoMode
+    ? DEMO_SCOPE_ID
+    : (() => {
+        const scopeValues = parseScope(sp?.get("scope") ?? "").filter((id) => validFolderIds.has(id));
+        return scopeValues[0] ?? "";
+      })();
 
   // ✅ ESLint-friendly deps (ingen join("|") i deps)
-  const scopeRaw = sp?.get("scope") ?? "";
-  const scopeIds = useMemo(() => parseScope(scopeRaw ? scopeRaw : null), [scopeRaw]);
+  const scopeRaw = isDemoMode ? DEMO_SCOPE_ID : (sp?.get("scope") ?? "");
+  const scopeIds = useMemo(() => {
+    const parsed = parseScope(scopeRaw ? scopeRaw : null);
+    return isDemoMode ? parsed : parsed.filter((id) => validFolderIds.has(id));
+  }, [isDemoMode, scopeRaw, validFolderIds]);
   const scopeSet = useMemo(() => new Set(scopeIds), [scopeIds]);
+  const effectiveFolders = useMemo(() => {
+    if (!isDemoMode) return folders;
+    return [{ id: DEMO_SCOPE_ID, name: DEMO_SCOPE_NAME, parent_id: null, start_date: null, end_date: null, archived_at: null }];
+  }, [folders, isDemoMode]);
 
   const { roots, childrenByParent } = useMemo(() => {
     const byParent = new Map<string, FolderRow[]>();
     const root: FolderRow[] = [];
 
-    for (const f of folders ?? []) {
+    for (const f of effectiveFolders ?? []) {
       if (f.archived_at) continue;
       if (!f.parent_id) root.push(f);
       else {
@@ -71,9 +89,10 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
     }
 
     return { roots: root, childrenByParent: byParent };
-  }, [folders]);
+  }, [effectiveFolders]);
 
   function toggleScope(folderId: string) {
+    if (isDemoMode) return;
     const next = new Set(scopeSet);
     if (next.has(folderId)) next.delete(folderId);
     else next.add(folderId);
@@ -88,20 +107,20 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
   }
 
   function folderHref(folderId: string) {
-    return buildUrl(pathname, new URLSearchParams(sp?.toString() ?? ""), { folder: folderId });
+    return buildUrl(pathname, new URLSearchParams(sp?.toString() ?? ""), { scope: folderId, folder: null });
   }
 
   const baseRow = "flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs";
   const nameCls = (isActive: boolean) =>
     cn("truncate", isActive ? "font-semibold text-zinc-900" : "text-zinc-800");
 
-  const totalSelected = scopeIds.length;
+  const totalSelected = isDemoMode ? 1 : scopeIds.length;
 
   return (
     <div className="space-y-1 px-2">
       {roots.map((f) => {
         const isActive = activeFolderId === f.id;
-        const checked = scopeSet.has(f.id);
+        const checked = scopeSet.has(f.id) || isActive;
         const kids = childrenByParent.get(f.id) ?? [];
 
         return (
@@ -111,6 +130,7 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
                 type="checkbox"
                 className="h-4 w-4 accent-black"
                 checked={checked}
+                disabled={isDemoMode}
                 onChange={() => toggleScope(f.id)}
                 aria-label={`Vælg ${f.name}`}
               />
@@ -123,7 +143,7 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
               <div className="space-y-1 pl-5">
                 {kids.map((c) => {
                   const isActiveChild = activeFolderId === c.id;
-                  const checkedChild = scopeSet.has(c.id);
+                  const checkedChild = scopeSet.has(c.id) || isActiveChild;
 
                   return (
                     <div key={c.id} className={cn(baseRow, isActiveChild ? "bg-zinc-50" : "hover:bg-zinc-50")}>
@@ -131,6 +151,7 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
                         type="checkbox"
                         className="h-4 w-4 accent-black"
                         checked={checkedChild}
+                        disabled={isDemoMode}
                         onChange={() => toggleScope(c.id)}
                         aria-label={`Vælg ${c.name}`}
                       />

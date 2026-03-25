@@ -2,6 +2,7 @@
 import "server-only";
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { getCanonicalUserPlan } from "@/lib/plan/limits";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +13,7 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {}
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 function formatDT(iso: string | null | undefined) {
@@ -37,14 +38,23 @@ type PageProps = {
 export default async function TraenerEvalueringDetailPage({ params, searchParams }: PageProps) {
   const { id } = await params;
   const sp = (await searchParams) ?? {};
-
+  const backToParam = typeof sp.backTo === "string" ? sp.backTo : undefined;
+  const scopeParam = typeof sp.scope === "string" ? sp.scope : undefined;
   const tscope = typeof sp.tscope === "string" ? sp.tscope : undefined;
 
-  const backParams = new URLSearchParams();
-  if (tscope) backParams.set("tscope", tscope);
-  const backHref = backParams.toString()
-    ? `/traener/evalueringer?${backParams.toString()}`
-    : "/traener/evalueringer";
+  function safeBackHref(raw: string | undefined): string | null {
+    const s = String(raw ?? "").trim();
+    if (!s.startsWith("/") || s.startsWith("//")) return null;
+    return s;
+  }
+
+  const backHref =
+    safeBackHref(backToParam) ??
+    (scopeParam
+      ? `/traener/evalueringer/historik?scope=${encodeURIComponent(scopeParam)}`
+      : tscope
+      ? `/traener/evalueringer/historik?scope=${encodeURIComponent(tscope)}`
+      : "/traener/evalueringer/historik");
 
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
@@ -52,7 +62,7 @@ export default async function TraenerEvalueringDetailPage({ params, searchParams
   if (!ownerId) {
     return (
       <main className="mx-auto max-w-4xl p-6">
-        <p className="text-sm text-red-600">Mangler bruger-id.</p>
+        <p className="text-sm text-red-600">Du skal være logget ind for at se evalueringen.</p>
         <Link href={backHref} className="mt-3 inline-block text-xs text-zinc-600 hover:underline">
           ← Tilbage
         </Link>
@@ -64,6 +74,7 @@ export default async function TraenerEvalueringDetailPage({ params, searchParams
     .from("exam_sessions")
     .select("*")
     .eq("owner_id", ownerId)
+    .eq("source_type", "trainer")
     .eq("id", id)
     .maybeSingle();
 
@@ -77,6 +88,41 @@ export default async function TraenerEvalueringDetailPage({ params, searchParams
         </Link>
       </main>
     );
+  }
+
+  const planInfo = await getCanonicalUserPlan(sb, ownerId);
+  if (planInfo.normalizedPlan === "freemium") {
+    const { data: visibleRows, error: visibleError } = await sb
+      .from("exam_sessions")
+      .select("id")
+      .eq("owner_id", ownerId)
+      .eq("source_type", "trainer")
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (visibleError) {
+      console.error("trainer evaluering detail visibility error:", visibleError);
+      return (
+        <main className="mx-auto max-w-4xl p-6">
+          <p className="text-sm text-red-600">Kunne ikke validere evalueringsadgang.</p>
+          <Link href={backHref} className="mt-3 inline-block text-xs text-zinc-600 hover:underline">
+            ← Tilbage til evalueringer
+          </Link>
+        </main>
+      );
+    }
+
+    const visibleIds = new Set((visibleRows ?? []).map((row: any) => String(row?.id ?? "")));
+    if (!visibleIds.has(String(id))) {
+      return (
+        <main className="mx-auto max-w-4xl p-6">
+          <p className="text-sm text-zinc-700">Denne evaluering er ikke tilgængelig på Freemium.</p>
+          <Link href={backHref} className="mt-3 inline-block text-xs text-zinc-600 hover:underline">
+            ← Tilbage til evalueringer
+          </Link>
+        </main>
+      );
+    }
   }
 
   const createdAt = (data as any).created_at as string | null | undefined;

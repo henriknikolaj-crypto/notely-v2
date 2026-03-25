@@ -1,25 +1,44 @@
 ﻿// app/api/generate-question/route.ts
 import "server-only";
 
-import { requireFlowModel } from "@/lib/openai/requireModel";
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 
 import { requireUser } from "@/lib/auth";
+import { captureException } from "@/lib/monitoring/error";
 import { enforceRateLimit } from "@/lib/rateLimit";
-import { ensureQuotaAndDecrement } from "@/lib/quota";
+import { quotaTryConsume } from "@/lib/quota/rpc";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
 import { createClient } from "@supabase/supabase-js";
+import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
+import { ensureProfile } from "@/lib/server/ensureProfile";
+import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import {
+  buildGenerateQuestionPrompts,
+  clampInt,
+  deriveFocusTargetsFromWeakSessions,
+  fileTitle,
+  pickDifficulty,
+  pickFocusMode,
+  scopeKeyFromFolderIds,
+  uniqTrimmed,
+  type ChunkRow,
+  type Difficulty,
+  type FileRow,
+  type FocusMode,
+  type WeakPointTarget,
+} from "@/lib/trainer/generate-question";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-type Difficulty = "easy" | "medium" | "hard";
 
 type GenerateQuestionRequest = {
   scopeFolderIds?: string[];
   difficulty?: Difficulty;
   maxContextChunks?: number;
+  focusMode?: FocusMode;
 
   // anti-repeat
   avoidQuestions?: string[];
@@ -52,6 +71,10 @@ type GenerateQuestionOk = {
     model: string;
     maxContextChunks: number;
     difficulty: Difficulty;
+    focusMode: FocusMode;
+    biasApplied: boolean;
+    focusTargets: Array<{ key: string; label: string }>;
+    weakSessionCount: number;
   };
 };
 
@@ -70,23 +93,17 @@ type GenerateQuestionErr = {
   debug?: any;
 };
 
-type FileRow = {
-  id: string;
-  name: string | null;
-  original_name: string | null;
-  folder_id: string | null;
-  created_at: string | null;
-};
-
-type ChunkRow = {
-  id: string;
-  file_id: string;
-  content: string | null;
-  created_at: string | null;
-  source_url?: string | null;
-};
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+function normalizeQuestionOutput(value: string) {
+  return String(value ?? "").normalize("NFC").replace(/\r\n/g, "\n").trim();
+}
+
+function isTooLongTrainerQuestion(value: string) {
+  const text = normalizeQuestionOutput(value);
+  const numberedParts = (text.match(/(?:^|\n)\s*\d+[.)]/g) ?? []).length;
+  return text.length > 420 || numberedParts > 1;
+}
 
 function supabaseAdminOrNull() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -112,55 +129,6 @@ async function readJsonBody<T>(req: NextRequest) {
   } catch {
     return { ok: false as const, error: "Ugyldigt JSON-body." };
   }
-}
-
-function pickDifficulty(raw: any): Difficulty {
-  return raw === "easy" || raw === "hard" ? raw : "medium";
-}
-
-function clampInt(raw: any, min: number, max: number, fallback: number) {
-  const n = typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function uniqTrimmed(ids: unknown) {
-  if (!Array.isArray(ids)) return [];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const x of ids) {
-    const s = String(x ?? "").trim();
-    if (!s) continue;
-    if (seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
-  }
-  return out;
-}
-
-function scopeKeyFromFolderIds(folderIds: string[]) {
-  const ids = uniqTrimmed(folderIds).sort();
-  return ids.length ? `folders:${ids.join(",")}` : "all";
-}
-
-function shuffle<T>(arr: T[]): T[] {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-function fileTitle(row: any) {
-  return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
-}
-
-function normalizeQuestion(s: string) {
-  return String(s ?? "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[.,;:!?()"'’”“\[\]{}]/g, "")
-    .trim();
 }
 
 async function loadLastUsedFileId(db: any, ownerId: string, scopeKey: string): Promise<string | null> {
@@ -208,9 +176,10 @@ async function getPlanAndLimit(db: any, ownerId: string) {
   const { data: profile } = await db.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
   const plan = (profile as any)?.plan ?? "freemium";
 
-  const { data: limits } = await db.from("plan_limits").select("feature, monthly_limit").eq("plan", plan);
+  const { data: limits } = await db.from("plan_limits").select("feature, monthly_limit, is_unlimited").eq("plan", plan);
   const row = (limits ?? []).find((r: any) => r.feature === "trainer_round");
   if (!row) return { plan, limit: undefined as number | null | undefined };
+  if ((row as any).is_unlimited === true) return { plan, limit: null as number | null };
 
   const v = (row as any).monthly_limit;
   if (v == null) return { plan, limit: null as number | null };
@@ -278,6 +247,9 @@ async function finishTrainerRoundJob(db: any, ownerId: string, roundId: string, 
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
+  let ownerId = "";
+  let primaryFolderId: string | null = null;
+  let generatedFileId: string | null = null;
 
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -294,17 +266,32 @@ export async function POST(req: NextRequest) {
     const body = parsed.value ?? {};
     const difficulty = pickDifficulty(body.difficulty);
     const maxContextChunks = clampInt(body.maxContextChunks, 4, 32, 10);
+    const requestedFocusMode = pickFocusMode(body.focusMode);
 
     const scopeFolderIds = uniqTrimmed(body.scopeFolderIds);
     const scopeKey = scopeKeyFromFolderIds(scopeFolderIds);
+    const explicitFolderId = String(body.folderId ?? body.folder_id ?? "").trim();
+    primaryFolderId = explicitFolderId || scopeFolderIds[0] || null;
+
+    let effectiveFocusMode: FocusMode = requestedFocusMode;
+    let focusScopeFolderId: string | null = null;
+    if (requestedFocusMode === "weakest") {
+      if (explicitFolderId) {
+        focusScopeFolderId = explicitFolderId;
+      } else if (scopeFolderIds.length === 1) {
+        focusScopeFolderId = scopeFolderIds[0];
+      } else {
+        effectiveFocusMode = "normal";
+      }
+    }
+    let focusTargets: WeakPointTarget[] = [];
+    let weakSessionCount = 0;
 
     const avoidQuestions = uniqTrimmed(body.avoidQuestions).slice(0, 24);
-    const avoidNorm = new Set(avoidQuestions.map(normalizeQuestion));
     const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 500);
     const avoidChunkSet = new Set<string>(avoidChunkIds);
 
     // Auth
-    let ownerId = "";
     try {
       const u: any = await requireUser(req);
       ownerId = u.id;
@@ -339,19 +326,28 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(err, { status: 500 });
     }
 
+    await ensureProfile(admin, ownerId);
+
     // Quota gate (trainer_round)
-    const q = await ensureQuotaAndDecrement(ownerId, "trainer_round", 1);
+    const q = await quotaTryConsume({
+      admin,
+      ownerId,
+      feature: "trainer_round",
+      amount: 1,
+      exceededMessage: "Du har brugt alle Træner-runder for denne måned på din nuværende plan.",
+    });
     if (!q.ok) {
       try {
         const { monthStart, resetAt, monthEnd } = getMonthBoundsUTC(new Date());
-        const { plan, limit } = await getPlanAndLimit(admin, ownerId);
-        const used = await countTrainerRoundsThisMonth(admin, ownerId, monthStart, resetAt);
+        const { plan } = await getPlanAndLimit(admin, ownerId);
+        const limit = q.limitPerMonth;
+        const used = typeof q.used === "number" ? q.used : await countTrainerRoundsThisMonth(admin, ownerId, monthStart, resetAt);
 
         const err: GenerateQuestionErr = {
           ok: false,
           error: q.message,
           requestId,
-          code: q.status === 500 ? "SETUP_ERROR" : "QUOTA_EXCEEDED",
+          code: q.status === 503 ? "SETUP_ERROR" : "QUOTA_EXCEEDED",
           feature: "trainer_round",
           plan,
           usedThisMonth: used,
@@ -366,7 +362,7 @@ export async function POST(req: NextRequest) {
           ok: false,
           error: q.message,
           requestId,
-          code: q.status === 500 ? "SETUP_ERROR" : "QUOTA_EXCEEDED",
+          code: q.status === 503 ? "SETUP_ERROR" : "QUOTA_EXCEEDED",
           feature: "trainer_round",
         };
         return NextResponse.json(err, { status: q.status });
@@ -383,6 +379,25 @@ export async function POST(req: NextRequest) {
         .eq("id", scopeFolderIds[0])
         .maybeSingle();
       if ((f as any)?.name) topic = String((f as any).name);
+    }
+
+    if (effectiveFocusMode === "weakest" && focusScopeFolderId) {
+      const { data: weakRows } = await admin
+        .from("exam_sessions")
+        .select("created_at,metadata")
+        .eq("owner_id", ownerId)
+        .eq("folder_id", focusScopeFolderId)
+        .in("source_type", ["trainer", "simulator"])
+        .not("metadata->weak_points", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(25);
+
+      const weakRowsArr = (weakRows ?? []) as Array<{ metadata: any }>;
+      weakSessionCount = weakRowsArr.length;
+      focusTargets = deriveFocusTargetsFromWeakSessions(weakRowsArr);
+      if (focusTargets.length === 0) {
+        effectiveFocusMode = "normal";
+      }
     }
 
     // Filer i scope
@@ -433,7 +448,7 @@ export async function POST(req: NextRequest) {
 
       const { data: pool } = await admin
         .from("doc_chunks")
-        .select("id,file_id,content,created_at,source_url")
+        .select("id,file_id,content,created_at,source_url,extraction_method,extraction_quality,page_from")
         .eq("owner_id", ownerId)
         .eq("file_id", fileId)
         .order("created_at", { ascending: false })
@@ -444,8 +459,11 @@ export async function POST(req: NextRequest) {
       if (nonEmpty.length === 0) continue;
 
       if (!fallbackFile) {
+        const rankedFallback = rankChunksForPrompt(nonEmpty, topic);
         fallbackFile = f;
-        fallbackChunks = shuffle(nonEmpty)
+        fallbackChunks = rankedFallback
+          .slice(0, Math.min(maxContextChunks * 2, rankedFallback.length))
+          .map((r) => r.chunk)
           .slice(0, Math.min(maxContextChunks, nonEmpty.length))
           .sort((a, b) => (Date.parse(a.created_at ?? "0") || 0) - (Date.parse(b.created_at ?? "0") || 0));
       }
@@ -454,8 +472,12 @@ export async function POST(req: NextRequest) {
       const candidate = filtered.length > 0 ? filtered : null;
       if (!candidate) continue;
 
+      const queryForRanking = [topic, difficulty, ...focusTargets.map((t) => t.label)].filter(Boolean).join(" ");
+      const rankedCandidate = rankChunksForPrompt(candidate, queryForRanking);
       chosenFile = f;
-      pickedChunks = shuffle(candidate)
+      pickedChunks = rankedCandidate
+        .slice(0, Math.min(maxContextChunks * 2, rankedCandidate.length))
+        .map((r) => r.chunk)
         .slice(0, Math.min(maxContextChunks, candidate.length))
         .sort((a, b) => (Date.parse(a.created_at ?? "0") || 0) - (Date.parse(b.created_at ?? "0") || 0));
 
@@ -478,6 +500,7 @@ export async function POST(req: NextRequest) {
     }
 
     const usedFileId = String(chosenFile.id);
+    generatedFileId = usedFileId;
     const usedFileTitle = fileTitle(chosenFile);
 
     const contextText = pickedChunks
@@ -498,55 +521,17 @@ export async function POST(req: NextRequest) {
       url: (c as any)?.source_url ? String((c as any).source_url) : null,
     }));
 
-    const model = requireFlowModel("trainer");
+    const model = resolveModelForFeature("generate_question");
 
-    const avoidBlock =
-      avoidQuestions.length > 0
-        ? `\nUNDGÅ at gentage nogen af disse spørgsmål (nøjagtigt eller næsten):\n- ${avoidQuestions.join("\n- ")}\n`
-        : "";
-
-    const systemPrompt = `
-Du er en dansk studieassistent.
-Du laver ét (1) eksamenslignende frit-svar spørgsmål ud fra elevens pensum-uddrag.
-
-VIGTIGT:
-- Du MÅ KUN bruge konteksten (KILDE-afsnit).
-- Skriv alt på dansk.
-- Ingen multiple choice.
-- Spørgsmålet skal være konkret og teste forståelse/anvendelse (ikke kun genkendelse).
-
-Returnér gyldig JSON:
-{
-  "question": "..."
-}
-`.trim();
-
-    const userPrompt = [
-  `Fag/tema: ${topic}`,
-  `Sværhedsgrad: ${difficulty}`,
-  `Kilde (primary): ${usedFileTitle}`,
-  avoidBlock.trim(),
-  "",
-  "KONTEKST (brug dette som eneste grundlag):",
-  "",
-  contextText,
-]
-  .filter(Boolean)
-  .join("\n");
-
-function isSamplingUnsupported(e: any) {
-  const msg = String(e?.message ?? "");
-  const param = String(e?.param ?? e?.error?.param ?? "");
-  return (
-    param === "temperature" ||
-    param === "top_p" ||
-    msg.includes("Unsupported value: 'temperature'") ||
-    msg.includes("Unsupported value: 'top_p'") ||
-    msg.includes("Only the default (1) value is supported")
-  );
-}
-
-// ... behold userPrompt som du har det
+    const { systemPrompt, userPrompt, biasApplied } = buildGenerateQuestionPrompts({
+      topic,
+      difficulty,
+      effectiveFocusMode,
+      focusTargets,
+      avoidQuestions,
+      usedFileTitle,
+      contextText,
+    });
 
 let finalQuestion = "";
 
@@ -556,13 +541,15 @@ for (let attempt = 0; attempt < 3; attempt++) {
     { role: "user" as const, content: userPrompt },
   ];
 
-  const baseReq = {
-    model,
-    response_format: { type: "json_object" as const },
-    messages,
-  } satisfies import("openai").OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
-
-  const completion = await openai.chat.completions.create(baseReq);
+  const { completion } = await createChatCompletion(openai, {
+    feature: "generate_question",
+    purpose: "json",
+    modelOverride: model,
+    payload: {
+      response_format: { type: "json_object" as const },
+      messages,
+    },
+  });
 
   const raw = completion.choices?.[0]?.message?.content ?? "{}";
   let payload: any = {};
@@ -572,8 +559,9 @@ for (let attempt = 0; attempt < 3; attempt++) {
     payload = {};
   }
 
-  const qText = String(payload?.question ?? "").trim();
+  const qText = normalizeQuestionOutput(String(payload?.question ?? ""));
   if (!qText) continue;
+  if (isTooLongTrainerQuestion(qText)) continue;
 
   finalQuestion = qText;
   break;
@@ -603,6 +591,8 @@ for (let attempt = 0; attempt < 3; attempt++) {
       citationCount: citations.length,
       evals_used: 0,
       max_evals: 2,
+      focusMode: effectiveFocusMode,
+      focusTargets,
     };
 
     const basePayload = {
@@ -639,12 +629,39 @@ for (let attempt = 0; attempt < 3; attempt++) {
         model,
         maxContextChunks,
         difficulty,
+        focusMode: effectiveFocusMode,
+        biasApplied,
+        focusTargets: focusTargets.map((t) => ({ key: t.key, label: t.label })),
+        weakSessionCount,
       },
     };
+
+    await trackProductEvent({
+      admin,
+      ownerId,
+      eventName: "trainer_question_generated",
+      metadata: {
+        source: "own",
+        folder_id: scopeFolderIds.length === 1 ? scopeFolderIds[0] : null,
+        file_id: usedFileId,
+        scope: scopeKey,
+        feature: "trainer",
+      },
+    });
 
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
     console.error("[generate-question] route error:", requestId, err);
+    captureException(err, {
+      flow: "trainer_generate_question",
+      route: "/api/generate-question",
+      ownerId: ownerId || null,
+      folderId: primaryFolderId,
+      fileId: generatedFileId,
+      requestId,
+      status: 500,
+      code: "TRAINER_ROUTE_ERROR",
+    });
     const out: GenerateQuestionErr = { ok: false, error: err?.message ?? "Uventet fejl i generate-question.", requestId };
     return NextResponse.json(out, { status: 500 });
   }

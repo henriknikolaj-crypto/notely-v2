@@ -2,7 +2,9 @@
 import "server-only";
 
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import ClientMC from "./ClientMC";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
@@ -13,9 +15,9 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {
-    // ignore – falder tilbage til DEV_USER_ID
+    // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 function parseScopeFolderIds(sp: Record<string, string | string[]>) {
@@ -46,8 +48,8 @@ function parseScopeFolderIds(sp: Record<string, string | string[]>) {
   return uniq;
 }
 
-async function getFolderNames(sb: any, ownerId: string, folderIds: string[]) {
-  if (!folderIds.length) return [];
+async function getResolvedScope(sb: any, ownerId: string, folderIds: string[]) {
+  if (!folderIds.length) return { scopeFolderIds: [] as string[], names: [] as string[] };
   const { data, error } = await sb
     .from("folders")
     .select("id,name")
@@ -56,7 +58,7 @@ async function getFolderNames(sb: any, ownerId: string, folderIds: string[]) {
 
   if (error) {
     console.error("[mc/page] folders load error:", error);
-    return [];
+    return { scopeFolderIds: [] as string[], names: [] as string[] };
   }
 
   const map = new Map<string, string>();
@@ -66,8 +68,9 @@ async function getFolderNames(sb: any, ownerId: string, folderIds: string[]) {
     if (id && name) map.set(id, name);
   }
 
-  // behold samme rækkefølge som scopeFolderIds
-  return folderIds.map((id) => map.get(id) ?? "Ukendt mappe");
+  const resolvedScopeFolderIds = folderIds.filter((id) => map.has(id));
+  const names = resolvedScopeFolderIds.map((id) => map.get(id) as string);
+  return { scopeFolderIds: resolvedScopeFolderIds, names };
 }
 
 export default async function Page({
@@ -81,42 +84,37 @@ export default async function Page({
   if (!ownerId) {
     return (
       <section className="p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+        Du skal være logget ind for at åbne Multiple Choice.
       </section>
     );
   }
 
   const sp = (await searchParams) ?? {};
-  const scopeFolderIds = parseScopeFolderIds(sp);
-  const names = await getFolderNames(sb, ownerId, scopeFolderIds);
-
-  const primary = names[0] ?? null;
-  const label =
-    primary && scopeFolderIds.length > 0
-      ? scopeFolderIds.length > 1
-        ? `${primary} (+${scopeFolderIds.length - 1})`
-        : primary
-      : "Vælg mappe i venstre side";
+  const requestedScopeFolderIds = parseScopeFolderIds(sp);
+  const resolvedScope = await getResolvedScope(sb, ownerId, requestedScopeFolderIds);
+  const scopeFolderIds = resolvedScope.scopeFolderIds;
+  const names = resolvedScope.names;
+  const hasScope = scopeFolderIds.length > 0;
 
   return (
     <section className="space-y-4">
       <header className="mb-2 border-b border-zinc-200 pb-3">
         <h1 className="text-lg font-semibold">Multiple Choice</h1>
         <p className="mt-1 text-sm text-zinc-600">
-          Træn på dit eget pensum. Du vælger mapper i venstre side og starter, når du er klar.
+          Træn på dit eget pensum. Vælg eller skift mappe her, og start når du er klar.
         </p>
       </header>
 
-      <div className="rounded-2xl border border-zinc-200 bg-white p-4">
-        <div className="text-[11px] font-semibold tracking-wide text-zinc-500">DU TRÆNER PÅ</div>
-        <div className="mt-1 text-sm font-semibold text-zinc-900">{label}</div>
-        <div className="mt-1 text-xs text-zinc-600">
-          Du kan ændre mapper i venstre side, før du starter en runde.
-        </div>
-
-        <div className="mt-4">
-          <ClientMC scopeFolderIds={scopeFolderIds} />
-        </div>
+      <TrainingScopeCard
+        names={names}
+        className="md:hidden"
+        emptyLabel="Vælg en mappe direkte her."
+        helpText={!hasScope ? "Multiple Choice er låst, indtil du har valgt en mappe." : undefined}
+      >
+        <FeatureScopePicker selectedNames={names} selectedScopeIds={scopeFolderIds} />
+      </TrainingScopeCard>
+      <div className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+        <ClientMC scopeFolderIds={scopeFolderIds} />
       </div>
     </section>
   );

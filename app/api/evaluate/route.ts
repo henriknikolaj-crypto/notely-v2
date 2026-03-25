@@ -6,7 +6,15 @@ import OpenAI from "openai";
 import { requireUser } from "@/lib/auth";
 import { ensureQuotaAndDecrement } from "@/lib/quota";
 import { enforceRateLimit } from "@/lib/rateLimit";
-import { requireFlowModel, type NotelyFlow } from "@/lib/openai/requireModel";
+import { type NotelyFlow } from "@/lib/openai/requireModel";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
+import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
+import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
+import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
+import { scopeKeyFromFolderIds } from "@/lib/trainer/generate-question";
+import { ensureProfile } from "@/lib/server/ensureProfile";
+import { trackProductEvent } from "@/lib/server/trackProductEvent";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -44,6 +52,13 @@ type EvalJson = {
   strengths?: unknown;
   improvements?: unknown;
   next_steps?: unknown;
+  weak_points?: unknown;
+  weakPoints?: unknown;
+  meta?: { weak_points?: unknown; weakPoints?: unknown } | null;
+  metadata?: { weak_points?: unknown; weakPoints?: unknown } | null;
+  feedback_meta?: { weak_points?: unknown; weakPoints?: unknown } | null;
+  evaluation_meta?: { weak_points?: unknown; weakPoints?: unknown } | null;
+  feedback_structured?: { weak_points?: unknown; weakPoints?: unknown } | null;
 };
 
 type Citation = {
@@ -63,6 +78,45 @@ function ensureStringArray(value: unknown): string[] {
   if (typeof value === "string") return value.trim() ? [value.trim()] : [];
   const s = String(value ?? "").trim();
   return s ? [s] : [];
+}
+
+type WeakPoint = {
+  key: string;
+  label: string;
+  action?: string;
+};
+
+function normalizeWeakPoints(value: unknown): WeakPoint[] {
+  if (!Array.isArray(value)) return [];
+
+  const out: WeakPoint[] = [];
+  const seen = new Set<string>();
+
+  for (const item of value) {
+    if (typeof item === "string") {
+      const label = item.trim();
+      if (!label) continue;
+      const key = label.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ key, label });
+      continue;
+    }
+
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const rawKey = String(obj.key ?? "").trim().toLowerCase();
+    const rawLabel = String(obj.label ?? obj.text ?? obj.key ?? "").trim();
+    const rawAction = String(obj.action ?? "").trim();
+    const key = rawKey || rawLabel.toLowerCase();
+    const label = rawLabel || rawKey;
+    if (!key || !label) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(rawAction ? { key, label, action: rawAction } : { key, label });
+  }
+
+  return out;
 }
 
 async function readJsonBody<T>(req: NextRequest) {
@@ -152,6 +206,7 @@ async function buildContextForEvaluation(opts: {
 }): Promise<{
   contextText: string;
   usedFileId: string | null;
+  usedFolderId: string | null;
   chunkCount: number;
   citations: Citation[];
 }> {
@@ -163,6 +218,9 @@ async function buildContextForEvaluation(opts: {
     file_id: string | null;
     folder_id: string | null;
     created_at?: string | null;
+    extraction_method?: string | null;
+    extraction_quality?: string | null;
+    page_from?: number | null;
   };
 
   type FileRow = {
@@ -190,6 +248,7 @@ async function buildContextForEvaluation(opts: {
 
   async function buildFromFileId(fileId: string): Promise<{
     text: string;
+    folderId: string | null;
     chunkCount: number;
     citations: Citation[];
   }> {
@@ -204,7 +263,7 @@ async function buildContextForEvaluation(opts: {
 
     const { data: chunks, error } = await sb
       .from("doc_chunks")
-      .select("id, content, file_id, folder_id, created_at")
+      .select("id, content, file_id, folder_id, created_at, extraction_method, extraction_quality, page_from")
       .eq("owner_id", ownerId)
       .eq("file_id", fileId)
       .order("created_at", { ascending: true })
@@ -212,19 +271,24 @@ async function buildContextForEvaluation(opts: {
 
     if (error) {
       console.error("[evaluate] doc_chunks error (file):", error);
-      return { text: "", chunkCount: 0, citations: [] };
+      return { text: "", folderId: (fileRow as any)?.folder_id ?? null, chunkCount: 0, citations: [] };
     }
 
     const rows: ChunkRow[] = (chunks ?? []) as ChunkRow[];
     const nonEmptyRows = rows.filter((r) => (r.content ?? "").trim().length > 0);
     const nonEmpty = nonEmptyRows.map((r) => (r.content ?? "").trim());
 
-    if (!nonEmpty.length) return { text: "", chunkCount: 0, citations: [] };
+    if (!nonEmpty.length) return { text: "", folderId: (fileRow as any)?.folder_id ?? null, chunkCount: 0, citations: [] };
 
-    let text = nonEmpty.join("\n\n---\n\n");
+    const rankedRows = rankChunksForPrompt(nonEmptyRows, `${body.question ?? ""} ${body.answer ?? ""}`)
+      .slice(0, Math.min(nonEmptyRows.length, 18))
+      .map((r) => r.chunk)
+      .sort((a, b) => (Date.parse(String(a.created_at ?? "0")) || 0) - (Date.parse(String(b.created_at ?? "0")) || 0));
+
+    let text = rankedRows.map((r) => (r.content ?? "").trim()).join("\n\n---\n\n");
     if (text.length > maxChars) text = text.slice(0, maxChars);
 
-    const firstChunkId = String(nonEmptyRows[0]?.id ?? fileId);
+    const firstChunkId = String(rankedRows[0]?.id ?? fileId);
     const citations: Citation[] = [
       {
         chunkId: firstChunkId,
@@ -234,7 +298,7 @@ async function buildContextForEvaluation(opts: {
       },
     ];
 
-    return { text, chunkCount: nonEmpty.length, citations };
+    return { text, folderId: (fileRow as any)?.folder_id ?? null, chunkCount: rankedRows.length, citations };
   }
 
   if (explicitFileId) {
@@ -242,6 +306,7 @@ async function buildContextForEvaluation(opts: {
     return {
       contextText: r.text,
       usedFileId: explicitFileId,
+      usedFolderId: r.folderId,
       chunkCount: r.chunkCount,
       citations: r.citations,
     };
@@ -273,7 +338,7 @@ async function buildContextForEvaluation(opts: {
     filesInScope = (allFiles ?? []) as FileRow[];
   }
 
-  if (!filesInScope.length) return { contextText: "", usedFileId: null, chunkCount: 0, citations: [] };
+  if (!filesInScope.length) return { contextText: "", usedFileId: null, usedFolderId: null, chunkCount: 0, citations: [] };
 
   const recentFiles = filesInScope.slice(0, Math.min(filesInScope.length, 5));
   const idx = Math.floor(Math.random() * recentFiles.length);
@@ -283,6 +348,7 @@ async function buildContextForEvaluation(opts: {
   return {
     contextText: r.text,
     usedFileId: String(chosenFile.id),
+    usedFolderId: r.folderId ?? (chosenFile.folder_id ?? null),
     chunkCount: r.chunkCount,
     citations: r.citations,
   };
@@ -381,18 +447,33 @@ try {
   const msg = String(e?.message ?? "");
   const isAuth = msg.toLowerCase().includes("unauthorized");
   if (!isAuth) console.error("[evaluate] requireUser crash:", e);
-  return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-}
+	  return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+	}
 
-    let model: string;
+    const profileAdmin = supabaseAdminOrNull();
+    if (profileAdmin) {
+      try {
+        await ensureProfile(profileAdmin, ownerId);
+      } catch (profileError) {
+        console.warn("[evaluate] ensureProfile warning:", profileError);
+      }
+    } else {
+      console.warn("[evaluate] ensureProfile skipped: missing service-role client");
+    }
+	
+	    let model: string;
     try {
-      model = requireFlowModel(flow);
+      model =
+        flow === "trainer" || flow === "simulator"
+          ? resolveModelForFeature("weakness")
+          : resolveModelForFeature(flow);
     } catch (e: any) {
       return NextResponse.json({ ok: false, error: e?.message ?? "Missing model env" }, { status: 500 });
     }
 
     // ✅ Trainer-runde gating (2 evals pr. runde) + ingen evaluate-quota for trainer
     let trainerRoundMeta: any = null;
+    let shouldConsumeTrainerRound = false;
     if (flow === "trainer") {
       if (!roundId) {
         return NextResponse.json(
@@ -418,6 +499,43 @@ try {
           { ok: false, error: "Denne runde er brugt op. Generér et nyt spørgsmål for at starte en ny runde." },
           { status: 402 },
         );
+      }
+
+      shouldConsumeTrainerRound = evalsUsed === 0;
+      if (shouldConsumeTrainerRound) {
+        const quotaAdmin = supabaseAdminOrNull();
+        if (!quotaAdmin) {
+          return NextResponse.json(
+            { ok: false, error: "Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (kræves til quota)." },
+            { status: 500 },
+          );
+        }
+
+        const quotaConsume = await quotaTryConsume({
+          admin: quotaAdmin,
+          ownerId,
+          feature: "trainer_round",
+          amount: 1,
+          exceededMessage: "Du har nået din grænse for Træner-runder denne måned.",
+        });
+
+        if (!quotaConsume.ok) {
+          if (quotaConsume.status === 503) {
+            console.error("[evaluate] quota_try_consume error:", quotaConsume.raw);
+          }
+          return NextResponse.json(
+            {
+              ok: false,
+              error: quotaConsume.message,
+              code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+              feature: "trainer_round",
+              usedThisMonth: quotaConsume.used,
+              monthlyLimit: quotaConsume.limitPerMonth,
+              resetAt: quotaConsume.resetAt,
+            },
+            { status: quotaConsume.status },
+          );
+        }
       }
     } else {
       // Quota-check (kun for simulator/oral)
@@ -464,6 +582,7 @@ try {
     // Kontekst + citations (kun hvis includeBackground)
     let contextText = "";
     let usedFileId: string | null = null;
+    let usedFolderId: string | null = null;
     let contextChunkCount = 0;
     let citations: Citation[] = [];
 
@@ -471,6 +590,7 @@ try {
       const ctx = await buildContextForEvaluation({ sb, ownerId, body, maxChars: 8000 });
       contextText = ctx.contextText;
       usedFileId = ctx.usedFileId;
+      usedFolderId = ctx.usedFolderId;
       contextChunkCount = ctx.chunkCount;
       citations = ctx.citations;
 
@@ -524,22 +644,28 @@ Du SKAL svare som gyldigt JSON med PRÆCIS disse felter:
   "overall": string,
   "strengths": string[],
   "improvements": string[],
-  "next_steps": string[]
+  "next_steps": string[],
+  "weak_points": [{ "key": string, "label": string, "action"?: string }]
 }
 
-Alle arrays SKAL indeholde mindst ét element.
+Felter "strengths", "improvements" og "next_steps" SKAL indeholde mindst ét element.
+Feltet "weak_points" SKAL altid være et array (kan være tomt).
 Ingen tekst uden for JSON-objektet.
 `.trim();
 
     const userPayload = { question, answer, context: contextText };
 
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: JSON.stringify(userPayload) },
-      ],
+    const { completion } = await createChatCompletion(openai, {
+      feature: flow === "trainer" || flow === "simulator" ? "weakness" : flow,
+      purpose: "json",
+      modelOverride: model,
+      payload: {
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: JSON.stringify(userPayload) },
+        ],
+      },
     });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
@@ -562,29 +688,56 @@ Ingen tekst uden for JSON-objektet.
     let strengths = ensureStringArray(parsedEval.strengths);
     let improvements = ensureStringArray(parsedEval.improvements);
     let nextSteps = ensureStringArray(parsedEval.next_steps);
+    const weakPointsRaw =
+      parsedEval.weak_points ??
+      parsedEval.weakPoints ??
+      parsedEval.meta?.weak_points ??
+      parsedEval.meta?.weakPoints ??
+      parsedEval.metadata?.weak_points ??
+      parsedEval.metadata?.weakPoints ??
+      parsedEval.feedback_meta?.weak_points ??
+      parsedEval.feedback_meta?.weakPoints ??
+      parsedEval.evaluation_meta?.weak_points ??
+      parsedEval.evaluation_meta?.weakPoints ??
+      parsedEval.feedback_structured?.weak_points ??
+      parsedEval.feedback_structured?.weakPoints;
+    const normalizedWeakPoints = normalizeWeakPoints(weakPointsRaw);
 
     if (!strengths.length) strengths = ["Du rammer noget af kernen, men kan blive mere præcis."];
     if (!improvements.length) improvements = ["Uddyb centrale begreber og knyt dem tydeligere til spørgsmålet."];
     if (!nextSteps.length) nextSteps = ["Skriv et forbedret svar, hvor du bruger 2–3 nøglebegreber og et konkret eksempel."];
 
-    const feedbackText = [
-      `Samlet vurdering: ${overall}`,
-      "",
-      "Styrker:",
-      ...strengths.map((s) => `- ${s}`),
-      "",
-      "Det kan forbedres:",
-      ...improvements.map((s) => `- ${s}`),
-      "",
-      "Forslag til næste skridt:",
-      ...nextSteps.map((s) => `- ${s}`),
-    ].join("\n");
+    const feedbackText = buildTrainerFeedbackText({
+      overall,
+      strengths,
+      improvements,
+      nextSteps,
+    });
 
     // ✅ bump evals_used på runden (LLM-kald er gennemført)
     if (flow === "trainer" && roundId) {
       const baseMeta = trainerRoundMeta ?? {};
       await bumpTrainerRoundEval(sb, ownerId, roundId, baseMeta);
     }
+
+    const sessionMeta = {
+      includeBackground,
+      scopeFolderIds,
+      ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
+      note_id: noteId,
+      file_id: usedFileId,
+      contextChunkCount,
+      contextPreview: contextText ? contextText.slice(0, 400) : null,
+      citations,
+      mode,
+      round_id: flow === "trainer" ? roundId : null,
+      weak_points: normalizedWeakPoints,
+    };
+
+    const resolvedTrackingFolderId = usedFolderId ?? sessionFolderId;
+    const resolvedTrackingScopeIds =
+      scopeFolderIds.length > 0 ? scopeFolderIds : resolvedTrackingFolderId ? [resolvedTrackingFolderId] : [];
+    const resolvedTrackingScope = resolvedTrackingScopeIds.length > 0 ? scopeKeyFromFolderIds(resolvedTrackingScopeIds) : null;
 
     const insertPayload = {
       owner_id: ownerId,
@@ -594,18 +747,8 @@ Ingen tekst uden for JSON-objektet.
       score,
       folder_id: sessionFolderId,
       source_type: flow,
-      meta: {
-        includeBackground,
-        scopeFolderIds,
-        ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
-        note_id: noteId,
-        file_id: usedFileId,
-        contextChunkCount,
-        contextPreview: contextText ? contextText.slice(0, 400) : null,
-        citations,
-        mode,
-        round_id: flow === "trainer" ? roundId : null,
-      },
+      meta: sessionMeta,
+      metadata: sessionMeta,
     };
 
     const { error: insertError } = await sb.from("exam_sessions").insert(insertPayload);
@@ -635,6 +778,20 @@ Ingen tekst uden for JSON-objektet.
       } catch (e) {
         console.error("[evaluate] jobs update (succeeded) error:", e);
       }
+    }
+
+    if (flow === "trainer") {
+      await trackProductEvent({
+        ownerId,
+        eventName: "trainer_answer_evaluated",
+        metadata: {
+          source: "own",
+          folder_id: resolvedTrackingFolderId,
+          file_id: usedFileId,
+          scope: resolvedTrackingScope,
+          feature: "trainer",
+        },
+      });
     }
 
     return NextResponse.json(

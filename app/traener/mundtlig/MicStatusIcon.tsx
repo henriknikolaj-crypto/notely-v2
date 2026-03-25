@@ -1,7 +1,7 @@
 // app/traener/mundtlig/MicStatusIcon.tsx
 "use client";
 
-type MicState = "idle" | "thinking" | "speaking" | "listening" | "evaluating";
+type MicState = "idle" | "thinking" | "speaking" | "listening" | "evaluating" | "paused";
 
 function cx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
@@ -19,6 +19,8 @@ export function MicStatusIcon({
       ? "#ef4444" // rød
       : state === "listening"
         ? "#22c55e" // grøn
+        : state === "paused"
+          ? "#d4d4d8" // lys grå
         : state === "evaluating"
           ? "#a1a1aa" // grå
           : state === "thinking"

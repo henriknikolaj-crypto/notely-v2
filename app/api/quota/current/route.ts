@@ -4,11 +4,22 @@ import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
+import { getMonthlyNoteGenerationUsage } from "@/lib/notes/entitlements";
+import { quotaTryConsume } from "@/lib/quota/rpc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const FLASHCARDS_PER_GENERATION = 10;
+const NO_STORE_HEADERS = {
+  "Cache-Control": "no-store, max-age=0",
+  Pragma: "no-cache",
+  Vary: "Cookie",
+};
+
+function jsonNoStore(body: any, status = 200) {
+  return NextResponse.json(body, { status, headers: NO_STORE_HEADERS });
+}
 
 function n0(x: number | null | undefined) {
   return typeof x === "number" && Number.isFinite(x) ? x : 0;
@@ -191,19 +202,15 @@ async function countFlashcardUnitsThisMonth(opts: {
 
 function pickLimit(planLimits: any[] | null | undefined, feature: string): number | null {
   const row = (planLimits ?? []).find((r: any) => r.feature === feature);
-  const v =
-    row?.monthly_limit ??
-    row?.limit_per_month ??
-    row?.limitPerMonth ??
-    row?.limit ??
-    null;
+  if (!row || row?.is_unlimited === true) return null;
+  const v = row?.monthly_limit ?? null;
 
   return isFiniteNum(v) ? Math.round(v) : null;
 }
 
 function pickUnlimited(planLimits: any[] | null | undefined, feature: string): boolean {
   const row = (planLimits ?? []).find((r: any) => r.feature === feature);
-  return !!(row?.is_unlimited ?? row?.unlimited ?? false);
+  return row?.is_unlimited === true;
 }
 
 function safeIso(x: any): string | null {
@@ -214,24 +221,23 @@ function safeIso(x: any): string | null {
 }
 
 async function tryQuotaCheck(admin: any, ownerId: string, feature: string) {
-  const r = await admin.rpc("quota_try_consume", {
-    p_owner_id: ownerId,
-    p_feature: feature,
-    p_amount: 0,
+  const r = await quotaTryConsume({
+    admin,
+    ownerId,
+    feature: feature as any,
+    amount: 0,
+    exceededMessage: "quota exceeded",
   });
 
-  if (r?.error) return { ok: false as const, error: r.error };
-
-  const row = Array.isArray(r?.data) ? r.data[0] : r?.data;
-  if (!row) return { ok: false as const, error: { message: "No data" } };
+  if (!r.ok && r.status === 503) return { ok: false as const, error: r.raw };
 
   return {
     ok: true as const,
-    allowed: !!row.ok,
-    used: Number(row.out_used ?? 0) || 0,
-    limit: row.out_limit_per_month == null ? null : Number(row.out_limit_per_month),
-    resetAt: safeIso(row.out_reset_at),
-    raw: row,
+    allowed: r.ok,
+    used: Number(r.used ?? 0) || 0,
+    limit: r.limitPerMonth == null ? null : Number(r.limitPerMonth),
+    resetAt: safeIso(r.resetAt),
+    raw: r.raw,
   };
 }
 
@@ -244,16 +250,16 @@ export async function GET(req: NextRequest) {
     ownerId = u.id;
     mode = u.mode;
   } catch {
-    return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
+    return jsonNoStore({ ok: false, error: "unauthorized" }, 401);
   }
 
   let admin: any;
   try {
     admin = supabaseAdmin();
   } catch (e: any) {
-    return NextResponse.json(
+    return jsonNoStore(
       { ok: false, error: "Server config mangler.", details: String(e?.message ?? e) },
-      { status: 500 },
+      500,
     );
   }
 
@@ -276,7 +282,7 @@ export async function GET(req: NextRequest) {
   // plan limits (bruges som fallback/debug)
   const { data: planLimitRows } = await admin
     .from("plan_limits")
-    .select("plan, feature, monthly_limit, limit_per_month, is_unlimited")
+    .select("plan, feature, monthly_limit, is_unlimited")
     .eq("plan", plan);
 
   const planLimits = planLimitRows ?? [];
@@ -318,7 +324,7 @@ export async function GET(req: NextRequest) {
       const limit = importUnlimited ? null : (qImport.limit ?? importLimit);
       const used = capUsed(n0(qImport.used), limit);
 
-      return NextResponse.json({
+      return jsonNoStore({
         ok: true,
         mode,
         ownerId,
@@ -360,7 +366,7 @@ export async function GET(req: NextRequest) {
     const usedRaw = n0(importMonth.count);
     const used = capUsed(usedRaw, importUnlimited ? null : importLimit);
 
-    return NextResponse.json({
+    return jsonNoStore({
       ok: true,
       mode,
       ownerId,
@@ -435,8 +441,21 @@ export async function GET(req: NextRequest) {
     const trainerUsed = capUsed(n0(qTrainer.used), trainerRoundUnlimited ? null : (qTrainer.limit ?? trainerRoundLimit));
     const mcUsed = capUsed(n0(qMc.used), mcUnlimited ? null : (qMc.limit ?? mcLimit));
     const flashUsed = capUsed(n0(qFlash.used), flashUnlimited ? null : (qFlash.limit ?? flashLimit));
+    let noteUsage = {
+      summary: { usedThisMonth: 0, limitPerMonth: null as number | null },
+      focus: { usedThisMonth: 0, limitPerMonth: null as number | null },
+    };
 
-    return NextResponse.json({
+    try {
+      const usage = await getMonthlyNoteGenerationUsage(admin, ownerId);
+      if (usage.isFreemium) {
+        noteUsage = { summary: usage.summary, focus: usage.focus };
+      }
+    } catch (error) {
+      console.error("[quota/current] monthly notes usage error:", error);
+    }
+
+    return jsonNoStore({
       ok: true,
       mode,
       ownerId,
@@ -450,6 +469,8 @@ export async function GET(req: NextRequest) {
       trainer_round: { usedThisMonth: trainerUsed, limitPerMonth: trainerRoundUnlimited ? null : (qTrainer.limit ?? trainerRoundLimit) },
       mc_generate: { usedThisMonth: mcUsed, limitPerMonth: mcUnlimited ? null : (qMc.limit ?? mcLimit) },
       flashcards_generate: { usedThisMonth: flashUsed, limitPerMonth: flashUnlimited ? null : (qFlash.limit ?? flashLimit) },
+      notes_summary_generate: noteUsage.summary,
+      notes_focus_generate: noteUsage.focus,
 
       ...(process.env.NODE_ENV !== "production"
         ? {
@@ -465,6 +486,8 @@ export async function GET(req: NextRequest) {
                 trainer_round: qTrainer.raw ?? null,
                 mc_generate: qMc.raw ?? null,
                 flashcards_generate: qFlash.raw ?? null,
+                notes_summary_generate: noteUsage.summary,
+                notes_focus_generate: noteUsage.focus,
               },
             },
           }
@@ -511,13 +534,26 @@ export async function GET(req: NextRequest) {
   const trainerRoundUsedRaw = n0(trainerRoundMonth.count);
   const mcMonthUsedRaw = n0(mcMonth.count);
   const flashMonthUsedRaw = Number(flashUnitsRes.units ?? 0) || 0;
+  let noteUsage = {
+    summary: { usedThisMonth: 0, limitPerMonth: null as number | null },
+    focus: { usedThisMonth: 0, limitPerMonth: null as number | null },
+  };
+
+  try {
+    const usage = await getMonthlyNoteGenerationUsage(admin, ownerId);
+    if (usage.isFreemium) {
+      noteUsage = { summary: usage.summary, focus: usage.focus };
+    }
+  } catch (error) {
+    console.error("[quota/current] monthly notes usage error:", error);
+  }
 
   const importMonthUsed = capUsed(importMonthUsedRaw, importLimit);
   const trainerRoundUsed = capUsed(trainerRoundUsedRaw, trainerRoundLimit);
   const mcMonthUsed = capUsed(mcMonthUsedRaw, mcLimit);
   const flashMonthUsed = capUsed(n0(flashMonthUsedRaw), flashLimit);
 
-  return NextResponse.json({
+  return jsonNoStore({
     ok: true,
     mode,
     ownerId,
@@ -531,6 +567,8 @@ export async function GET(req: NextRequest) {
     trainer_round: { usedThisMonth: trainerRoundUsed, limitPerMonth: trainerRoundLimit },
     mc_generate: { usedThisMonth: mcMonthUsed, limitPerMonth: mcLimit },
     flashcards_generate: { usedThisMonth: flashMonthUsed, limitPerMonth: flashLimit },
+    notes_summary_generate: noteUsage.summary,
+    notes_focus_generate: noteUsage.focus,
 
     ...(process.env.NODE_ENV !== "production"
       ? {
@@ -542,6 +580,8 @@ export async function GET(req: NextRequest) {
               trainer_round_jobs: trainerRoundUsedRaw,
               mc_generate_jobs: mcMonthUsedRaw,
               flashcards_units: n0(flashMonthUsedRaw),
+              notes_summary_generate: noteUsage.summary.usedThisMonth,
+              notes_focus_generate: noteUsage.focus.usedThisMonth,
             },
             flashcards: { meta: flashUnitsRes.meta ?? null },
             jobsTs: {

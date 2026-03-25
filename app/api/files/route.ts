@@ -16,6 +16,11 @@ type NormalizedFileItem = {
   storage_path: string | null;
   created_at: string | null;
   uploaded_at: string | null;
+  page_count?: number | null;
+  ocr_pages?: number | null;
+  extraction_method?: string | null;
+  extraction_quality?: string | null;
+  extraction_meta?: Record<string, unknown> | null;
   source_table: "files" | "training_files";
 };
 
@@ -136,7 +141,7 @@ export async function GET(req: NextRequest) {
 
   // normalize
   const normalized: NormalizedFileItem[] = [
-    ...trainingRes.data.map((t: any) => {
+    ...trainingRes.data.map((t: any): NormalizedFileItem => {
       const created = pickTs(t.created_at, t.inserted_at, t.uploaded_at);
       const uploaded = pickTs(t.uploaded_at, t.created_at, t.inserted_at);
 
@@ -152,11 +157,16 @@ export async function GET(req: NextRequest) {
         storage_path: asStr(t.storage_path),
         created_at: created,
         uploaded_at: uploaded ?? created,
+        page_count: asNum(t.page_count),
+        ocr_pages: asNum(t.ocr_pages),
+        extraction_method: asStr(t.extraction_method),
+        extraction_quality: asStr(t.extraction_quality),
+        extraction_meta: t.extraction_meta && typeof t.extraction_meta === "object" ? t.extraction_meta : null,
         source_table: "training_files" as const,
       };
     }),
 
-    ...filesRes.data.map((f: any) => {
+    ...filesRes.data.map((f: any): NormalizedFileItem => {
       const created = pickTs(f.created_at, f.inserted_at, f.uploaded_at);
       const uploaded = pickTs(f.uploaded_at, f.created_at, f.inserted_at);
 
@@ -171,6 +181,11 @@ export async function GET(req: NextRequest) {
         storage_path: asStr(f.storage_path),
         created_at: created,
         uploaded_at: uploaded ?? created,
+        page_count: asNum(f.page_count),
+        ocr_pages: asNum(f.ocr_pages),
+        extraction_method: asStr(f.extraction_method),
+        extraction_quality: asStr(f.extraction_quality),
+        extraction_meta: f.extraction_meta && typeof f.extraction_meta === "object" ? f.extraction_meta : null,
         source_table: "files" as const,
       };
     }),

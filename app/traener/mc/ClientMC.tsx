@@ -1,6 +1,7 @@
 "use client";
 
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 type MCOption = {
@@ -30,7 +31,7 @@ type MCQuestion = {
   citations?: MCCitation[];
   usedFileId?: string | null;
   meta?: MCMeta;
-  source: "api" | "fallback";
+  source: "api";
 };
 
 type GenerateMcItemOk = {
@@ -74,47 +75,6 @@ type GenerateMcBatchResponseErr = {
 
 type GenerateMcBatchResponse = GenerateMcBatchResponseOk | GenerateMcBatchResponseErr;
 
-// Fallback-spørgsmål hvis API'et ikke svarer
-const FALLBACK_QUESTIONS: MCQuestion[] = [
-  {
-    id: "local-q1",
-    question: "Hvad er hovedformålet med Notely?",
-    options: [
-      { id: "a", text: "At være en nordisk studieassistent, der hjælper dig med at forstå dit eget pensum", isCorrect: true },
-      { id: "b", text: "At erstatte alle lærebøger, så du aldrig behøver at læse igen", isCorrect: false },
-      { id: "c", text: "At være et generelt AI-chatværktøj uden fokus på studier", isCorrect: false },
-      { id: "d", text: "Kun at lave marketing-tekster til sociale medier", isCorrect: false },
-    ],
-    explanation:
-      "Notely er tænkt som en studieassistent/eksamenstræner, der arbejder ud fra dit eget pensum – ikke som en erstatning for alt andet.",
-    source: "fallback",
-  },
-  {
-    id: "local-q2",
-    question: "Hvad er en god tommelfingerregel for Multiple Choice-spørgsmål i Notely?",
-    options: [
-      { id: "a", text: "Kun ét korrekt svar, tydeligt adskilt fra distraktorerne", isCorrect: true },
-      { id: "b", text: "Flere svar, der alle er lige korrekte", isCorrect: false },
-      { id: "c", text: "Svarmuligheder, der er så uklare som muligt", isCorrect: false },
-      { id: "d", text: "Altid mindst 8 svarmuligheder", isCorrect: false },
-    ],
-    explanation: "MC-spørgsmål bliver stærkest, når der er én klar korrekt mulighed og nogle plausible distraktorer.",
-    source: "fallback",
-  },
-  {
-    id: "local-q3",
-    question: "Hvordan skal MC-delen på sigt fungere i Notely ift. dit pensum?",
-    options: [
-      { id: "a", text: "Spørgsmålene skal genereres ud fra dine egne noter og filer", isCorrect: true },
-      { id: "b", text: "Spørgsmålene skal være helt tilfældige uden relation til pensum", isCorrect: false },
-      { id: "c", text: "Spørgsmålene skal kun handle om Notelys funktioner", isCorrect: false },
-      { id: "d", text: "Spørgsmålene skal kun komme fra en global amerikansk syllabus", isCorrect: false },
-    ],
-    explanation: "Planen er, at MC-spørgsmål genereres ud fra dit eget materiale, så træningen matcher dit fag.",
-    source: "fallback",
-  },
-];
-
 type Props = {
   scopeFolderIds?: string[];
 };
@@ -155,7 +115,16 @@ function toApiQuestion(v: GenerateMcItemOk): MCQuestion {
 type BatchResult = "OK" | "NOT_FOUND" | "STOP" | "NEEDS_SINGLE";
 
 export default function ClientMC({ scopeFolderIds }: Props) {
-  const scopeKey = useMemo(() => JSON.stringify(scopeFolderIds ?? []), [scopeFolderIds]);
+  const effectiveScopeFolderIds = useMemo(
+    () =>
+      Array.from(
+        new Set((scopeFolderIds ?? []).map((id) => String(id ?? "").trim()).filter(Boolean)),
+      ),
+    [scopeFolderIds],
+  );
+  const scopeKey = useMemo(() => JSON.stringify(effectiveScopeFolderIds), [effectiveScopeFolderIds]);
+  const batchRequestSeqRef = useRef(0);
+  const activeRequestKindRef = useRef<"batch" | "single" | null>(null);
 
   const [started, setStarted] = useState(false);
 
@@ -176,8 +145,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [quotaBlocked, setQuotaBlocked] = useState<string | null>(null);
 
-  const [fallbackIndex, setFallbackIndex] = useState(0);
-
   // batch queue
   const [queue, setQueue] = useState<MCQuestion[]>([]);
   const [queuePos, setQueuePos] = useState(0);
@@ -190,6 +157,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
   // afgør om batch endpoint findes
   const batchSupportedRef = useRef<boolean | null>(null);
+  const hasScope = effectiveScopeFolderIds.length > 0;
 
   const dispatchQuotaChanged = useCallback(() => {
     if (typeof window !== "undefined") window.dispatchEvent(new Event("notely-quota-changed"));
@@ -235,10 +203,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
   const computeSessionSize = useCallback(async () => {
     try {
-      const res = await fetch("/api/quota/current", { method: "GET", cache: "no-store" });
-      if (!res.ok) return DEFAULT_SESSION_SIZE;
-
-      const json = await readJsonSafe<any>(res);
+      const json = await fetchQuotaCurrent();
       if (!json?.ok) return DEFAULT_SESSION_SIZE;
 
       const { used, limit } = pickQuota(json);
@@ -250,7 +215,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     } catch {
       return DEFAULT_SESSION_SIZE;
     }
-  }, [readJsonSafe]);
+  }, []);
 
   const applyQuotaBlocked = useCallback(
     (msg?: string | null) => {
@@ -263,31 +228,53 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     [dispatchQuotaChanged],
   );
 
-  const applyFallback = useCallback(
-    (mode: "initial" | "next", reason?: string) => {
-      if (reason) setLoadError((prev) => prev || reason);
-
-      setFallbackIndex((prev) => {
-        const next = (prev + (mode === "next" ? 1 : 0)) % FALLBACK_QUESTIONS.length;
-        const q = FALLBACK_QUESTIONS[next];
-        setCurrentQuestion(q);
-        registerAntiRepeat(q);
-        return next;
-      });
-
-      if (mode === "next") setQuestionNumber((prev) => prev + 1);
-      else setQuestionNumber(1);
-    },
-    [registerAntiRepeat],
-  );
+  const resetRoundToIdle = useCallback((message?: string) => {
+    setStarted(false);
+    setCurrentQuestion(null);
+    setSelectedId(null);
+    setChecked(false);
+    setIsFinished(false);
+    setQueue([]);
+    setQueuePos(0);
+    setQuestionNumber(1);
+    if (message) setLoadError(message);
+  }, []);
 
   const fetchBatch = useCallback(
     async (count: number): Promise<BatchResult> => {
+      if (effectiveScopeFolderIds.length === 0) {
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchBatch:rejected-empty-scope", { count });
+        }
+        resetRoundToIdle("Vælg eller skift mappe her, før du starter Multiple Choice.");
+        setLoadingNext(false);
+        return "STOP";
+      }
+
+      const batchRequestSeq = ++batchRequestSeqRef.current;
+      const isStale = () => batchRequestSeq !== batchRequestSeqRef.current;
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[mc-ui] fetchBatch:start", {
+          batchRequestSeq,
+          count,
+          scopeFolderIds: effectiveScopeFolderIds,
+        });
+      }
+
       setLoadingNext(true);
+      activeRequestKindRef.current = "batch";
       setLoadError(null);
       setQuotaBlocked(null);
 
-      if (abortRef.current) abortRef.current.abort();
+      if (abortRef.current) {
+        abortRef.current.abort();
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] previous-request-aborted-by-new-request", {
+            newKind: "batch",
+            scopeFolderIds: effectiveScopeFolderIds,
+          });
+        }
+      }
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -296,7 +283,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         const avoidChunkIds = recentChunkIdsRef.current.slice(-80);
 
         const payload = {
-          scopeFolderIds: scopeFolderIds ?? [],
+          scopeFolderIds: effectiveScopeFolderIds,
           difficulty: "medium" as const,
           maxContextChunks: 10,
           count,
@@ -311,6 +298,14 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           body: JSON.stringify(payload),
           signal: ac.signal,
         });
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchBatch:resolved", {
+            batchRequestSeq,
+            status: res.status,
+            ok: res.ok,
+            aborted: ac.signal.aborted,
+          });
+        }
 
         if (res.status === 404) {
           batchSupportedRef.current = false;
@@ -332,12 +327,29 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
         if (!res.ok) {
           const j = await readJsonSafe<any>(res);
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[mc-ui] fetchBatch:error-response", {
+              batchRequestSeq,
+              status: res.status,
+              error: String(j?.error ?? `Kunne ikke generere MC-batch (${res.status}).`),
+            });
+          }
+          if (isStale()) return "STOP";
           setLoadError(String(j?.error ?? `Kunne ikke generere MC-batch (${res.status}).`));
           return "NEEDS_SINGLE";
         }
 
         const data = (await readJsonSafe<GenerateMcBatchResponse>(res)) as GenerateMcBatchResponse | null;
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchBatch:parsed", {
+            batchRequestSeq,
+            jsonOk: !!data && (data as any)?.ok === true,
+            returnedCount: (data as any)?.returnedCount ?? null,
+            itemsLength: Array.isArray((data as any)?.items) ? (data as any).items.length : null,
+          });
+        }
         if (!data || (data as any).ok === false) {
+          if (isStale()) return "STOP";
           setLoadError(String((data as any)?.error ?? "Kunne ikke generere MC-batch."));
           return "NEEDS_SINGLE";
         }
@@ -351,6 +363,13 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           .filter((q) => (q.question ?? "").trim().length > 0 && Array.isArray(q.options) && q.options.length === 4);
 
         if (apiQuestionsAll.length === 0) {
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[mc-ui] fetchBatch:no-valid-questions", {
+              batchRequestSeq,
+              rawItemsLength: items.length,
+            });
+          }
+          if (isStale()) return "STOP";
           setLoadError("Batch returnerede ingen gyldige spørgsmål.");
           return "NEEDS_SINGLE";
         }
@@ -363,41 +382,94 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               : apiQuestionsAll.length;
 
         const apiQuestions = apiQuestionsAll.slice(0, Math.min(effective, apiQuestionsAll.length));
+        const first = apiQuestions[0] ?? null;
 
+        if (isStale()) {
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[mc-ui] fetchBatch:stale-success-ignored", {
+              batchRequestSeq,
+              questionCount: apiQuestions.length,
+            });
+          }
+          return "STOP";
+        }
+
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchBatch:set-state", {
+            batchRequestSeq,
+            questionCount: apiQuestions.length,
+            firstQuestionId: first?.id ?? null,
+          });
+        }
+
+        setLoadError(null);
+        setQuotaBlocked(null);
+        setIsFinished(false);
         setSessionTotal(apiQuestions.length);
         setQueue(apiQuestions);
         setQueuePos(0);
-
-        const first = apiQuestions[0] ?? null;
         setCurrentQuestion(first);
         setQuestionNumber(1);
+        setSelectedId(null);
+        setChecked(false);
+        setSaveError(null);
 
         dispatchQuotaChanged();
         registerAntiRepeat(first);
 
         return "OK";
       } catch (err: any) {
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchBatch:catch", {
+            batchRequestSeq,
+            name: err?.name ?? null,
+            message: err?.message ?? String(err),
+            stale: isStale(),
+          });
+        }
         if (err?.name === "AbortError") return "STOP";
+        if (isStale()) return "STOP";
         console.error("generate-mc-batch error:", err);
-        setLoadError("Kunne ikke generere MC-batch. Prøver enkelt-spørgsmål …");
+        setLoadError("Kunne ikke generere MC-batch. Prøver enkeltspørgsmål …");
         return "NEEDS_SINGLE";
       } finally {
-        setLoadingNext(false);
-        setSelectedId(null);
-        setChecked(false);
-        setSaveError(null);
+        if (!isStale()) {
+          activeRequestKindRef.current = null;
+          setLoadingNext(false);
+          setSelectedId(null);
+          setChecked(false);
+          setSaveError(null);
+        }
       }
     },
-    [applyQuotaBlocked, dispatchQuotaChanged, readJsonSafe, registerAntiRepeat, scopeFolderIds],
+    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, readJsonSafe, registerAntiRepeat, resetRoundToIdle],
   );
 
   const fetchSingle = useCallback(
     async (mode: "initial" | "next"): Promise<"OK" | "STOP"> => {
+      if (effectiveScopeFolderIds.length === 0) {
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] fetchSingle:rejected-empty-scope", { mode });
+        }
+        resetRoundToIdle("Vælg eller skift mappe her, før du starter Multiple Choice.");
+        setLoadingNext(false);
+        return "STOP";
+      }
+
       setLoadingNext(true);
+      activeRequestKindRef.current = "single";
       setLoadError(null);
       setQuotaBlocked(null);
 
-      if (abortRef.current) abortRef.current.abort();
+      if (abortRef.current) {
+        abortRef.current.abort();
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] previous-request-aborted-by-new-request", {
+            newKind: "single",
+            scopeFolderIds: effectiveScopeFolderIds,
+          });
+        }
+      }
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -406,7 +478,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         const avoidChunkIds = recentChunkIdsRef.current.slice(-80);
 
         const payload = {
-          scopeFolderIds: scopeFolderIds ?? [],
+          scopeFolderIds: effectiveScopeFolderIds,
           difficulty: "medium" as const,
           maxContextChunks: 10,
           avoidQuestions,
@@ -437,17 +509,15 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           const j = await readJsonSafe<any>(res);
           const msg =
             String(j?.error ?? j?.message ?? "").trim() || `Kunne ikke generere spørgsmål fra dit materiale (${res.status}).`;
-          setLoadError(msg);
-          applyFallback(mode, msg);
-          return "OK";
+          resetRoundToIdle(msg);
+          return "STOP";
         }
 
         const data = (await readJsonSafe<GenerateMcSingleResponse>(res)) as GenerateMcSingleResponse | null;
         if (!data || (data as any).ok === false) {
           const msg = String((data as any)?.error ?? "Kunne ikke generere MC-spørgsmål.");
-          setLoadError(msg);
-          applyFallback(mode, msg);
-          return "OK";
+          resetRoundToIdle(msg);
+          return "STOP";
         }
 
         const ok = data as GenerateMcSingleResponseOk;
@@ -462,21 +532,38 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
         return "OK";
       } catch (err: any) {
-        if (err?.name === "AbortError") return "STOP";
+        if (err?.name === "AbortError") {
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[mc-ui] fetchSingle:aborted", { scopeFolderIds: effectiveScopeFolderIds });
+          }
+          return "STOP";
+        }
         console.error("generate-mc-question error:", err);
-        applyFallback(mode, "Kunne ikke hente nyt spørgsmål – bruger demo-spørgsmål i stedet.");
-        return "OK";
+        resetRoundToIdle("Kunne ikke hente nyt spørgsmål fra dit valgte materiale.");
+        return "STOP";
       } finally {
+        activeRequestKindRef.current = null;
         setLoadingNext(false);
         setSelectedId(null);
         setChecked(false);
         setSaveError(null);
       }
     },
-    [applyFallback, applyQuotaBlocked, dispatchQuotaChanged, readJsonSafe, registerAntiRepeat, scopeFolderIds],
+    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, readJsonSafe, registerAntiRepeat, resetRoundToIdle],
   );
 
   const startNewRound = useCallback(async () => {
+    if (effectiveScopeFolderIds.length === 0) {
+      setStarted(false);
+      setCurrentQuestion(null);
+      setQueue([]);
+      setQueuePos(0);
+      setIsFinished(false);
+      setLoadingNext(false);
+      setLoadError("Vælg eller skift mappe her, før du starter Multiple Choice.");
+      return;
+    }
+
     setStarted(true);
 
     setCurrentQuestion(null);
@@ -521,11 +608,21 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       return;
     }
     // STOP eller OK: intet mere at gøre
-  }, [applyQuotaBlocked, computeSessionSize, fetchBatch, fetchSingle]);
+  }, [applyQuotaBlocked, computeSessionSize, effectiveScopeFolderIds, fetchBatch, fetchSingle]);
 
   // scope-skift: stop alt og tilbage til “Start”
   useEffect(() => {
-    if (abortRef.current) abortRef.current.abort();
+    if (abortRef.current) {
+      abortRef.current.abort();
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[mc-ui] request-aborted-on-scope-change", {
+          activeRequestKind: activeRequestKindRef.current,
+          scopeKey,
+        });
+      }
+    }
+    batchRequestSeqRef.current += 1;
+    activeRequestKindRef.current = null;
 
     setStarted(false);
 
@@ -544,17 +641,36 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
     setQueue([]);
     setQueuePos(0);
-
     recentQuestionsRef.current = [];
     recentChunkIdsRef.current = [];
 
     void (async () => {
+      if (!hasScope) {
+        setSessionTotal(DEFAULT_SESSION_SIZE);
+        setQuotaBlocked(null);
+        return;
+      }
       const sz = await computeSessionSize();
       setSessionTotal(sz);
       if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
       else setQuotaBlocked(null);
     })();
-  }, [scopeKey, computeSessionSize]);
+  }, [computeSessionSize, hasScope, scopeKey]);
+
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        if (process.env.NODE_ENV !== "production") {
+          console.debug("[mc-ui] request-aborted-on-unmount", {
+            activeRequestKind: activeRequestKindRef.current,
+          });
+        }
+      }
+      batchRequestSeqRef.current += 1;
+      activeRequestKindRef.current = null;
+    };
+  }, []);
 
   const correctOption = currentQuestion?.options.find((o) => o.isCorrect) || null;
 
@@ -679,15 +795,14 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
   // START state
   if (!started && !currentQuestion && !isFinished) {
-    const hasScope = (scopeFolderIds ?? []).length > 0;
-
     return (
       <div className="space-y-4">
         <div className="rounded-2xl border border-zinc-200 bg-white p-4">
           <div className="text-sm font-semibold text-zinc-900">Multiple Choice</div>
-          <div className="mt-1 text-xs text-zinc-600">Vælg først mappe(r) i venstre side. Tryk derefter “Start” for at generere en runde.</div>
+          <div className="mt-1 text-xs text-zinc-600">Vælg eller skift mappe her. Tryk derefter “Start” for at generere en runde.</div>
 
           {quotaBlocked ? <LimitNotice className="mt-3">{quotaBlocked}</LimitNotice> : null}
+          {!quotaBlocked && loadError ? <div className="mt-3 text-xs text-red-600">{loadError}</div> : null}
 
           <div className="mt-4 flex flex-wrap gap-2">
             <button
@@ -755,7 +870,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       <div className="flex items-center justify-between text-xs text-zinc-600">
         <span>
           Spørgsmål {questionNumber}/{sessionTotal}
-          {currentQuestion.source === "fallback" && <span className="ml-2 italic text-zinc-400">(demo)</span>}
         </span>
         <span>
           Rigtige i denne session: <span className="font-medium">{correctCount}/{sessionTotal}</span>

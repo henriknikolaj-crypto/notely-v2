@@ -5,6 +5,14 @@ import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
 import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
+import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
+import {
+  formatSuspiciousPreview,
+  hasSuspiciousFlashcardChars,
+  normalizeFlashcardMathText,
+} from "@/lib/text/flashcardMath";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,6 +37,12 @@ type FlashcardPayload = {
   front: string;
   back: string;
   citation?: Citation | null;
+};
+
+type FlashcardSessionSnapshotItem = {
+  id: string;
+  front: string;
+  back: string;
 };
 
 type LimitsPayload =
@@ -103,14 +117,6 @@ function normalizePlan(raw: any) {
   return p;
 }
 
-function monthBoundsUTC(now = new Date()) {
-  const y = now.getUTCFullYear();
-  const m = now.getUTCMonth();
-  const start = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
-  const resetAt = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0));
-  return { monthStart: start.toISOString(), resetAt: resetAt.toISOString() };
-}
-
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -133,74 +139,31 @@ function fileTitle(row: any) {
 function getFlashLimit(planLimits: any[] | null | undefined): number | null | undefined {
   const row = (planLimits ?? []).find((r: any) => r.feature === "flashcards_generate");
   if (!row) return undefined;
+  if ((row as any).is_unlimited === true) return null;
   const v = (row as any).monthly_limit;
   if (v == null) return null;
   const n = Number(v);
   return Number.isFinite(n) ? Math.round(n) : undefined;
 }
 
-/**
- * Tæl flashcards-forbrug i "kort-units".
- * Primært: SUM(requested) eller SUM(returned) på flashcard_sessions denne måned.
- * Fallback: rowCount * unitsPerSession (typisk 10).
- */
-async function countFlashcardUnitsThisMonth(opts: {
-  sb: any;
-  ownerId: string;
-  monthStart: string;
-  resetAt: string;
-  unitsPerSession: number;
-}) {
-  const { sb, ownerId, monthStart, resetAt, unitsPerSession } = opts;
-
-  const cols = ["requested", "returned", "cards_returned", "cards_count", "card_count", "count"] as const;
-  const tsCols = ["created_at", "inserted_at"] as const;
-
-  for (const tsCol of tsCols) {
-    for (const col of cols) {
-      const r = await sb
-        .from("flashcard_sessions")
-        .select(col)
-        .eq("owner_id", ownerId)
-        .gte(tsCol, monthStart)
-        .lt(tsCol, resetAt)
-        .limit(5000);
-
-      if (r?.error) continue;
-
-      const rows = Array.isArray(r.data) ? r.data : [];
-      let sum = 0;
-      for (const row of rows) {
-        const v = Number((row as any)?.[col]);
-        if (Number.isFinite(v)) sum += v;
-      }
-      return { units: sum, meta: { mode: "sum", tsCol, col } };
-    }
-  }
-
-  const r2 = await sb
-    .from("flashcard_sessions")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", ownerId)
-    .gte("created_at", monthStart)
-    .lt("created_at", resetAt);
-
-  if (!r2?.error && r2?.count != null) {
-    const cnt = Number(r2.count ?? 0) || 0;
-    return { units: cnt * unitsPerSession, meta: { mode: "rowCount", cnt, unitsPerSession } };
-  }
-
-  return { units: 0, meta: { mode: "unknown" } };
-}
-
-async function insertFlashcardSessionBestEffort(sb: any, payloads: any[]) {
+async function insertFlashcardSessionBestEffort(client: any, payloads: any[]) {
   let lastErr: any = null;
   for (const p of payloads) {
-    const r = await sb.from("flashcard_sessions").insert(p);
+    const r = await client.from("flashcard_sessions").insert(p);
     if (!r?.error) return { ok: true as const };
     lastErr = r.error;
   }
   return { ok: false as const, error: lastErr };
+}
+
+function buildCardsSnapshot(cards: FlashcardPayload[]): FlashcardSessionSnapshotItem[] {
+  return cards
+    .map((card) => ({
+      id: String(card?.id ?? "").trim(),
+      front: String(card?.front ?? "").trim(),
+      back: String(card?.back ?? "").trim(),
+    }))
+    .filter((card) => card.id && card.front && card.back);
 }
 
 export async function POST(req: NextRequest) {
@@ -235,7 +198,9 @@ export async function POST(req: NextRequest) {
       const rl = await enforceRateLimit(
         ownerId,
         "flashcards_generate",
-        { limit: 6, windowSeconds: 60, minIntervalMs: 3000 },
+        process.env.NODE_ENV === "production"
+          ? { limit: 6, windowSeconds: 60, minIntervalMs: 3000 }
+          : { limit: 120, windowSeconds: 60, minIntervalMs: 0 },
         "Generér flashcards",
       );
       if (!rl.ok) {
@@ -245,11 +210,19 @@ export async function POST(req: NextRequest) {
       // fail-open
     }
 
+    const quotaAdmin = supabaseAdminOrNull();
+    if (!quotaAdmin) {
+      return NextResponse.json(
+        { ok: false, error: "Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (kræves til quota)." },
+        { status: 500 },
+      );
+    }
+
     // plan + limits
     const { data: profile } = await sb.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
     const planKey = normalizePlan((profile as any)?.plan ?? "freemium");
 
-    const { data: planLimits, error: plErr } = await sb.from("plan_limits").select("feature, monthly_limit").eq("plan", planKey);
+    const { data: planLimits, error: plErr } = await sb.from("plan_limits").select("feature, monthly_limit, is_unlimited").eq("plan", planKey);
     if (plErr) console.error("[flashcards/generate] plan_limits error:", plErr);
 
     const monthlyLimit = getFlashLimit(planLimits); // undefined | null | number
@@ -261,33 +234,45 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // forbrug (units) denne måned
-    const { monthStart, resetAt } = monthBoundsUTC(new Date());
-    const usedUnitsRes = await countFlashcardUnitsThisMonth({
-      sb,
+    const quotaSnapshot = await quotaTryConsume({
+      admin: quotaAdmin,
       ownerId,
-      monthStart,
-      resetAt,
-      unitsPerSession: requested,
+      feature: "flashcards_generate",
+      amount: 0,
+      exceededMessage: "Du har nået din flashcards-grænse for denne måned.",
     });
-    const usedThisMonthUnits = Number(usedUnitsRes.units ?? 0) || 0;
 
-    // Tal => stop hvis næste kald vil overskride limit. NULL => ∞
-    if (typeof monthlyLimit === "number") {
-      if (usedThisMonthUnits + requested > monthlyLimit) {
-        const limits: LimitsPayload = {
-          plan: planKey,
-          feature: "flashcards_generate",
-          usedThisMonth: usedThisMonthUnits,
-          monthlyLimit,
-          remainingThisMonth: Math.max(0, monthlyLimit - usedThisMonthUnits),
-        };
-        return NextResponse.json(
-          { ok: false, error: "Du har nået din flashcards-grænse for denne måned.", code: "QUOTA_EXCEEDED", limits },
-          { status: 429 },
-        );
+    if (!quotaSnapshot.ok) {
+      if (quotaSnapshot.status === 503) {
+        console.error("[flashcards/generate] quota_try_consume error:", quotaSnapshot.raw);
       }
+      const limits: LimitsPayload =
+        typeof quotaSnapshot.limitPerMonth === "number"
+          ? {
+              plan: planKey,
+              feature: "flashcards_generate",
+              usedThisMonth: quotaSnapshot.used,
+              monthlyLimit: quotaSnapshot.limitPerMonth,
+              remainingThisMonth: Math.max(0, quotaSnapshot.limitPerMonth - quotaSnapshot.used),
+            }
+          : null;
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: quotaSnapshot.message,
+          code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+          limits,
+          resetAt: quotaSnapshot.resetAt,
+        },
+        { status: quotaSnapshot.status },
+      );
     }
+
+    const effectiveRequested =
+      typeof quotaSnapshot.limitPerMonth === "number"
+        ? Math.max(1, Math.min(requested, Math.max(0, quotaSnapshot.limitPerMonth - quotaSnapshot.used)))
+        : requested;
 
     // filer i scope
     let filesQ = sb
@@ -338,6 +323,7 @@ export async function POST(req: NextRequest) {
 
     const sources: Array<{
       fileId: string;
+      folderId: string | null;
       title: string;
       url: string | null;
       chunkId: string;
@@ -347,12 +333,13 @@ export async function POST(req: NextRequest) {
     let guard = 0;
     let pickIdx = 0;
 
-    while (sources.length < requested && guard < 200) {
+    while (sources.length < effectiveRequested && guard < 200) {
       guard++;
       const f = fileRows[pickIdx % fileRows.length];
       pickIdx++;
 
       const fileId = String(f.id);
+      const folderId = f?.folder_id ? String(f.folder_id) : null;
       const title = fileTitle(f);
 
       const pool = await loadPool(fileId);
@@ -366,10 +353,11 @@ export async function POST(req: NextRequest) {
 
       sources.push({
         fileId,
+        folderId,
         title,
         url: chunk.source_url ? String(chunk.source_url) : null,
         chunkId: String(chunk.id),
-        text: txt.slice(0, 1600),
+        text: normalizeFlashcardMathText(txt).slice(0, 1600),
       });
     }
 
@@ -380,9 +368,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const usedFallback = sources.length < requested;
+    const usedFallback = sources.length < effectiveRequested;
 
-    const model = process.env.OPENAI_MODEL_FLASHCARDS || process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const model = resolveModelForFeature("flashcards");
 
     const systemPrompt = `
 Du er en dansk studieassistent. Du laver flashcards ud fra kilderne nedenfor.
@@ -390,7 +378,12 @@ Du er en dansk studieassistent. Du laver flashcards ud fra kilderne nedenfor.
 VIGTIGT:
 - Hvert kort skal baseres på ÉN (1) bestemt kilde og returnere sourceIndex for den kilde.
 - Skriv alt på dansk.
-- Spørgsmål skal være præcise. Svar skal være kort og nyttigt.
+- Front skal være et kort, præcist spørgsmål.
+- Back skal være mere uddybende og pædagogisk:
+  - 2-5 korte sætninger
+  - tilføj 1 konkret eksempel hvis relevant
+  - du må bruge maks 2 bullets, men undgå lange tekstmure
+- Hold tonen rolig, klar og nordisk.
 - Front/back må ikke nævne "SOURCE", "sourceIndex", "JSON" eller interne instruktioner.
 
 Returnér gyldig JSON:
@@ -411,24 +404,31 @@ Returnér gyldig JSON:
 
     const userPrompt = [
       `Sværhedsgrad: ${difficulty}`,
-      `Lav ${requested} flashcards.`,
+      `Lav ${effectiveRequested} flashcards.`,
       "",
       "KILDER (brug kun disse):",
       "",
       sourcesText,
       "",
       "KRAV:",
-      `- cards.length skal være ${requested} hvis muligt.`,
+      `- cards.length skal være ${effectiveRequested} hvis muligt.`,
       `- sourceIndex skal være 1..${sources.length}.`,
+      "- front: kort spørgsmål (helst 1 sætning).",
+      "- back: 2-5 korte sætninger, gerne 1 konkret eksempel hvis relevant.",
+      "- back må gerne bruge op til 2 bullets, men ikke være en lang mur af tekst.",
     ].join("\n");
 
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
+    const { completion } = await createChatCompletion(openai, {
+      feature: "flashcards",
+      purpose: "json",
+      modelOverride: model,
+      payload: {
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      },
     });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
@@ -455,8 +455,8 @@ Returnér gyldig JSON:
 
       const src = sources[sourceIndex - 1];
 
-      const cleanFront = front.replace(/\bSOURCE\s*\d+\b/gi, "").trim();
-      const cleanBack = back.replace(/\bSOURCE\s*\d+\b/gi, "").trim();
+      const cleanFront = normalizeFlashcardMathText(front.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
+      const cleanBack = normalizeFlashcardMathText(back.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
 
       outCards.push({
         id: randomUUID(),
@@ -477,39 +477,155 @@ Returnér gyldig JSON:
       );
     }
 
+    if (process.env.NODE_ENV !== "production") {
+      const suspiciousSource = sources.find((source) => hasSuspiciousFlashcardChars(source.text));
+      const suspiciousCard = outCards.find((card) =>
+        hasSuspiciousFlashcardChars(card.front) || hasSuspiciousFlashcardChars(card.back),
+      );
+
+      if (suspiciousSource || suspiciousCard) {
+        console.warn("[flashcards/generate] suspicious math symbols detected", {
+          rawChunkText: suspiciousSource ? formatSuspiciousPreview(suspiciousSource.text) : null,
+          generatedFlashcardText: suspiciousCard
+            ? {
+                front: formatSuspiciousPreview(suspiciousCard.front),
+                back: formatSuspiciousPreview(suspiciousCard.back),
+              }
+            : null,
+        });
+      }
+    }
+
+    const quotaConsume = await quotaTryConsume({
+      admin: quotaAdmin,
+      ownerId,
+      feature: "flashcards_generate",
+      amount: outCards.length,
+      exceededMessage: "Du har nået din flashcards-grænse for denne måned.",
+    });
+
+    if (!quotaConsume.ok) {
+      if (quotaConsume.status === 503) {
+        console.error("[flashcards/generate] quota_try_consume error:", quotaConsume.raw);
+      }
+      const limits: LimitsPayload =
+        typeof quotaConsume.limitPerMonth === "number"
+          ? {
+              plan: planKey,
+              feature: "flashcards_generate",
+              usedThisMonth: quotaConsume.used,
+              monthlyLimit: quotaConsume.limitPerMonth,
+              remainingThisMonth: Math.max(0, quotaConsume.limitPerMonth - quotaConsume.used),
+            }
+          : null;
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: quotaConsume.message,
+          code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+          limits,
+          resetAt: quotaConsume.resetAt,
+        },
+        { status: quotaConsume.status },
+      );
+    }
+
     const sessionId = randomUUID();
     const usedFileId = sources[0]?.fileId ? String(sources[0].fileId) : null;
+    const derivedScopeFolderIds = uniqTrimmed(
+      sources
+        .map((source) => source.folderId)
+        .filter((folderId): folderId is string => typeof folderId === "string" && folderId.trim().length > 0),
+    );
+    const sessionScopeFolderIds = scopeFolderIds.length > 0 ? scopeFolderIds : derivedScopeFolderIds;
 
     const nowIso = new Date().toISOString();
+    const cardsSnapshot = buildCardsSnapshot(outCards);
+    if (cardsSnapshot.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "Kunne ikke gemme kort-snapshot for sessionen." },
+        { status: 500 },
+      );
+    }
+
+    if (process.env.NODE_ENV !== "production") {
+      const suspiciousStored = cardsSnapshot.find((card) =>
+        hasSuspiciousFlashcardChars(card.front) || hasSuspiciousFlashcardChars(card.back),
+      );
+      if (suspiciousStored) {
+        console.warn("[flashcards/generate] suspicious stored flashcard snapshot", {
+          storedFlashcardText: {
+            front: formatSuspiciousPreview(suspiciousStored.front),
+            back: formatSuspiciousPreview(suspiciousStored.back),
+          },
+        });
+      }
+    }
+
     const insertPayloads = [
       {
         id: sessionId,
         owner_id: ownerId,
         created_at: nowIso,
-        requested,
+        requested: effectiveRequested,
         returned: outCards.length,
         difficulty,
-        scope_folder_ids: scopeFolderIds,
+        scope_folder_ids: sessionScopeFolderIds,
         used_file_id: usedFileId,
+        cards_snapshot: cardsSnapshot,
       },
-      { id: sessionId, owner_id: ownerId, created_at: nowIso, requested, returned: outCards.length, difficulty },
-      { owner_id: ownerId, created_at: nowIso, requested, returned: outCards.length },
-      { owner_id: ownerId, created_at: nowIso },
+      {
+        owner_id: ownerId,
+        created_at: nowIso,
+        requested: effectiveRequested,
+        returned: outCards.length,
+        difficulty,
+        scope_folder_ids: sessionScopeFolderIds,
+        used_file_id: usedFileId,
+        cards_snapshot: cardsSnapshot,
+      },
+      {
+        id: sessionId,
+        owner_id: ownerId,
+        created_at: nowIso,
+        requested: effectiveRequested,
+        returned: outCards.length,
+        difficulty,
+        scope_folder_ids: sessionScopeFolderIds,
+        cards_snapshot: cardsSnapshot,
+      },
+      {
+        owner_id: ownerId,
+        created_at: nowIso,
+        requested: effectiveRequested,
+        returned: outCards.length,
+        difficulty,
+        scope_folder_ids: sessionScopeFolderIds,
+        cards_snapshot: cardsSnapshot,
+      },
     ];
 
-    const ins = await insertFlashcardSessionBestEffort(sb, insertPayloads);
-    if (!ins.ok) console.error("[flashcards/generate] insert flashcard_sessions failed:", ins.error);
+    const ins = await insertFlashcardSessionBestEffort(quotaAdmin, insertPayloads);
+    if (!ins.ok) {
+      console.error("[flashcards/generate] insert flashcard_sessions failed:", ins.error);
+      return NextResponse.json(
+        { ok: false, error: "Kunne ikke gemme flashcard-sessionen." },
+        { status: 500 },
+      );
+    }
 
-    const usedAfter = usedThisMonthUnits + requested;
+    const usedAfter = quotaConsume.used;
+    const finalLimit = quotaConsume.limitPerMonth ?? monthlyLimit ?? quotaSnapshot.limitPerMonth;
 
     const limits: LimitsPayload =
-      typeof monthlyLimit === "number"
+      typeof finalLimit === "number"
         ? {
             plan: planKey,
             feature: "flashcards_generate",
             usedThisMonth: usedAfter,
-            monthlyLimit,
-            remainingThisMonth: Math.max(0, monthlyLimit - usedAfter),
+            monthlyLimit: finalLimit,
+            remainingThisMonth: Math.max(0, finalLimit - usedAfter),
           }
         : null;
 
@@ -517,10 +633,10 @@ Returnér gyldig JSON:
       ok: true,
       sessionId,
       cards: outCards,
-      requested,
+      requested: effectiveRequested,
       returned: outCards.length,
       difficulty,
-      scopeFolderIds,
+      scopeFolderIds: sessionScopeFolderIds,
       usedFileId,
       usedFallback,
       limits,

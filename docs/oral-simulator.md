@@ -46,7 +46,7 @@
   - brug `verbose_json` + segment timestamps
 - Evaluer med chat-model:
   - `requireFlowModel("oral")`
-  - `OPENAI_MODEL_ORAL = gpt-5.2`
+  - `OPENAI_MODEL_ORAL = gpt-5.4`
 - Returnér JSON:
   - `{ ok:true, result:{ grade, score, summary, strengths, improvements, transcript:{ text, segments:[{start,end,text}] } } }`
 - Gem i `exam_sessions`:

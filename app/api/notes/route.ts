@@ -3,6 +3,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { getOwnerCtx } from "@/lib/auth/owner";
+import {
+  filterVisibleNotes,
+  getNoteEntitlement,
+} from "@/lib/notes/entitlements";
+import { ensureProfile } from "@/lib/server/ensureProfile";
+import { supabaseAdminOrNull } from "@/lib/quota/rpc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,13 +40,14 @@ export async function GET(req: NextRequest) {
 
   const limitRaw = Number(req.nextUrl.searchParams.get("limit") ?? "50");
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+  const entitlement = await getNoteEntitlement(sb, owner.ownerId);
 
   const { data, error } = await sb
     .from("notes")
     .select("id, title, content, source_title, source_url, created_at")
     .eq("owner_id", owner.ownerId)
     .order("created_at", { ascending: false })
-    .limit(limit);
+    .limit(entitlement.visibleNotesLimit ?? limit);
 
   if (error) {
     console.error("[api/notes GET] db error", error);
@@ -50,7 +57,17 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  return NextResponse.json({ ok: true, notes: data ?? [] }, { status: 200 });
+  const visibleNotes = filterVisibleNotes(data ?? [], entitlement).slice(0, limit);
+
+  return NextResponse.json(
+    {
+      ok: true,
+      notes: visibleNotes,
+      visible_limit: entitlement.visibleNotesLimit,
+      total_notes: entitlement.totalNotes,
+    },
+    { status: 200 },
+  );
 }
 
 // POST /api/notes
@@ -82,6 +99,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       { ok: false, code: "INVALID_CONTENT", error: "Indhold må ikke være tomt." },
       { status: 400 },
+    );
+  }
+
+  try {
+    const profileAdmin = supabaseAdminOrNull();
+    if (profileAdmin) {
+      await ensureProfile(profileAdmin, owner.ownerId);
+    }
+  } catch (error: any) {
+    console.error("[api/notes POST] ensureProfile error", error);
+    return NextResponse.json(
+      { ok: false, code: "NOTE_PREPARE_FAILED", error: "Kunne ikke klargøre noten." },
+      { status: 500 },
     );
   }
 

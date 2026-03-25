@@ -1,9 +1,18 @@
 ﻿// app/auth/logout/route.ts
 import "server-only";
+import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
-export async function GET() {
+function resolveNext(rawNext: string | null) {
+  const candidate = String(rawNext ?? "").trim();
+  if (!candidate) return null;
+  if (!candidate.startsWith("/")) return null;
+  if (candidate.startsWith("//")) return null;
+  return candidate;
+}
+
+export async function GET(request: NextRequest) {
   const supabase = await supabaseServerRSC();
 
   try {
@@ -22,9 +31,18 @@ export async function GET() {
     console.error("Logout exception:", e);
   }
 
-  const base = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
-  return NextResponse.redirect(new URL("/auth/login", base));
+  const requestedNext = resolveNext(new URL(request.url).searchParams.get("next"));
+  const location = requestedNext
+    ? `/auth/login?next=${encodeURIComponent(requestedNext)}`
+    : "/auth/login";
+  console.info("[auth-debug] logout redirect", {
+    requestedNext,
+    redirectTo: location,
+  });
+  return new NextResponse(null, {
+    status: 303,
+    headers: {
+      Location: location,
+    },
+  });
 }
-
-
-

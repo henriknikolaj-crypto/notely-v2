@@ -4,6 +4,8 @@
 import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
+import { FlipCard } from "./FlipCard";
 import LimitNotice from "../_ui/LimitNotice";
 
 type Citation = {
@@ -18,6 +20,8 @@ type Citation = {
 
 type Flashcard = {
   id: string;
+  question?: string;
+  answer?: string;
   front: string;
   back: string;
   citation?: Citation | null;
@@ -33,29 +37,6 @@ type Quota =
       remainingThisMonth?: number; // bagudkompat
     }
   | null;
-
-const DEMO_CARDS: Flashcard[] = [
-  {
-    id: "demo-1",
-    front: "Hvad kendetegner en realistisk novelle?",
-    back:
-      "Hverdagsnært miljø, nøgternt sprog og konflikter, der udspringer af relationer og sociale vilkår. Personerne er ofte almindelige og komplekse.",
-    citation: { title: "Demo", detail: "Eksempel" },
-  },
-  {
-    id: "demo-2",
-    front: "Hvad er en synsvinkel i en tekst?",
-    back:
-      "Synsvinklen er den position, teksten fortælles fra. Den styrer, hvad læseren får adgang til, og hvor tæt vi kommer på personers tanker og følelser.",
-    citation: { title: "Demo", detail: "Eksempel" },
-  },
-  {
-    id: "demo-3",
-    front: "Nævn to typiske temaer i realistiske noveller.",
-    back: "Identitet, sociale forskelle, moral/dilemmaer, relationer og ensomhed.",
-    citation: { title: "Demo", detail: "Eksempel" },
-  },
-];
 
 type Props = {
   scopeFolderIds?: string[];
@@ -73,20 +54,102 @@ async function readJsonSafe(res: Response) {
   }
 }
 
+function toText(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(toText).join("\n").trim();
+  if (typeof v === "object") {
+    if (typeof v.text === "string") return v.text;
+    if (typeof v.content === "string") return v.content;
+    if (typeof v.value === "string") return v.value;
+  }
+  return "";
+}
+
+function pickText(...vals: any[]): string {
+  for (const v of vals) {
+    const s = toText(v).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
 function normalizeCard(raw: any): Flashcard | null {
-  const id = String(raw?.id ?? "").trim();
-  const front = String(raw?.front ?? "").trim();
-  const back = String(raw?.back ?? "").trim();
-  if (!id || !front || !back) return null;
+  const id = pickText(raw?.id, raw?.card_id, raw?.flashcard_id);
+  if (!id) return null;
 
-  const cit =
-    raw?.citation ?? {
-      file_id: raw?.citation_file_id ?? null,
-      title: raw?.citation_title ?? null,
-      url: raw?.citation_url ?? null,
-    };
+  // API'et (som i dit screenshot) sender typisk front/back.
+  // Vi normaliserer derfor ALWAYS til front/back, og gemmer question/answer hvis de findes.
+  const q = pickText(
+    raw?.question,
+    raw?.q,
+    raw?.prompt,
+    raw?.term,
+    raw?.questionText,
+    raw?.question_text,
+    raw?.frontText,
+    raw?.front_text,
+    raw?.sporgsmaal,
+    raw?.["spørgsmål"],
+    raw?.data?.question,
+    raw?.card?.question,
+    raw?.front?.text,
+    raw?.front?.content,
+    raw?.front,
+  );
 
-  return { id, front, back, citation: cit ?? null };
+  const a = pickText(
+    raw?.answer,
+    raw?.a,
+    raw?.completion,
+    raw?.definition,
+    raw?.answerText,
+    raw?.answer_text,
+    raw?.backText,
+    raw?.back_text,
+    raw?.svar,
+    raw?.data?.answer,
+    raw?.card?.answer,
+    raw?.back?.text,
+    raw?.back?.content,
+    raw?.back,
+  );
+
+  const front = pickText(raw?.front, q);
+  const back = pickText(raw?.back, a);
+
+  // Vi kræver front/back – ellers ender UI med blanke kort.
+  if (!front || !back) return null;
+
+  const citRaw =
+    raw?.citation ??
+    (Array.isArray(raw?.citations) && raw.citations.length ? raw.citations[0] : null) ??
+    null;
+
+  const cit: Citation | null =
+    citRaw && typeof citRaw === "object"
+      ? {
+          file_id: citRaw.file_id ?? citRaw.fileId ?? raw?.citation_file_id ?? null,
+          title: citRaw.title ?? raw?.citation_title ?? null,
+          url: citRaw.url ?? raw?.citation_url ?? null,
+          detail: citRaw.detail ?? raw?.citation_detail ?? null,
+        }
+      : {
+          file_id: raw?.citation_file_id ?? null,
+          title: raw?.citation_title ?? null,
+          url: raw?.citation_url ?? null,
+          detail: raw?.citation_detail ?? null,
+        };
+
+  return {
+    id,
+    question: q || undefined,
+    answer: a || undefined,
+    front,
+    back,
+    citation: cit ?? null,
+  };
 }
 
 function getScopeFromUrl(sp: ReturnType<typeof useSearchParams> | null): string[] {
@@ -143,13 +206,15 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
     () => buildScopeFolderIds(scopeFolderIds, urlScopeIds),
     [scopeFolderIds, urlScopeIds],
   );
+  const scopeKey = React.useMemo(() => JSON.stringify(effectiveScopeFolderIds), [effectiveScopeFolderIds]);
 
   const [cards, setCards] = React.useState<Flashcard[]>([]);
   const [i, setI] = React.useState(0);
-  const [showBack, setShowBack] = React.useState(false);
+  const [flipped, setFlipped] = React.useState(false);
 
   const [loading, setLoading] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
   const [limitReached, setLimitReached] = React.useState(false);
 
   const [quota, setQuota] = React.useState<Quota>(null);
@@ -169,6 +234,17 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
   const citationFileId = String(citation?.file_id ?? citation?.fileId ?? "").trim();
   const citationDetail = String(citation?.detail ?? "").trim();
 
+  React.useEffect(() => {
+    setFlipped(false);
+  }, [card?.id]);
+
+  React.useEffect(() => {
+    setCards([]);
+    setI(0);
+    setFlipped(false);
+    setErrorMsg(null);
+  }, [scopeKey]);
+
   const dispatchQuotaChanged = React.useCallback(() => {
     try {
       window.dispatchEvent(new Event("notely-quota-changed"));
@@ -178,13 +254,10 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
     }
   }, []);
 
-  const precheckQuota = React.useCallback(async () => {
+  const precheckQuota = React.useCallback(async (force = false) => {
     try {
-      const res = await fetch("/api/quota/current", { method: "GET" });
-      if (!res.ok) return;
-
-      const json = await readJsonSafe(res);
-      if (!json?.ok) return;
+      const json = await fetchQuotaCurrent({ force });
+      if (!json?.ok) return false;
 
       const { used, limit } = pickFlashcardsQuota(json);
       if (typeof limit === "number" && limit > 0) {
@@ -192,30 +265,43 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
         if (remaining <= 0) {
           setLimitReached(true);
           setNotice(QUOTA_MSG);
-        } else {
-          setLimitReached(false);
-          setNotice(null);
+          setErrorMsg(null);
+          return true;
         }
       }
+      setLimitReached(false);
+      setNotice(null);
+      return false;
     } catch {
-      // ignore
+      return false;
     }
   }, []);
 
-  // ✅ Vis limit med det samme ved load + når quota ændrer sig
   React.useEffect(() => {
     void precheckQuota();
 
-    const onQuota = () => void precheckQuota();
+    const onQuota = () => void precheckQuota(true);
     window.addEventListener("notely-quota-changed", onQuota);
     return () => window.removeEventListener("notely-quota-changed", onQuota);
   }, [precheckQuota]);
 
+  React.useEffect(() => {
+    void precheckQuota(true);
+  }, [precheckQuota, scopeKey]);
+
   const generate = React.useCallback(async () => {
     if (limitReached) return;
+    if (effectiveScopeFolderIds.length === 0) {
+      setErrorMsg("Vælg eller skift mappe her, før du genererer flashcards.");
+      return;
+    }
+
+    const quotaBlocked = await precheckQuota(true);
+    if (quotaBlocked) return;
 
     setLoading(true);
     setNotice(null);
+    setErrorMsg(null);
 
     try {
       const res = await fetch("/api/flashcards/generate", {
@@ -234,63 +320,75 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
       if (data?.quota) setQuota(data.quota as Quota);
       else if (data?.limits) setQuota(data.limits as Quota);
 
-      if (res.status === 402 || res.status === 429) {
-        setLimitReached(true);
-        setNotice(String(data?.error ?? QUOTA_MSG));
-        dispatchQuotaChanged();
+      if (!res.ok) {
+        const msg = String(data?.error ?? data?.message ?? "Uventet fejl fra serveren.");
+        if (res.status === 402 || res.status === 429) {
+          setLimitReached(true);
+          setNotice(msg || QUOTA_MSG);
+          setErrorMsg(null);
+          dispatchQuotaChanged();
+          void precheckQuota(true);
+          return;
+        }
+        setErrorMsg(`Fejl (${res.status}): ${msg}`);
         return;
       }
 
-      const rawCards = Array.isArray(data?.cards) ? data.cards : [];
+      const rawCards: any[] = Array.isArray(data?.cards)
+        ? data.cards
+        : Array.isArray(data?.flashcards)
+          ? data.flashcards
+          : Array.isArray(data?.items)
+            ? data.items
+            : [];
+
       const next = rawCards.map(normalizeCard).filter(Boolean) as Flashcard[];
 
       if (res.ok && data?.ok && next.length > 0) {
         setLimitReached(false);
         setCards(next);
         setI(0);
-        setShowBack(false);
+        setFlipped(false);
         if (data?.warning) setNotice(String(data.warning));
         dispatchQuotaChanged();
         return;
       }
 
-      setLimitReached(false);
-      setCards(DEMO_CARDS);
-      setI(0);
-      setShowBack(false);
-      setNotice(String(data?.warning ?? data?.error ?? "Kunne ikke generere kort – bruger demo-kort i stedet."));
-      dispatchQuotaChanged();
+      if (rawCards.length > 0 && next.length === 0) {
+        console.warn("Flashcards: kunne ikke normalisere cards. Eksempel raw:", rawCards[0]);
+        setErrorMsg("Kort blev genereret, men kunne ikke læses (format-mismatch). Se console.warn for eksempel.");
+        return;
+      }
+
+      setErrorMsg(String(data?.warning ?? data?.error ?? "Kunne ikke generere kort fra API-svaret."));
     } catch (err) {
-      // eslint-disable-next-line no-console
       console.error("flashcards generate error:", err);
-      setCards(DEMO_CARDS);
-      setI(0);
-      setShowBack(false);
-      setNotice("Kunne ikke generere kort – bruger demo-kort i stedet.");
-      dispatchQuotaChanged();
+      setErrorMsg("Fejl (netværk): Kunne ikke generere kort.");
     } finally {
       setLoading(false);
     }
-  }, [effectiveScopeFolderIds, dispatchQuotaChanged, limitReached]);
+  }, [effectiveScopeFolderIds, dispatchQuotaChanged, limitReached, precheckQuota]);
 
   function prev() {
     if (!canPrev) return;
     setI((x) => Math.max(0, x - 1));
-    setShowBack(false);
   }
 
   function next() {
     if (!canNext) return;
     setI((x) => Math.min(cards.length - 1, x + 1));
-    setShowBack(false);
   }
 
   function flip() {
     if (!hasCards) return;
-    setShowBack((x) => !x);
+    setFlipped((x) => !x);
   }
 
   const hasScope = effectiveScopeFolderIds.length > 0;
+
+  // VIGTIGT: front/back er canonical (API sender dem). Brug || (ikke ??) så "" ikke blokerer fallback.
+  const frontText = card ? (card.question?.trim() || card.front || "") : "";
+  const backText = card ? (card.answer?.trim() || card.back || "") : "";
 
   return (
     <div className="space-y-4">
@@ -309,18 +407,21 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
         </button>
       </div>
 
-      {/* ✅ ens “grå boks” ved limit */}
       {limitReached ? <LimitNotice feature="flashcards_generate" message={notice ?? QUOTA_MSG} /> : null}
+      {errorMsg ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{errorMsg}</div>
+      ) : null}
       {!limitReached && notice ? <div className="text-xs text-zinc-500">{notice}</div> : null}
 
-      <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-        <div className="text-sm font-semibold text-zinc-900">{showBack ? "Svar" : "Spørgsmål"}</div>
+      <div className="space-y-3">
+        <FlipCard
+          backLabel="Svar"
+          front={frontText || "Vælg eller skift mappe her, og tryk derefter “Generér 10 kort”."}
+          back={backText}
+          flipped={flipped}
+        />
 
-        <div className="mt-3 min-h-[120px] text-[15px] leading-6 text-zinc-900">
-          {card ? (showBack ? card.back : card.front) : "Vælg mappe(r) i venstre side og tryk “Generér 10 kort”."}
-        </div>
-
-        <div className="mt-4 text-xs text-zinc-500">
+        <div className="text-center text-xs text-zinc-500">
           {citationTitle ? (
             <span>
               Kilde:{" "}
@@ -367,7 +468,7 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
           disabled={!hasCards || loading}
           className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-50 disabled:opacity-50"
         >
-          {showBack ? "Vis spørgsmål" : "Vis svar"}
+          {flipped ? "Vis spørgsmål" : "Vis svar"}
         </button>
 
         <button

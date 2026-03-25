@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
+import { consumeMcQuota, getMcQuotaSnapshot } from "@/lib/quota/mc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -92,20 +93,8 @@ function supabaseAdmin() {
 }
 
 async function getOwnerId(req: NextRequest): Promise<string> {
-  try {
-    const u = await requireUser(req);
-    return u.id;
-  } catch {
-    const hdr = String(req.headers.get("x-dev-secret") || req.headers.get("x-shared-secret") || "").trim();
-    const secret =
-      process.env.IMPORT_SHARED_SECRET || process.env.DEV_SHARED_SECRET || process.env.DEV_SECRET || "";
-    if (hdr && secret && hdr === secret) {
-      const devUserId = process.env.DEV_USER_ID;
-      if (!devUserId) throw new Error("DEV_USER_ID mangler i .env.local (dev-bypass).");
-      return devUserId;
-    }
-    throw new Error("Unauthorized");
-  }
+  const u = await requireUser(req);
+  return u.id;
 }
 
 function normalizePlan(raw: any) {
@@ -126,7 +115,7 @@ async function getPlanAndMcLimit(admin: any, ownerId: string): Promise<{ plan: s
   let limits: any[] | null = null;
 
   for (const p of tryPlans) {
-    const r = await admin.from("plan_limits").select("feature, monthly_limit, monthlyLimit").eq("plan", p);
+    const r = await admin.from("plan_limits").select("feature, monthly_limit, is_unlimited").eq("plan", p);
     if (!r.error && Array.isArray(r.data) && r.data.length > 0) {
       limits = r.data;
       break;
@@ -135,7 +124,8 @@ async function getPlanAndMcLimit(admin: any, ownerId: string): Promise<{ plan: s
 
   const row = (limits ?? []).find((r: any) => String(r?.feature ?? "") === "mc_generate");
   if (!row) return { plan: planNorm, mcLimit: null }; // fail-open: undgå 500-støj
-  const rawLimit = (row as any).monthly_limit ?? (row as any).monthlyLimit ?? null;
+  if ((row as any).is_unlimited === true) return { plan: planNorm, mcLimit: null };
+  const rawLimit = (row as any).monthly_limit ?? null;
   if (rawLimit == null) return { plan: planNorm, mcLimit: null };
   const n = Number(rawLimit);
   return { plan: planNorm, mcLimit: Number.isFinite(n) ? Math.round(n) : null };
@@ -350,26 +340,20 @@ export async function POST(req: NextRequest) {
 
     const admin = supabaseAdmin();
 
-    // quota (NULL = ubegrænset)
-    const { plan, mcLimit } = await getPlanAndMcLimit(admin, ownerId);
-    if (typeof mcLimit === "number" && mcLimit > 0) {
-      const { monthStart, resetAt } = getMonthBoundsUTC(new Date());
-      const used = await countMcJobsThisMonth(admin, ownerId, monthStart, resetAt);
-      const remaining = Math.max(0, mcLimit - used);
-      if (remaining <= 0) {
-        const err: GenerateMcErr = {
-          ok: false,
-          error: "Du har nået din grænse for Multiple Choice denne måned.",
-          requestId,
-          code: "QUOTA_EXCEEDED",
-          feature: "mc_generate",
-          plan,
-          usedThisMonth: used,
-          monthlyLimit: mcLimit,
-          resetAt,
-        };
-        return NextResponse.json(err, { status: 429 });
-      }
+    const quotaSnapshot = await getMcQuotaSnapshot(admin, ownerId);
+    if (!quotaSnapshot.ok) {
+      const err: GenerateMcErr = {
+        ok: false,
+        error: quotaSnapshot.message,
+        requestId,
+        code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaSnapshot.plan,
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        resetAt: quotaSnapshot.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaSnapshot.status });
     }
 
     // topic (første mappe-navn hvis muligt)
@@ -521,8 +505,6 @@ export async function POST(req: NextRequest) {
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.9,
-      top_p: 0.95,
     });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
@@ -569,6 +551,22 @@ export async function POST(req: NextRequest) {
       isCorrect: o.isCorrect,
     }));
 
+    const quotaConsume = await consumeMcQuota(admin, ownerId, 1);
+    if (!quotaConsume.ok) {
+      const err: GenerateMcErr = {
+        ok: false,
+        error: quotaConsume.message,
+        requestId,
+        code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaConsume.plan,
+        usedThisMonth: quotaConsume.used,
+        monthlyLimit: quotaConsume.limitPerMonth,
+        resetAt: quotaConsume.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaConsume.status });
+    }
+
     await saveLastUsedFileId(admin, ownerId, scopeKey, usedFileId);
 
     await logMcJob(admin, ownerId, {
@@ -583,8 +581,8 @@ export async function POST(req: NextRequest) {
       usedChunkIds,
       question: q,
       citationCount: citations.length,
-      plan,
-      mcLimit,
+      plan: quotaConsume.plan,
+      mcLimit: quotaConsume.limitPerMonth,
     });
 
     const out: GenerateMcOk = {
@@ -606,3 +604,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(out, { status });
   }
 }
+

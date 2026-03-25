@@ -5,14 +5,15 @@ import { createClient } from "@supabase/supabase-js";
 
 type RateLimitOk = { ok: true };
 type RateLimitBlocked = { ok: false; status: 429; message: string; retryAfterMs: number };
-export type RateLimitResult = RateLimitOk | RateLimitBlocked;
+type RateLimitUnavailable = { ok: false; status: 503; message: string; retryAfterMs: number };
+export type RateLimitResult = RateLimitOk | RateLimitBlocked | RateLimitUnavailable;
 
 function getServiceClient(): any | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url || !key) {
-    console.warn("[rateLimit] Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY – skip.");
+    console.error("[rateLimit] Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.");
     return null;
   }
 
@@ -31,7 +32,14 @@ export async function enforceRateLimit(
   actionLabel?: string,
 ): Promise<RateLimitResult> {
   const sb = getServiceClient();
-  if (!sb) return { ok: true };
+  if (!sb) {
+    return {
+      ok: false,
+      status: 503,
+      retryAfterMs: 1000,
+      message: "Kunne ikke tjekke hastighedsgrænsen lige nu. Prøv igen om lidt.",
+    };
+  }
 
   const { data, error } = await sb.rpc("rate_limit_check", {
     p_owner_id: ownerId,
@@ -43,7 +51,12 @@ export async function enforceRateLimit(
 
   if (error) {
     console.error("[rateLimit] rpc error:", error);
-    return { ok: true }; // fail-open
+    return {
+      ok: false,
+      status: 503,
+      retryAfterMs: 1000,
+      message: "Kunne ikke tjekke hastighedsgrænsen lige nu. Prøv igen om lidt.",
+    };
   }
 
   const row = Array.isArray(data) ? data[0] : data;

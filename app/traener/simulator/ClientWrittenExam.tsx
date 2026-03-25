@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 type ApiQuestion = { id: string; prompt: string };
 
@@ -21,7 +22,12 @@ type SubmitOverall = {
 type Props = {
   scopeFolderIds: string[];
   activeFolderId: string | null;
+  trainingAreaSlotId?: string;
+  isPro?: boolean;
 };
+
+type FocusMode = "normal" | "weakest";
+type PlanStatus = "unknown" | "pro" | "nonpro";
 
 function cx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
@@ -115,7 +121,11 @@ function ProgressRing({
   );
 }
 
-export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Props) {
+export default function ClientWrittenExam({ scopeFolderIds, activeFolderId, trainingAreaSlotId }: Props) {
+  const [hydrated, setHydrated] = useState(false);
+  const [planStatus, setPlanStatus] = useState<PlanStatus>("unknown");
+  const requiresPro = planStatus === "nonpro";
+  const isCheckingPro = planStatus === "unknown";
   const effectiveScopeFolderIds = useMemo(() => {
     const ids = new Set<string>();
     for (const id of scopeFolderIds ?? []) {
@@ -125,9 +135,13 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
     if (activeFolderId) ids.add(String(activeFolderId));
     return Array.from(ids);
   }, [scopeFolderIds, activeFolderId]);
+  const hasScope = effectiveScopeFolderIds.length > 0;
 
   const [durationMin, setDurationMin] = useState<20 | 40 | 60>(20);
+  const [focusMode, setFocusMode] = useState<FocusMode>("normal");
   const durationMs = durationMin * 60 * 1000;
+  const hasSelectedFolder = !!activeFolderId || effectiveScopeFolderIds.length === 1;
+  const effectiveFocusMode: FocusMode = hasSelectedFolder ? focusMode : "normal";
 
   const [phase, setPhase] = useState<"idle" | "loading" | "running" | "submitting" | "done">("idle");
   const [questions, setQuestions] = useState<Question[]>([]);
@@ -149,9 +163,34 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   const [prefetchState, setPrefetchState] = useState<"idle" | "loading" | "ready">("idle");
   const [prefetched, setPrefetched] = useState<Question[]>([]);
   const prefetchAbortRef = useRef<AbortController | null>(null);
+  const [trainingAreaSlotEl, setTrainingAreaSlotEl] = useState<HTMLElement | null>(null);
 
   // auto submit når tid er slut (kun én gang)
   const autoSubmitRef = useRef(false);
+
+  useEffect(() => {
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    void (async () => {
+      try {
+        const res = await fetch(`/api/quota/current?ts=${Date.now()}`, { method: "GET", cache: "no-store" });
+        const json = await res.json().catch(() => null);
+        if (!active) return;
+        const plan = String((json as any)?.plan ?? "").trim().toLowerCase();
+        setPlanStatus(plan === "pro" ? "pro" : "nonpro");
+      } catch {
+        if (!active) return;
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const remainingMs = useMemo(() => {
     if ((phase !== "running" && phase !== "submitting" && phase !== "done") || !endAt) return durationMs;
@@ -165,11 +204,12 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   }, [phase, startedAt, now, durationMs]);
 
   useEffect(() => {
+    if (requiresPro || isCheckingPro) return;
     if (phase !== "running" && phase !== "submitting") return;
     if (!endAt) return;
     const id = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(id);
-  }, [phase, endAt]);
+  }, [requiresPro, isCheckingPro, phase, endAt]);
 
   // Start timer efter spørgsmål er renderet
   useEffect(() => {
@@ -193,6 +233,14 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
     void ensurePrefetchReady();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
+
+  useEffect(() => {
+    if (!trainingAreaSlotId || typeof document === "undefined") {
+      setTrainingAreaSlotEl(null);
+      return;
+    }
+    setTrainingAreaSlotEl(document.getElementById(trainingAreaSlotId));
+  }, [trainingAreaSlotId]);
 
   // Auto-submit når tiden løber ud (hvis mindst 1 svar)
   useEffect(() => {
@@ -223,6 +271,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   }
 
   async function generate(count: number, opts?: { signal?: AbortSignal; avoidPrompts?: string[] }): Promise<Question[]> {
+    if (requiresPro || isCheckingPro) return [];
     const avoidPrompts = opts?.avoidPrompts ?? currentAvoidPrompts();
 
     const res = await fetch("/api/exam/generate", {
@@ -233,6 +282,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
         count,
         scopeFolderIds: effectiveScopeFolderIds,
         folderId: activeFolderId ?? null,
+        focusMode: effectiveFocusMode,
         avoidQuestions: avoidPrompts,
       }),
     });
@@ -276,6 +326,11 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
 
   async function onStart() {
     if (phase !== "idle") return;
+    if (requiresPro || isCheckingPro) return;
+    if (!hasScope) {
+      setError("Vælg en mappe før du starter eksamen.");
+      return;
+    }
 
     prefetchAbortRef.current?.abort();
     prefetchAbortRef.current = null;
@@ -318,6 +373,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   }
 
   async function ensurePrefetchReady() {
+    if (requiresPro || isCheckingPro) return;
     if (phase !== "running") return;
     if (prefetchState === "loading" || prefetchState === "ready") return;
 
@@ -348,6 +404,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   }
 
   async function onAddMore() {
+    if (requiresPro || isCheckingPro) return;
     if (phase !== "running") return;
 
     // hvis ikke klar endnu: prøv at hente (best effort)
@@ -383,6 +440,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
   }
 
   async function onSubmit(isAuto = false) {
+    if (requiresPro || isCheckingPro) return;
     if (phase !== "running") return;
 
     const answeredCount = questions.reduce(
@@ -450,6 +508,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
     }
   }
 
+  const controlsLocked = requiresPro || isCheckingPro;
   const canStart = phase === "idle";
   const isLoading = phase === "loading";
   const isRunning = phase === "running";
@@ -471,9 +530,40 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
     prefetchState === "ready" ? "Tilføj 5 flere" : prefetchState === "loading" ? "Forbereder 5…" : "Tilføj 5 flere";
 
   const addMoreDisabled = prefetchState !== "ready";
+  useEffect(() => {
+    if (!controlsLocked) return;
+    setError(null);
+  }, [controlsLocked]);
+  const trainingAreaControls =
+    phase === "idle" ? (
+      <>
+        <div className="mt-2 flex items-center justify-end">
+          {effectiveFocusMode === "weakest" ? (
+            <span className="rounded-full border border-zinc-300 px-2 py-[1px] text-[10px] font-medium text-zinc-700">
+              Målrettet
+            </span>
+          ) : null}
+        </div>
+        <label className="mt-2 flex items-start gap-2 text-xs text-zinc-700">
+          <input
+            type="checkbox"
+            checked={effectiveFocusMode === "weakest"}
+            onChange={(e) => setFocusMode(e.target.checked ? "weakest" : "normal")}
+            disabled={!hasSelectedFolder}
+            className="mt-[2px] h-4 w-4 rounded border-zinc-300 accent-black disabled:cursor-not-allowed disabled:opacity-50"
+          />
+          <span>
+            <span className="block">Træn på mine svage punkter</span>
+            <span className="text-zinc-500">Bruger seneste vurderinger i valgt mappe.</span>
+          </span>
+        </label>
+      </>
+    ) : null;
 
   return (
     <section className="space-y-4">
+      {trainingAreaSlotEl && trainingAreaControls ? createPortal(trainingAreaControls, trainingAreaSlotEl) : null}
+
       {/* Sticky timer + actions */}
       <div className="sticky top-4 z-10">
         <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
@@ -492,6 +582,7 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
             </div>
 
             <div className="flex items-center gap-2">
+
               {/* Varighed (kun før start) */}
               {phase === "idle" && (
                 <div className="mr-2 inline-flex overflow-hidden rounded-xl bg-white">
@@ -502,11 +593,13 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
                         key={m}
                         type="button"
                         onClick={() => setDurationMin(m as 20 | 40 | 60)}
+                        disabled={controlsLocked}
                         className={cx(
                           tabBtn(active),
                           m !== 20 && "border-l-0",
                           m === 20 && "rounded-l-xl",
                           m === 60 && "rounded-r-xl",
+                          controlsLocked && "cursor-not-allowed text-zinc-500",
                         )}
                       >
                         {m} min
@@ -517,7 +610,12 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
               )}
 
               {canStart && (
-                <button type="button" onClick={onStart} className={actionBtn}>
+                <button
+                  type="button"
+                  onClick={onStart}
+                  disabled={controlsLocked || !hasScope}
+                  className={`${actionBtn} disabled:cursor-not-allowed disabled:bg-white disabled:text-zinc-500`}
+                >
                   Start
                 </button>
               )}
@@ -548,7 +646,20 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId }: Pr
             </div>
           </div>
 
-          {error && <p className="mt-3 text-sm text-red-600">Fejl: {error}</p>}
+          {isCheckingPro ? (
+              <div className="mt-3 rounded-xl border border-zinc-200 bg-white px-3 py-2">
+                <p className="text-sm text-zinc-600">Tjekker abonnement...</p>
+              </div>
+            ) : hydrated && requiresPro ? (
+              <div className="mt-3 rounded-xl border border-zinc-200 bg-white px-3 py-2">
+                <p className="text-sm font-medium text-zinc-800">Kræver Pro</p>
+                <p className="mt-0.5 text-sm text-zinc-600">Opgradér for at starte eksamen.</p>
+              </div>
+            ) : error ? (
+              <p className="mt-3 text-sm text-red-600">Fejl: {error}</p>
+            ) : !hasScope ? (
+              <p className="mt-3 text-sm text-zinc-600">Vælg en mappe ovenfor før du starter eksamen.</p>
+            ) : null}
         </section>
       </div>
 

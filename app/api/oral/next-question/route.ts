@@ -1,10 +1,13 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
-import { requireFlowModel } from "@/lib/openai/requireModel";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
 import { buildOralContext } from "@/lib/oral/context";
 
 export const runtime = "nodejs";
@@ -57,7 +60,24 @@ function normalizeKind(raw: unknown): "followup" | "new" {
   return String(raw ?? "").trim().toLowerCase() === "followup" ? "followup" : "new";
 }
 
+function supabaseAdminOrNull() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 export async function POST(req: NextRequest) {
+  const requestId = randomUUID();
   try {
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY." }, { status: 500 });
@@ -70,6 +90,20 @@ export async function POST(req: NextRequest) {
     const body = parsed.value;
 
     const { sb, id: ownerId } = await requireUser(req);
+    const admin = supabaseAdminOrNull();
+    if (!admin) {
+      return NextResponse.json({ ok: false, error: "Server config mangler." }, { status: 500 });
+    }
+
+    // Why: Mundtlig eksamen skal håndhæves server-side som Pro-only, så client-bypass ikke virker.
+    const { data: profile } = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+    const plan = normalizePlan((profile as any)?.plan);
+    if (plan !== "pro") {
+      return NextResponse.json(
+        { ok: false, error: "Kræver Pro", code: "PRO_REQUIRED", requestId },
+        { status: 403 },
+      );
+    }
 
     const rl = await enforceRateLimit(
       ownerId,
@@ -97,7 +131,7 @@ export async function POST(req: NextRequest) {
 
     const history = normalizeHistory(body.history);
 
-    const model = requireFlowModel("oral");
+    const model = resolveModelForFeature("oral_question");
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const turnIndex = Number.isFinite(Number(body.turnIndex)) ? Math.max(0, Math.floor(Number(body.turnIndex))) : 0;
@@ -112,35 +146,39 @@ export async function POST(req: NextRequest) {
 
     const lastAnswerText = String(body.lastAnswerText ?? "").trim();
 
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: [
-            "Du er dansk eksaminator til mundtlig eksamen.",
-            "Returnér KUN JSON: {\"kind\":\"new|followup\",\"questionText\":\"...\",\"threadId\":\"...\",\"followupCount\":0|1}.",
-            "kind='followup' bruges kun ved uklart/overfladisk svar eller manglende nøglepunkt (definition, begrundelse, eksempel, modargument, belæg).",
-            "Followup skal være meget kort (1 sætning).",
-            "kind='new' bruges når der skal videre til næste hovedspørgsmål.",
-            "Spørgsmål skal altid være på dansk og kun ét spørgsmål ad gangen.",
-            "Brug kontekst fra materialet og elevens tidligere svar.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            turnIndex,
-            remainingSeconds,
-            threadId: requestedThreadId,
-            followupCount: requestedFollowupCount,
-            lastAnswerText: lastAnswerText || null,
-            history,
-            context: ctx.contextText || null,
-          }),
-        },
-      ],
+    const { completion } = await createChatCompletion(openai, {
+      feature: "oral_question",
+      purpose: "json",
+      modelOverride: model,
+      payload: {
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Du er dansk eksaminator til mundtlig eksamen.",
+              "Returnér KUN JSON: {\"kind\":\"new|followup\",\"questionText\":\"...\",\"threadId\":\"...\",\"followupCount\":0|1}.",
+              "kind='followup' bruges kun ved uklart/overfladisk svar eller manglende nøglepunkt (definition, begrundelse, eksempel, modargument, belæg).",
+              "Followup skal være meget kort (1 sætning).",
+              "kind='new' bruges når der skal videre til næste hovedspørgsmål.",
+              "Spørgsmål skal altid være på dansk og kun ét spørgsmål ad gangen.",
+              "Brug kontekst fra materialet og elevens tidligere svar.",
+            ].join(" "),
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              turnIndex,
+              remainingSeconds,
+              threadId: requestedThreadId,
+              followupCount: requestedFollowupCount,
+              lastAnswerText: lastAnswerText || null,
+              history,
+              context: ctx.contextText || null,
+            }),
+          },
+        ],
+      },
     });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";

@@ -13,8 +13,8 @@ function getServiceClient(): any | null {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url || !key) {
-    console.warn(
-      "[quota] Mangler NEXT_PUBLIC_SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY – fail-open (skipper quota-check).",
+    console.error(
+      "[quota] Mangler NEXT_PUBLIC_SUPABASE_URL eller SUPABASE_SERVICE_ROLE_KEY.",
     );
     return null;
   }
@@ -45,7 +45,7 @@ async function loadMonthlyLimit(
 ): Promise<number | null | undefined> {
   const { data, error } = await supabase
     .from("plan_limits")
-    .select("monthly_limit")
+    .select("monthly_limit, is_unlimited")
     .eq("plan", plan)
     .eq("feature", feature)
     .maybeSingle();
@@ -56,6 +56,8 @@ async function loadMonthlyLimit(
   }
 
   if (!data) return undefined;
+
+  if ((data as any)?.is_unlimited === true) return null;
 
   const v = (data as any)?.monthly_limit;
 
@@ -153,7 +155,13 @@ export async function ensureQuotaAndDecrement(
   cost = 1,
 ): Promise<QuotaResult> {
   const supabase = getServiceClient();
-  if (!supabase) return { ok: true, remaining: null }; // fail-open
+  if (!supabase) {
+    return {
+      ok: false,
+      status: 503,
+      message: "Kunne ikke tjekke din grænse lige nu. Prøv igen om lidt.",
+    };
+  }
 
   const { data: profile, error: profileErr } = await supabase
     .from("profiles")

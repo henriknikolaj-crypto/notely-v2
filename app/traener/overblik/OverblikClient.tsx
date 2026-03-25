@@ -5,6 +5,12 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
 type OverviewItem = {
+  folderId?: string;
+  folderName?: string;
+  attemptsWritten?: number;
+  lastTrainedAt?: string | null;
+  avgLast5?: number | null;
+
   folder_id: string | null;
   folder_title: string;
   attempts_total: number;
@@ -179,6 +185,14 @@ function getWeakPointListFromSession(session: SessionRow): unknown[] {
     if (list.length > 0) return list;
   }
 
+  // Oral sessions may only have structured improvements. Use them only as a last-resort fallback.
+  if (session.source_type === "oral") {
+    const result = asRecord(meta?.result);
+    const overall = asRecord(result?.overall);
+    const improvements = asWeakPointRawList(overall?.improvements);
+    if (improvements.length > 0) return improvements;
+  }
+
   return [];
 }
 
@@ -342,19 +356,46 @@ function sanitizeOverviewItems(raw: OverviewItem[]): OverviewItem[] {
   const seen = new Set<string>();
 
   for (const item of raw) {
-    const folderId = typeof item?.folder_id === "string" ? item.folder_id.trim() : "";
+    const folderIdRaw =
+      (typeof item?.folder_id === "string" ? item.folder_id : null) ??
+      (typeof item?.folderId === "string" ? item.folderId : null);
+    const folderId = (folderIdRaw ?? "").trim();
     if (!folderId) continue; // skjul NULL/orphan => ingen "Uden mappe"-kort
 
     if (seen.has(folderId)) continue;
     seen.add(folderId);
 
-    out.push({
-      ...item,
-      folder_id: folderId,
-      folder_title:
-        typeof item.folder_title === "string" && item.folder_title.trim()
+    const folderName =
+      (typeof item.folderName === "string" && item.folderName.trim()
+        ? item.folderName.trim()
+        : typeof item.folder_title === "string" && item.folder_title.trim()
           ? item.folder_title.trim()
-          : "Mappe",
+          : folderId);
+    const attempts =
+      typeof item.attempts_total === "number"
+        ? item.attempts_total
+        : typeof item.attemptsWritten === "number"
+          ? item.attemptsWritten
+          : 0;
+    const avg =
+      typeof item.avg_last5 === "number" || item.avg_last5 === null
+        ? item.avg_last5
+        : typeof item.avgLast5 === "number" || item.avgLast5 === null
+          ? item.avgLast5
+          : null;
+    const lastTrained =
+      typeof item.last_trained_at === "string" || item.last_trained_at === null
+        ? item.last_trained_at
+        : typeof item.lastTrainedAt === "string" || item.lastTrainedAt === null
+          ? item.lastTrainedAt
+          : null;
+
+    out.push({
+      folder_id: folderId,
+      folder_title: folderName,
+      attempts_total: attempts,
+      avg_last5: avg,
+      last_trained_at: lastTrained,
     });
   }
 
@@ -384,6 +425,10 @@ export default function OverblikClient() {
         });
         const payload = (await res.json().catch(() => ({}))) as OverviewResponse;
 
+        if (res.status === 401) {
+          throw new Error("Login mangler i denne browser. Overblik kan ikke hentes uden en gyldig session.");
+        }
+
         if (!res.ok) {
           throw new Error(payload?.error || "Kunne ikke hente overblik.");
         }
@@ -411,11 +456,13 @@ export default function OverblikClient() {
   const hasItems = useMemo(() => items.length > 0, [items]);
 
   return (
-    <main className="max-w-6xl mx-auto p-6">
-      <h1 className="mb-1 text-3xl font-semibold">Overblik</h1>
-      <p className="mb-6 text-[13px] text-black/70">
-        Dine mapper med seneste aktivitet og scoreudvikling.
-      </p>
+    <main className="space-y-6">
+      <header className="mb-6 border-b border-zinc-200 pb-3">
+        <h1 className="text-lg font-semibold text-zinc-900">Overblik</h1>
+        <p className="mt-1 text-sm text-zinc-600">
+          Dine mapper med seneste aktivitet og scoreudvikling.
+        </p>
+      </header>
 
       {loading ? <p className="text-sm text-zinc-600">Henter overblik...</p> : null}
 
@@ -512,7 +559,7 @@ export default function OverblikClient() {
                       href={`/traener/mappe/${encodeURIComponent(card.folder_id)}`}
                       className="inline-flex items-center justify-center rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium text-black hover:bg-neutral-50"
                     >
-                      Åbn indsigt
+                      Se detaljer
                     </Link>
                   ) : (
                     <span className="inline-flex items-center justify-center rounded-full border border-neutral-200 px-4 py-2 text-sm font-medium text-zinc-400">

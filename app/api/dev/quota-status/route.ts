@@ -3,21 +3,10 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { requireDevSecret } from "@/lib/dev/guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function readBearerOrShared(req: NextRequest): string {
-  const h1 = req.headers.get("x-shared-secret");
-  if (h1 && h1.trim()) return h1.trim();
-
-  const h2 = req.headers.get("authorization") || req.headers.get("Authorization") || "";
-  return h2.replace(/^Bearer\s+/i, "").trim();
-}
-
-function readDevSecret(req: NextRequest): string {
-  return String(req.headers.get("x-dev-secret") || req.headers.get("x-shared-secret") || "").trim();
-}
 
 function isUuidLike(s: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -29,7 +18,7 @@ function monthBoundsUTC(now = new Date()) {
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
   const monthStart = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0)).toISOString();
-  const monthEnd = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0)).toISOString(); // eksklusiv
+  const monthEnd = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0)).toISOString();
   return { monthStart, monthEnd };
 }
 
@@ -40,40 +29,10 @@ function jsonError(
   return NextResponse.json({ ok: false, ...payload }, { status });
 }
 
-function gate(req: NextRequest) {
-  const isProd = process.env.NODE_ENV === "production";
-
-  const expectedImport = String(process.env.IMPORT_SHARED_SECRET ?? "").trim();
-  const expectedDev = String(process.env.DEV_BYPASS_SECRET ?? process.env.DEV_SECRET ?? "").trim();
-
-  if (isProd) {
-    // Prod: kræv IMPORT_SHARED_SECRET
-    const incoming = readBearerOrShared(req);
-    if (!expectedImport || incoming !== expectedImport) return { ok: false as const, status: 401 };
-    return { ok: true as const, mode: "prod" as const };
-  }
-
-  // Dev: kræv dev-secret (primært) – ellers fallback til import secret hvis dev-secret ikke er sat
-  if (expectedDev) {
-    const incoming = readDevSecret(req);
-    if (incoming !== expectedDev) return { ok: false as const, status: 404 };
-    return { ok: true as const, mode: "dev" as const };
-  }
-
-  if (expectedImport) {
-    const incoming = readBearerOrShared(req);
-    if (incoming !== expectedImport) return { ok: false as const, status: 404 };
-    return { ok: true as const, mode: "dev" as const };
-  }
-
-  // Ingen secrets sat => endpoint skal ikke være åbent
-  return { ok: false as const, status: 404 };
-}
-
 export async function GET(req: NextRequest) {
-  const g = gate(req);
-  if (!g.ok) {
-    return NextResponse.json({ ok: false, error: "Not found" }, { status: g.status });
+  const guard = requireDevSecret(req);
+  if (!guard.ok) {
+    return NextResponse.json({ ok: false, error: guard.message }, { status: guard.status });
   }
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -87,7 +46,6 @@ export async function GET(req: NextRequest) {
 
   const supabase = createClient(url, key, { auth: { persistSession: false } });
 
-  // Owner: default DEV_USER_ID, men tillad override via ?owner_id=... når gated
   const sp = req.nextUrl.searchParams;
   const ownerOverride = (sp.get("owner_id") ?? sp.get("ownerId") ?? "").trim() || null;
 
@@ -118,7 +76,7 @@ export async function GET(req: NextRequest) {
 
   const { data: planLimitRows, error: planLimitErr } = await supabase
     .from("plan_limits")
-    .select("plan, feature, monthly_limit")
+    .select("plan, feature, monthly_limit, is_unlimited")
     .eq("plan", plan);
 
   if (planLimitErr) console.error("[quota-status] plan_limits error:", planLimitErr);
@@ -126,12 +84,15 @@ export async function GET(req: NextRequest) {
   const planLimits = planLimitRows ?? [];
 
   const importLimit =
-    planLimits.find((r: any) => r.feature === "import")?.monthly_limit ?? null;
+    planLimits.find((r: any) => r.feature === "import")?.is_unlimited
+      ? null
+      : (planLimits.find((r: any) => r.feature === "import")?.monthly_limit ?? null);
 
   const evalLimit =
-    planLimits.find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null;
+    planLimits.find((r: any) => r.feature === "evaluate")?.is_unlimited
+      ? null
+      : (planLimits.find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null);
 
-  // Import-brug (jobs.kind='import', status='succeeded')
   const { count: importThisMonth = 0, error: importMonthErr } = await supabase
     .from("jobs")
     .select("id", { count: "exact", head: true })
@@ -152,7 +113,6 @@ export async function GET(req: NextRequest) {
 
   if (importAllErr) console.error("[quota-status] import all-time error:", importAllErr);
 
-  // Evaluate-brug (exam_sessions, source_type='trainer')
   const { count: evalThisMonth = 0, error: evalMonthErr } = await supabase
     .from("exam_sessions")
     .select("id", { count: "exact", head: true })
@@ -173,7 +133,7 @@ export async function GET(req: NextRequest) {
 
   return NextResponse.json({
     ok: true,
-    gatedAs: g.mode,
+    gatedAs: "dev",
     ownerId,
     now: now.toISOString(),
     monthStart,
@@ -182,7 +142,7 @@ export async function GET(req: NextRequest) {
     import: {
       usedThisMonth: importThisMonth,
       totalAllTime: importAllTime,
-      limitPerMonth: importLimit, // bagudkompat
+      limitPerMonth: importLimit,
       monthlyLimit: importLimit,
     },
     evaluate: {

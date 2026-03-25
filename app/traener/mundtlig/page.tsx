@@ -1,10 +1,16 @@
+// app/traener/mundtlig/page.tsx
 import "server-only";
 
 import Link from "next/link";
+import { unstable_noStore as noStore } from "next/cache";
+import { createClient } from "@supabase/supabase-js";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ClientOralExam from "./ClientOralExam";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 async function getOwnerId(sb: any): Promise<string | null> {
   try {
@@ -13,7 +19,20 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {}
-  return process.env.DEV_USER_ID ?? null;
+  return null;
+}
+
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url || !key) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 }
 
 function cx(...xs: Array<string | false | null | undefined>) {
@@ -70,11 +89,19 @@ function compactFolderLabel(folderIds: string[], folderMap: Map<string, string>)
   return extra > 0 ? `${first} +${extra}` : first;
 }
 
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 export default async function Page({
   searchParams,
 }: {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
+  noStore();
   const sp = (await searchParams) ?? {};
 
   const activeFolderId = pickString(sp, "folder") || null;
@@ -94,7 +121,7 @@ export default async function Page({
   if (!ownerId) {
     return (
       <main className="p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+        Du skal være logget ind for at åbne Træner.
       </main>
     );
   }
@@ -118,8 +145,33 @@ export default async function Page({
   }
 
   const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
+  const resolvedTrainingFolderIds = trainingFolderIds.filter((id) => folderMap.has(id));
+  const resolvedActiveFolderId = resolvedTrainingFolderIds[0] ?? null;
 
-  const scopeHelp = "Vælg mappe";
+  // ✅ plan → isPro (brug service-role, så RLS/cache ikke kan give falsk "freemium")
+  let isPro = false;
+  try {
+    const admin = supabaseAdmin();
+    const { data: profile } = await admin
+      .from("profiles")
+      .select("plan")
+      .eq("id", ownerId)
+      .maybeSingle();
+
+    const planRaw = (profile as any)?.plan ?? null;
+    const planNorm = normalizePlan(planRaw);
+    isPro = planNorm === "pro";
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[oral page]", { ownerId, planRaw, planNorm, isPro });
+    }
+  } catch (e: any) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[oral page] plan lookup failed:", e?.message ?? String(e));
+    }
+    // fail-closed: isPro=false
+    isPro = false;
+  }
 
   return (
     <main>
@@ -135,7 +187,7 @@ export default async function Page({
         {/* Toggle */}
         <div className="inline-flex overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
           <Link href={hrefSkrift} className={cx("px-4 py-2 text-sm text-zinc-900", "bg-white hover:bg-zinc-50")}>
-            Skrift
+            Skriftlig
           </Link>
 
           <Link
@@ -146,17 +198,19 @@ export default async function Page({
           </Link>
         </div>
 
-        <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-          <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
+        <TrainingScopeCard
+          names={scopeCompact ? [scopeCompact] : []}
+          className="md:hidden"
+          emptyLabel="Vælg en mappe direkte her."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        >
+          <FeatureScopePicker
+            selectedNames={scopeCompact ? [scopeCompact] : []}
+            selectedScopeIds={resolvedTrainingFolderIds}
+          />
+        </TrainingScopeCard>
 
-          {scopeCompact ? (
-            <p className="text-xs text-zinc-600">{scopeCompact}</p>
-          ) : (
-            <p className="text-xs text-zinc-600">{scopeHelp}</p>
-          )}
-        </section>
-
-        <ClientOralExam scopeFolderIds={scopeIds} activeFolderId={activeFolderId} />
+        <ClientOralExam scopeFolderIds={resolvedTrainingFolderIds} activeFolderId={resolvedActiveFolderId} isPro={isPro} />
       </section>
     </main>
   );

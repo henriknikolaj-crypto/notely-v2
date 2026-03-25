@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
+import { consumeMcQuota, getMcQuotaSnapshot } from "@/lib/quota/mc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -95,6 +96,8 @@ type FileRow = {
   original_name: string | null;
   folder_id: string | null;
   created_at: string | null;
+  extraction_quality?: string | null;
+  extraction_meta?: Record<string, any> | null;
 };
 
 type ChunkRow = {
@@ -105,7 +108,33 @@ type ChunkRow = {
   source_url?: string | null;
 };
 
+type PlannedQuestion = {
+  batchIndex: number;
+  usedFileId: string;
+  usedFileTitle: string;
+  usedChunkIds: string[];
+  citations: McCitationPayload[];
+  focusAngle: string;
+  userPrompt: string;
+};
+
+type ScoredChunkRow = ChunkRow & {
+  mcScore: number;
+  mcRejected: boolean;
+  mcDownweighted: boolean;
+  mcAcceptReasons: string[];
+  mcDownweightReasons: string[];
+  mcRejectReasons: string[];
+};
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MC_BATCH_CONCURRENCY = 3;
+const MC_BATCH_CONTEXT_CHAR_LIMIT = 4500;
+const MC_OPENAI_CALL_TIMEOUT_MS = 85_000;
+
+function nowMs() {
+  return Date.now();
+}
 
 function n0(x: number | null | undefined) {
   return typeof x === "number" && Number.isFinite(x) ? x : 0;
@@ -119,20 +148,8 @@ function supabaseAdmin() {
 }
 
 async function getOwnerId(req: NextRequest): Promise<string> {
-  try {
-    const u = await requireUser(req);
-    return u.id;
-  } catch {
-    const hdr = String(req.headers.get("x-dev-secret") || req.headers.get("x-shared-secret") || "").trim();
-    const secret =
-      process.env.IMPORT_SHARED_SECRET || process.env.DEV_SHARED_SECRET || process.env.DEV_SECRET || "";
-    if (hdr && secret && hdr === secret) {
-      const devUserId = process.env.DEV_USER_ID;
-      if (!devUserId) throw new Error("DEV_USER_ID mangler i .env.local (dev-bypass).");
-      return devUserId;
-    }
-    throw new Error("Unauthorized");
-  }
+  const u = await requireUser(req);
+  return u.id;
 }
 
 function normalizePlan(raw: any) {
@@ -155,7 +172,7 @@ async function getPlanAndMcLimit(admin: any, ownerId: string): Promise<{ plan: s
   let limits: any[] | null = null;
 
   for (const p of tryPlans) {
-    const r = await admin.from("plan_limits").select("feature, monthly_limit, monthlyLimit").eq("plan", p);
+    const r = await admin.from("plan_limits").select("feature, monthly_limit, is_unlimited").eq("plan", p);
     if (!r.error && Array.isArray(r.data) && r.data.length > 0) {
       limits = r.data;
       break;
@@ -167,7 +184,8 @@ async function getPlanAndMcLimit(admin: any, ownerId: string): Promise<{ plan: s
   const row = (limits ?? []).find((r: any) => String(r?.feature ?? "") === "mc_generate");
   if (!row) return { plan: planNorm, mcLimit: null }; // mangler række => behandl som unlimited for at undgå 500-støj
 
-  const rawLimit = (row as any).monthly_limit ?? (row as any).monthlyLimit ?? null;
+  if ((row as any).is_unlimited === true) return { plan: planNorm, mcLimit: null };
+  const rawLimit = (row as any).monthly_limit ?? null;
   if (rawLimit == null) return { plan: planNorm, mcLimit: null }; // NULL => ubegrænset
 
   const n = Number(rawLimit);
@@ -348,6 +366,93 @@ function chunksPerQuestion(difficulty: Difficulty, maxContextChunks: number) {
   return Math.max(1, Math.min(base, maxContextChunks));
 }
 
+function scoreChunkForMc(content: string, fileRow?: FileRow | null) {
+  const text = String(content ?? "").trim();
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const words = text.split(/\s+/).filter(Boolean);
+  const sentenceMatches = text.match(/[.!?]/g) ?? [];
+  const digits = (text.match(/\d/g) ?? []).length;
+  const mathish = (text.match(/[=+\-/*^%<>()[\]{}]/g) ?? []).length;
+  const denseSpaces = (text.match(/ {2,}/g) ?? []).length;
+  const shortLines = lines.filter((line) => line.length <= 28).length;
+  const tableLikeLines = lines.filter((line) => /\|/.test(line) || /\t/.test(line) || / {2,}/.test(line)).length;
+  const keywordHits = (
+    text.match(/\b(er|betyder|kaldes|derfor|fordi|viser|beskriver|forklarer|defineres|sammenhæng|konsekvens)\b/gi) ?? []
+  ).length;
+  const conceptHits = (text.match(/\b(definition|begreb|kaldes|betyder|sammenhæng|relation|resultat|regel|lov)\b/gi) ?? []).length;
+  const figureRefs = (text.match(/\b(figur|graf|diagram|illustration|tabel)\b/gi) ?? []).length;
+  const taskStubHits = (text.match(/\b(beregn|bestem|angiv|vis at|udled|tegn|aflæs)\b/gi) ?? []).length;
+  const dominantPageType = String(fileRow?.extraction_meta?.dominant_page_type ?? "").trim().toLowerCase();
+
+  let score = 0;
+  const acceptReasons: string[] = [];
+  const downweightReasons: string[] = [];
+  const rejectReasons: string[] = [];
+
+  if (text.length >= 180) {
+    score += 3;
+    acceptReasons.push("connected_text");
+  } else if (text.length >= 110) {
+    score += 1;
+  }
+  else rejectReasons.push("too_short");
+
+  if (words.length >= 35) score += 2;
+  if (sentenceMatches.length >= 2) {
+    score += 2;
+    acceptReasons.push("multi_sentence");
+  }
+  if (keywordHits >= 1) {
+    score += 2;
+    acceptReasons.push("explanatory");
+  }
+  if (conceptHits >= 1) {
+    score += 2;
+    acceptReasons.push("concept_like");
+  }
+  if (keywordHits >= 1 && mathish >= 2 && digits >= 1) {
+    score += 1;
+    acceptReasons.push("balanced_technical");
+  }
+
+  if (lines.length > 0 && shortLines / lines.length > 0.6) {
+    score -= 3;
+    rejectReasons.push("fragmented");
+  }
+  if (tableLikeLines >= 2 || denseSpaces >= 3) {
+    score -= 3;
+    rejectReasons.push("table_like");
+  }
+  if (text.length > 0 && (digits + mathish) / text.length > 0.18) {
+    score -= 3;
+    rejectReasons.push("symbol_heavy");
+  }
+  if (figureRefs >= 1 && keywordHits === 0 && sentenceMatches.length < 2) {
+    score -= 2;
+    downweightReasons.push("figure_ref");
+  }
+  if (taskStubHits >= 1 && text.length < 220 && keywordHits === 0) {
+    score -= 2;
+    downweightReasons.push("task_stub");
+  }
+  if ((dominantPageType === "formula_heavy" || dominantPageType === "table_heavy") && keywordHits === 0 && sentenceMatches.length < 2) {
+    score -= 1;
+    downweightReasons.push("page_type_bias");
+  }
+  if (String(fileRow?.extraction_quality ?? "").trim().toLowerCase() === "low") {
+    score -= 1;
+    downweightReasons.push("low_extraction_quality");
+  }
+  return {
+    score,
+    acceptReasons,
+    downweightReasons,
+    rejectReasons,
+    downweighted: downweightReasons.length > 0 && rejectReasons.length === 0,
+    reject: rejectReasons.length > 0 && score < 2,
+  };
+}
+
 const FOCUS_ANGLES = [
   "Begrebsafklaring (hvad betyder et centralt begreb i teksten?)",
   "Sammenligning (hvad adskiller to nært beslægtede begreber i teksten?)",
@@ -359,6 +464,49 @@ const FOCUS_ANGLES = [
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
+  const requestStartedAt = nowMs();
+
+  const metrics = {
+    fileCountInScope: 0,
+    docChunksInScope: 0,
+    pickedChunkCount: 0,
+    totalCharactersInPickedChunks: 0,
+    openAiCallCount: 0,
+    openAiCallDurationsMs: [] as number[],
+    openAiCallCharacters: [] as number[],
+    totalOpenAiMs: 0,
+    totalRetrievalMs: 0,
+    totalPromptBuildMs: 0,
+    totalNormalizationMs: 0,
+    sequentialOpenAiCalls: false,
+    retryOpenAiCalls: 0,
+    usedFileIds: [] as string[],
+    usedChunkIds: [] as string[],
+    chunksRejectedForMc: 0,
+    chunksDownweightedForMc: 0,
+    acceptedChunkReasonCounts: {
+      connected_text: 0,
+      multi_sentence: 0,
+      explanatory: 0,
+      concept_like: 0,
+      balanced_technical: 0,
+    },
+    rejectedChunkReasonCounts: {
+      too_short: 0,
+      fragmented: 0,
+      table_like: 0,
+      symbol_heavy: 0,
+    },
+    downweightedChunkReasonCounts: {
+      figure_ref: 0,
+      task_stub: 0,
+      page_type_bias: 0,
+      low_extraction_quality: 0,
+    },
+    waveCount: 0,
+    maxInFlightOpenAi: 0,
+    abortSource: null as string | null,
+  };
 
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -377,9 +525,20 @@ export async function POST(req: NextRequest) {
 
     const requestedCount = clampInt(body.count, 1, 10, 10);
     const maxContextChunks = clampInt(body.maxContextChunks, 2, 32, 10);
+    const ownerId = await getOwnerId(req);
 
     const scopeFolderIds = uniqTrimmed(body.scopeFolderIds);
     const scopeKey = scopeKeyFromFolderIds(scopeFolderIds);
+    if (scopeFolderIds.length === 0) {
+      console.info("[generate-mc-batch] request-rejected-empty-scope", { requestId });
+      const err: GenerateMcBatchErr = {
+        ok: false,
+        error: "Vælg mindst én mappe før du starter Multiple Choice.",
+        requestId,
+        debug: { scopeFolderIds },
+      };
+      return NextResponse.json(err, { status: 400 });
+    }
 
     const avoidQuestions = uniqTrimmed(body.avoidQuestions).slice(0, 64);
     const avoidNorm = new Set(avoidQuestions.map(normalizeQuestion));
@@ -389,42 +548,25 @@ export async function POST(req: NextRequest) {
     const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 800);
     const avoidChunkSet = new Set<string>(avoidChunkIds);
 
-    const ownerId = await getOwnerId(req);
-
     const admin = supabaseAdmin();
-    const { monthStart, resetAt, monthEnd } = getMonthBoundsUTC(new Date());
-
-    // plan + limit (NULL = ubegrænset)
-    const { plan, mcLimit } = await getPlanAndMcLimit(admin, ownerId);
-
-    let remaining = Number.POSITIVE_INFINITY;
-    let usedThisMonth = 0;
-
-    if (typeof mcLimit === "number" && mcLimit > 0) {
-      const mcMonth = await countMcJobsThisMonth(admin, ownerId, monthStart, resetAt);
-      usedThisMonth = mcMonth.used;
-      remaining = Math.max(0, mcLimit - usedThisMonth);
-
-      if (remaining <= 0) {
-        const err: GenerateMcBatchErr = {
-          ok: false,
-          error: "Du har nået din grænse for Multiple Choice denne måned.",
-          requestId,
-          code: "QUOTA_EXCEEDED",
-          feature: "mc_generate",
-          plan,
-          usedThisMonth,
-          monthlyLimit: mcLimit,
-          monthStart,
-          monthEnd,
-          resetAt,
-        };
-        return NextResponse.json(err, { status: 429 });
-      }
+    const quotaSnapshot = await getMcQuotaSnapshot(admin, ownerId);
+    if (!quotaSnapshot.ok) {
+      const err: GenerateMcBatchErr = {
+        ok: false,
+        error: quotaSnapshot.message,
+        requestId,
+        code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaSnapshot.plan,
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        resetAt: quotaSnapshot.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaSnapshot.status });
     }
 
     const effectiveCount =
-      remaining === Number.POSITIVE_INFINITY ? requestedCount : Math.min(requestedCount, remaining);
+      quotaSnapshot.remainingThisMonth == null ? requestedCount : Math.min(requestedCount, quotaSnapshot.remainingThisMonth);
 
     // Topic (første mappe-navn hvis muligt)
     let topic = "pensum";
@@ -441,7 +583,7 @@ export async function POST(req: NextRequest) {
     // Filer i scope
     let filesQ = admin
       .from("files")
-      .select("id,name,original_name,folder_id,created_at")
+      .select("id,name,original_name,folder_id,created_at,extraction_quality,extraction_meta")
       .eq("owner_id", ownerId)
       .order("created_at", { ascending: false })
       .limit(80);
@@ -452,6 +594,8 @@ export async function POST(req: NextRequest) {
     if (filesErr) console.error("[generate-mc-batch] files error:", filesErr);
 
     const fileRows = (files ?? []) as FileRow[];
+    const fileById = new Map(fileRows.map((row) => [String(row.id), row]));
+    metrics.fileCountInScope = fileRows.length;
     if (fileRows.length === 0) {
       const err: GenerateMcBatchErr = {
         ok: false,
@@ -460,6 +604,20 @@ export async function POST(req: NextRequest) {
         debug: { scopeFolderIds },
       };
       return NextResponse.json(err, { status: 400 });
+    }
+
+    {
+      const scopeFileIds = fileRows.map((f) => String(f.id)).filter(Boolean).slice(0, 80);
+      if (scopeFileIds.length > 0) {
+        const countStartedAt = nowMs();
+        const { count } = await admin
+          .from("doc_chunks")
+          .select("id", { count: "exact", head: true })
+          .eq("owner_id", ownerId)
+          .in("file_id", scopeFileIds);
+        metrics.totalRetrievalMs += nowMs() - countStartedAt;
+        metrics.docChunksInScope = n0(count);
+      }
     }
 
     // Rotation på fil-niveau
@@ -475,11 +633,12 @@ export async function POST(req: NextRequest) {
     let pointer = 0;
 
     // Lazy cache af chunk-pools pr file
-    const poolCache = new Map<string, ChunkRow[]>();
-    async function loadPool(fileId: string): Promise<ChunkRow[]> {
+    const poolCache = new Map<string, ScoredChunkRow[]>();
+    async function loadPool(fileId: string): Promise<ScoredChunkRow[]> {
       const existing = poolCache.get(fileId);
       if (existing) return existing;
 
+      const poolStartedAt = nowMs();
       const { data: pool, error: poolErr } = await admin
         .from("doc_chunks")
         .select("id,file_id,content,created_at,source_url")
@@ -491,17 +650,57 @@ export async function POST(req: NextRequest) {
       if (poolErr) {
         console.error("[generate-mc-batch] doc_chunks pool error:", poolErr);
         poolCache.set(fileId, []);
+        metrics.totalRetrievalMs += nowMs() - poolStartedAt;
         return [];
       }
 
       const poolRows = ((pool ?? []) as ChunkRow[]).filter((r) => (r.content ?? "").trim().length > 0);
-      poolCache.set(fileId, poolRows);
-      return poolRows;
+      const scoredRows = poolRows
+        .map((row) => {
+          const scored = scoreChunkForMc(row.content ?? "", fileById.get(String(row.file_id)) ?? null);
+          if (scored.reject) {
+            metrics.chunksRejectedForMc += 1;
+            for (const reason of scored.rejectReasons) {
+              if (reason in metrics.rejectedChunkReasonCounts) {
+                metrics.rejectedChunkReasonCounts[reason as keyof typeof metrics.rejectedChunkReasonCounts] += 1;
+              }
+            }
+          }
+          if (!scored.reject) {
+            for (const reason of scored.acceptReasons) {
+              if (reason in metrics.acceptedChunkReasonCounts) {
+                metrics.acceptedChunkReasonCounts[reason as keyof typeof metrics.acceptedChunkReasonCounts] += 1;
+              }
+            }
+          }
+          if (scored.downweighted) {
+            metrics.chunksDownweightedForMc += 1;
+            for (const reason of scored.downweightReasons) {
+              if (reason in metrics.downweightedChunkReasonCounts) {
+                metrics.downweightedChunkReasonCounts[reason as keyof typeof metrics.downweightedChunkReasonCounts] += 1;
+              }
+            }
+          }
+          return {
+            ...row,
+            mcScore: scored.score,
+            mcRejected: scored.reject,
+            mcDownweighted: scored.downweighted,
+            mcAcceptReasons: scored.acceptReasons,
+            mcDownweightReasons: scored.downweightReasons,
+            mcRejectReasons: scored.rejectReasons,
+          };
+        })
+        .sort((a, b) => b.mcScore - a.mcScore);
+      poolCache.set(fileId, scoredRows);
+      metrics.totalRetrievalMs += nowMs() - poolStartedAt;
+      return scoredRows;
     }
 
     async function pickFileAndChunks(): Promise<{ file: FileRow; chunks: ChunkRow[] } | null> {
+      const pickStartedAt = nowMs();
       const scanMax = Math.min(30, rotated.length);
-      const take = chunksPerQuestion(difficulty, maxContextChunks);
+      const take = Math.min(chunksPerQuestion(difficulty, maxContextChunks), 2);
 
       // pass 1: respekter avoidChunkSet
       for (let tries = 0; tries < scanMax; tries++) {
@@ -513,11 +712,16 @@ export async function POST(req: NextRequest) {
         const usable = pool.filter((r) => !avoidChunkSet.has(String(r.id)));
         if (usable.length < 1) continue;
 
-        const picked = shuffle(usable)
-          .slice(0, Math.min(take, usable.length))
+        const preferred = usable.filter((r) => !r.mcRejected && !r.mcDownweighted);
+        const acceptable = usable.filter((r) => !r.mcRejected);
+        const candidatePool = preferred.length >= 1 ? preferred : acceptable.length >= 1 ? acceptable : usable;
+
+        const picked = shuffle(candidatePool)
+          .slice(0, Math.min(take, candidatePool.length))
           .sort((a, b) => (Date.parse(a.created_at ?? "0") || 0) - (Date.parse(b.created_at ?? "0") || 0));
 
         pointer = (idx + 1) % rotated.length;
+        metrics.totalRetrievalMs += nowMs() - pickStartedAt;
         return { file: f, chunks: picked };
       }
 
@@ -530,14 +734,20 @@ export async function POST(req: NextRequest) {
         const pool = await loadPool(fileId);
         if (pool.length < 1) continue;
 
-        const picked = shuffle(pool)
-          .slice(0, Math.min(take, pool.length))
+        const preferred = pool.filter((r) => !r.mcRejected && !r.mcDownweighted);
+        const acceptable = pool.filter((r) => !r.mcRejected);
+        const candidatePool = preferred.length >= 1 ? preferred : acceptable.length >= 1 ? acceptable : pool;
+
+        const picked = shuffle(candidatePool)
+          .slice(0, Math.min(take, candidatePool.length))
           .sort((a, b) => (Date.parse(a.created_at ?? "0") || 0) - (Date.parse(b.created_at ?? "0") || 0));
 
         pointer = (idx + 1) % rotated.length;
+        metrics.totalRetrievalMs += nowMs() - pickStartedAt;
         return { file: f, chunks: picked };
       }
 
+      metrics.totalRetrievalMs += nowMs() - pickStartedAt;
       return null;
     }
 
@@ -574,27 +784,34 @@ Returnér gyldig JSON:
 
     const items: GenerateMcItemOk[] = [];
     let lastUsedFileIdInBatch: string | null = null;
+    console.info("[generate-mc-batch] request-start", { requestId, scopeFolderIds, effectiveCount });
 
     const recentCorrectAnswers = new Set<string>();
-
-    for (let i = 0; i < effectiveCount; i++) {
+    async function planQuestion(batchIndex: number): Promise<PlannedQuestion | null> {
       const pick = await pickFileAndChunks();
-      if (!pick) break;
+      if (!pick) return null;
 
       const usedFileId = String(pick.file.id);
       const usedFileTitle = fileTitle(pick.file);
       lastUsedFileIdInBatch = usedFileId;
+      metrics.usedFileIds.push(usedFileId);
 
       const usedChunkIds = pick.chunks.map((c) => String(c.id));
       for (const id of usedChunkIds) avoidChunkSet.add(id);
+      metrics.pickedChunkCount += pick.chunks.length;
+      metrics.usedChunkIds.push(...usedChunkIds);
 
+      const promptStartedAt = nowMs();
       const contextText = pick.chunks
         .map((c) => `KILDE: ${usedFileTitle}\n\n${(c.content ?? "").trim()}`)
         .filter(Boolean)
         .join("\n\n---\n\n")
-        .slice(0, 7000);
-
-      if (!contextText.trim()) continue;
+        .slice(0, MC_BATCH_CONTEXT_CHAR_LIMIT);
+      metrics.totalCharactersInPickedChunks += contextText.length;
+      if (!contextText.trim()) {
+        metrics.totalPromptBuildMs += nowMs() - promptStartedAt;
+        return null;
+      }
 
       const citations: McCitationPayload[] = pick.chunks.map((c) => ({
         chunkId: String(c.id),
@@ -617,8 +834,7 @@ Returnér gyldig JSON:
             )}\n`
           : "";
 
-      const focusAngle = FOCUS_ANGLES[i % FOCUS_ANGLES.length];
-
+      const focusAngle = FOCUS_ANGLES[batchIndex % FOCUS_ANGLES.length];
       const userPrompt = [
         `Fag/tema: ${topic}`,
         `Sværhedsgrad: ${difficulty}`,
@@ -634,7 +850,12 @@ Returnér gyldig JSON:
       ]
         .filter(Boolean)
         .join("\n");
+      metrics.totalPromptBuildMs += nowMs() - promptStartedAt;
 
+      return { batchIndex, usedFileId, usedFileTitle, usedChunkIds, citations, focusAngle, userPrompt };
+    }
+
+    async function generatePlannedQuestion(planned: PlannedQuestion) {
       let finalQuestion = "";
       let finalOptions: Array<{ text: string; isCorrect: boolean }> = [];
       let finalExplanation: string | null = null;
@@ -645,17 +866,58 @@ Returnér gyldig JSON:
             ? systemPromptBase
             : `${systemPromptBase}\nEKSTRA VIGTIGT: Du må IKKE gentage tidligere spørgsmål. Vælg et andet fokus i konteksten og et andet korrekt-svar.`;
 
-        const completion = await openai.chat.completions.create({
-          model,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          temperature: 0.9,
-          top_p: 0.95,
-        });
+        const openAiStartedAt = nowMs();
+        const openAiAbort = new AbortController();
+        const timeoutHandle = setTimeout(() => {
+          metrics.abortSource = "route_openai_timeout";
+          console.info("[generate-mc-batch] openai-call-abort", {
+            requestId,
+            source: "route_openai_timeout",
+            batchIndex: planned.batchIndex,
+            attempt,
+            timeoutMs: MC_OPENAI_CALL_TIMEOUT_MS,
+          });
+          openAiAbort.abort("route_openai_timeout");
+        }, MC_OPENAI_CALL_TIMEOUT_MS);
+        let completion;
+        try {
+          completion = await openai.chat.completions.create(
+            {
+              model,
+              response_format: { type: "json_object" },
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: planned.userPrompt },
+              ],
+            },
+            { signal: openAiAbort.signal },
+          );
+        } catch (err: any) {
+          const abortReason = String(openAiAbort.signal.reason ?? "").trim();
+          if (openAiAbort.signal.aborted || err?.name === "AbortError" || String(err?.message ?? "").includes("aborted")) {
+            const source = abortReason || "unknown_abort_source";
+            metrics.abortSource = source;
+            console.info("[generate-mc-batch] openai-call-aborted", {
+              requestId,
+              source,
+              batchIndex: planned.batchIndex,
+              attempt,
+              elapsedMs: nowMs() - openAiStartedAt,
+            });
+            throw new Error(`MC OpenAI call aborted by ${source}`);
+          }
+          throw err;
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
+        const openAiDurationMs = nowMs() - openAiStartedAt;
+        metrics.openAiCallCount += 1;
+        metrics.openAiCallDurationsMs.push(openAiDurationMs);
+        metrics.openAiCallCharacters.push(planned.userPrompt.length + systemPrompt.length);
+        metrics.totalOpenAiMs += openAiDurationMs;
+        if (attempt > 0) metrics.retryOpenAiCalls += 1;
 
+        const normalizationStartedAt = nowMs();
         const raw = completion.choices[0]?.message?.content ?? "{}";
 
         type LlmOption = { text?: string; isCorrect?: boolean };
@@ -672,11 +934,19 @@ Returnér gyldig JSON:
         const opts = Array.isArray(payload.options) ? payload.options : [];
         const normQ = normalizeQuestion(q);
 
-        if (!q || opts.length < 2) continue;
-        if (avoidNorm.has(normQ)) continue;
-
+        if (!q || opts.length < 2) {
+          metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
+          continue;
+        }
+        if (avoidNorm.has(normQ)) {
+          metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
+          continue;
+        }
         if (avoidTopics.length > 0 && attempt === 0) {
-          if (hitsAvoidTopics(q, avoidTopics) >= 1) continue;
+          if (hitsAvoidTopics(q, avoidTopics) >= 1) {
+            metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
+            continue;
+          }
         }
 
         const normalized = opts.slice(0, 4);
@@ -685,65 +955,82 @@ Returnér gyldig JSON:
         let correctIdx = normalized.findIndex((o) => !!o.isCorrect);
         if (correctIdx === -1) correctIdx = 0;
 
-        const fixed = normalized.map((o, idx) => ({
+        finalQuestion = q;
+        finalOptions = normalized.map((o, idx) => ({
           text: stripLeadingLetterOption(String(o.text ?? "")) || `Mulighed ${idx + 1}`,
           isCorrect: idx === correctIdx,
         }));
-
-        const correctText = fixed.find((x) => x.isCorrect)?.text ?? "";
-        const normA = normalizeAnswer(correctText);
-        if (normA && recentCorrectAnswers.has(normA)) continue;
-
-        finalQuestion = q;
-        finalOptions = fixed;
         finalExplanation = String(payload.explanation ?? "").trim() || null;
-        if (normA) recentCorrectAnswers.add(normA);
+        metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
         break;
       }
 
-      if (!finalQuestion || finalOptions.length === 0) break;
+      return { ...planned, finalQuestion, finalOptions, finalExplanation };
+    }
 
-      const shuffled = shuffle(finalOptions);
-      const letters = ["a", "b", "c", "d"];
-      const options: McOptionPayload[] = shuffled.map((o, idx) => ({
-        id: letters[idx],
-        text: o.text,
-        isCorrect: o.isCorrect,
-      }));
-
-      const item: GenerateMcItemOk = {
-        ok: true,
-        questionId: randomUUID(),
-        question: finalQuestion,
-        options,
-        explanation: finalExplanation,
-        citations,
-        usedFileId,
-        meta: { requestId, usedChunkIds, usedFileTitle },
-      };
-
-      items.push(item);
-      avoidNorm.add(normalizeQuestion(finalQuestion));
-
-      await logMcJob(admin, ownerId, {
-        source: "generate-mc-batch",
+    let nextBatchIndex = 0;
+    while (items.length < effectiveCount) {
+      const waveStartedAt = nowMs();
+      metrics.waveCount += 1;
+      const wavePlans: PlannedQuestion[] = [];
+      for (let i = 0; i < MC_BATCH_CONCURRENCY && nextBatchIndex < effectiveCount; i++) {
+        const planned = await planQuestion(nextBatchIndex);
+        nextBatchIndex += 1;
+        if (planned) wavePlans.push(planned);
+      }
+      if (wavePlans.length === 0) break;
+      metrics.maxInFlightOpenAi = Math.max(metrics.maxInFlightOpenAi, wavePlans.length);
+      console.info("[generate-mc-batch] wave-start", {
         requestId,
-        scopeFolderIds,
-        scopeKey,
-        difficulty,
-        model,
-        usedFileId,
-        usedFileTitle,
-        maxContextChunks,
-        chunksPerQuestion: chunksPerQuestion(difficulty, maxContextChunks),
-        focusAngle,
-        citationCount: citations.length,
-        question: finalQuestion,
-        batchIndex: i,
-        batchRequestedCount: requestedCount,
-        batchEffectiveCount: effectiveCount,
-        plan,
-        mcLimit,
+        wave: metrics.waveCount,
+        plannedCount: wavePlans.length,
+        inFlightOpenAi: wavePlans.length,
+      });
+
+      const waveResults = await Promise.all(wavePlans.map((planned) => generatePlannedQuestion(planned)));
+      waveResults.sort((a, b) => a.batchIndex - b.batchIndex);
+
+      for (const result of waveResults) {
+        if (!result.finalQuestion || result.finalOptions.length === 0) continue;
+
+        const normQ = normalizeQuestion(result.finalQuestion);
+        if (avoidNorm.has(normQ)) continue;
+
+        const correctText = result.finalOptions.find((x) => x.isCorrect)?.text ?? "";
+        const normA = normalizeAnswer(correctText);
+        if (normA && recentCorrectAnswers.has(normA)) continue;
+
+        const shuffled = shuffle(result.finalOptions);
+        const letters = ["a", "b", "c", "d"];
+        const options: McOptionPayload[] = shuffled.map((o, idx) => ({
+          id: letters[idx],
+          text: o.text,
+          isCorrect: o.isCorrect,
+        }));
+
+        items.push({
+          ok: true,
+          questionId: randomUUID(),
+          question: result.finalQuestion,
+          options,
+          explanation: result.finalExplanation,
+          citations: result.citations,
+          usedFileId: result.usedFileId,
+          meta: { requestId, usedChunkIds: result.usedChunkIds, usedFileTitle: result.usedFileTitle },
+        });
+
+        avoidNorm.add(normQ);
+        if (normA) recentCorrectAnswers.add(normA);
+
+        if (items.length >= effectiveCount) break;
+      }
+      console.info("[generate-mc-batch] wave-end", {
+        requestId,
+        wave: metrics.waveCount,
+        plannedCount: wavePlans.length,
+        acceptedSoFar: items.length,
+        waveMs: nowMs() - waveStartedAt,
+        inFlightOpenAi: 0,
       });
     }
 
@@ -752,6 +1039,36 @@ Returnér gyldig JSON:
     }
 
     if (items.length === 0) {
+      const totalRequestMs = nowMs() - requestStartedAt;
+      const usedFileIds = Array.from(new Set(metrics.usedFileIds));
+      const uniquePickedChunkCount = new Set(metrics.usedChunkIds).size;
+      console.info("[generate-mc-batch] diagnostics", {
+        requestId,
+        scopeFolderIds,
+        fileCountInScope: metrics.fileCountInScope,
+        docChunksInScope: metrics.docChunksInScope,
+        pickedChunkCount: metrics.pickedChunkCount,
+        uniquePickedChunkCount,
+        totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
+        chunksRejectedForMc: metrics.chunksRejectedForMc,
+        chunksDownweightedForMc: metrics.chunksDownweightedForMc,
+        acceptedChunkReasonCounts: metrics.acceptedChunkReasonCounts,
+        rejectedChunkReasonCounts: metrics.rejectedChunkReasonCounts,
+        chunkRejectReasonCounts: metrics.rejectedChunkReasonCounts,
+        downweightedChunkReasonCounts: metrics.downweightedChunkReasonCounts,
+        abortSource: metrics.abortSource,
+        openAiCallCount: metrics.openAiCallCount,
+        openAiCallDurationsMs: metrics.openAiCallDurationsMs,
+        openAiCallCharacters: metrics.openAiCallCharacters,
+        totalOpenAiMs: metrics.totalOpenAiMs,
+        totalRetrievalMs: metrics.totalRetrievalMs,
+        totalPromptBuildMs: metrics.totalPromptBuildMs,
+        totalNormalizationMs: metrics.totalNormalizationMs,
+        totalRequestMs,
+        sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
+        retryOpenAiCalls: metrics.retryOpenAiCalls,
+        usedFileIds,
+      });
       const err: GenerateMcBatchErr = {
         ok: false,
         error: "Kunne ikke generere nogen MC-spørgsmål fra dit materiale.",
@@ -759,6 +1076,45 @@ Returnér gyldig JSON:
         debug: { scopeFolderIds, requestedCount, effectiveCount },
       };
       return NextResponse.json(err, { status: 500 });
+    }
+
+    const quotaConsume = await consumeMcQuota(admin, ownerId, items.length);
+    if (!quotaConsume.ok) {
+      const err: GenerateMcBatchErr = {
+        ok: false,
+        error: quotaConsume.message,
+        requestId,
+        code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaConsume.plan,
+        usedThisMonth: quotaConsume.used,
+        monthlyLimit: quotaConsume.limitPerMonth,
+        resetAt: quotaConsume.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaConsume.status });
+    }
+
+    for (const [batchIndex, item] of items.entries()) {
+      await logMcJob(admin, ownerId, {
+        source: "generate-mc-batch",
+        requestId,
+        scopeFolderIds,
+        scopeKey,
+        difficulty,
+        model,
+        usedFileId: item.usedFileId,
+        usedFileTitle: item.meta.usedFileTitle,
+        maxContextChunks,
+        chunksPerQuestion: Math.min(chunksPerQuestion(difficulty, maxContextChunks), 2),
+        focusAngle: FOCUS_ANGLES[batchIndex % FOCUS_ANGLES.length],
+        citationCount: item.citations.length,
+        question: item.question,
+        batchIndex,
+        batchRequestedCount: requestedCount,
+        batchEffectiveCount: effectiveCount,
+        plan: quotaConsume.plan,
+        mcLimit: quotaConsume.limitPerMonth,
+      });
     }
 
     const resp: GenerateMcBatchOk = {
@@ -770,11 +1126,88 @@ Returnér gyldig JSON:
       items,
     };
 
+    const totalRequestMs = nowMs() - requestStartedAt;
+    const usedFileIds = Array.from(new Set(metrics.usedFileIds));
+    const uniquePickedChunkCount = new Set(metrics.usedChunkIds).size;
+    console.info("[generate-mc-batch] diagnostics", {
+      requestId,
+      scopeFolderIds,
+      fileCountInScope: metrics.fileCountInScope,
+      docChunksInScope: metrics.docChunksInScope,
+      pickedChunkCount: metrics.pickedChunkCount,
+      uniquePickedChunkCount,
+      totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
+      chunksRejectedForMc: metrics.chunksRejectedForMc,
+      chunksDownweightedForMc: metrics.chunksDownweightedForMc,
+      acceptedChunkReasonCounts: metrics.acceptedChunkReasonCounts,
+      rejectedChunkReasonCounts: metrics.rejectedChunkReasonCounts,
+      chunkRejectReasonCounts: metrics.rejectedChunkReasonCounts,
+      downweightedChunkReasonCounts: metrics.downweightedChunkReasonCounts,
+      waveCount: metrics.waveCount,
+      maxInFlightOpenAi: metrics.maxInFlightOpenAi,
+      abortSource: metrics.abortSource,
+      openAiCallCount: metrics.openAiCallCount,
+      openAiCallDurationsMs: metrics.openAiCallDurationsMs,
+      openAiCallCharacters: metrics.openAiCallCharacters,
+      totalOpenAiMs: metrics.totalOpenAiMs,
+      totalRetrievalMs: metrics.totalRetrievalMs,
+      totalPromptBuildMs: metrics.totalPromptBuildMs,
+      totalNormalizationMs: metrics.totalNormalizationMs,
+      totalRequestMs,
+      sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
+      retryOpenAiCalls: metrics.retryOpenAiCalls,
+      usedFileIds,
+    });
+    console.info("[generate-mc-batch] request-end", {
+      requestId,
+      status: 200,
+      totalRequestMs,
+      abortSource: metrics.abortSource,
+    });
+
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
     console.error("[generate-mc-batch] route error:", err);
+    const aborted =
+      err?.name === "AbortError" ||
+      String(err?.message ?? "").toLowerCase().includes("abort") ||
+      String(err?.cause ?? "").toLowerCase().includes("abort");
+    console.info("[generate-mc-batch] request-end", {
+      requestId,
+      status: aborted ? "aborted" : 500,
+      totalRequestMs: nowMs() - requestStartedAt,
+      abortSource: metrics.abortSource,
+    });
+    console.info("[generate-mc-batch] diagnostics", {
+      requestId,
+      totalRequestMs: nowMs() - requestStartedAt,
+      fileCountInScope: metrics.fileCountInScope,
+      docChunksInScope: metrics.docChunksInScope,
+      pickedChunkCount: metrics.pickedChunkCount,
+      uniquePickedChunkCount: new Set(metrics.usedChunkIds).size,
+      totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
+      chunksRejectedForMc: metrics.chunksRejectedForMc,
+      chunksDownweightedForMc: metrics.chunksDownweightedForMc,
+      acceptedChunkReasonCounts: metrics.acceptedChunkReasonCounts,
+      rejectedChunkReasonCounts: metrics.rejectedChunkReasonCounts,
+      chunkRejectReasonCounts: metrics.rejectedChunkReasonCounts,
+      downweightedChunkReasonCounts: metrics.downweightedChunkReasonCounts,
+      waveCount: metrics.waveCount,
+      maxInFlightOpenAi: metrics.maxInFlightOpenAi,
+      abortSource: metrics.abortSource,
+      openAiCallCount: metrics.openAiCallCount,
+      openAiCallDurationsMs: metrics.openAiCallDurationsMs,
+      totalOpenAiMs: metrics.totalOpenAiMs,
+      totalRetrievalMs: metrics.totalRetrievalMs,
+      totalPromptBuildMs: metrics.totalPromptBuildMs,
+      totalNormalizationMs: metrics.totalNormalizationMs,
+      sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
+      retryOpenAiCalls: metrics.retryOpenAiCalls,
+      usedFileIds: Array.from(new Set(metrics.usedFileIds)),
+    });
     const out: GenerateMcBatchErr = { ok: false, error: err?.message ?? "Uventet fejl i generate-mc-batch.", requestId };
     const status = out.error === "Unauthorized" ? 401 : 500;
     return NextResponse.json(out, { status });
   }
 }
+

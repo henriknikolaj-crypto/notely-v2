@@ -125,6 +125,10 @@ export default async function Page(props: { searchParams: Promise<SP> }) {
   const sp = toUrlSearchParams(spObj);
   const baseSp = new URLSearchParams(sp.toString());
   baseSp.delete("mode");
+  const historyHref =
+    mode === "mundtlig"
+      ? buildHref("/traener/mundtlig/historik", baseSp, {})
+      : buildHref("/traener/simulator/historik", baseSp, {});
 
   const backHref =
     mode === "mundtlig"
@@ -162,27 +166,22 @@ export default async function Page(props: { searchParams: Promise<SP> }) {
   };
 
   // Prøv med source_type-filter først; hvis kolonnen ikke findes, fallback uden filter.
-  let total: number | null = null;
   let rows: Row[] = [];
 
   const first = await run(true);
   if (first.ok) {
-    total = first.total;
     rows = first.rows;
   } else {
     const msg = String(first.error?.message ?? "");
     if (msg.includes('column "source_type"') && msg.includes("does not exist")) {
       const fb = await run(false);
       if (fb.ok) {
-        total = fb.total;
         rows = fb.rows;
       } else {
         rows = [];
-        total = 0;
       }
     } else {
       rows = [];
-      total = 0;
     }
   }
 
@@ -210,9 +209,9 @@ export default async function Page(props: { searchParams: Promise<SP> }) {
     }
   }
 
-  const title = mode === "mundtlig" ? "Mundtlig-historik" : "Skrift-historik";
+  const title = mode === "mundtlig" ? "Mundtlig-historik" : "Skriftlig-historik";
   const shown = rows.length;
-  const totalShown = typeof total === "number" ? total : shown;
+  const infoLine = shown >= 50 ? "Viser de 50 nyeste evalueringer." : `Viser ${shown} evalueringer.`;
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-8">
@@ -220,32 +219,38 @@ export default async function Page(props: { searchParams: Promise<SP> }) {
         ← Tilbage til Eksamen
       </Link>
 
-      <h1 className="mt-4 text-xl font-semibold">
-        {title} (seneste {shown} af {totalShown})
-      </h1>
+      <h1 className="mt-4 text-xl font-semibold">{title}</h1>
 
-      <p className="mt-2 text-sm text-zinc-600">Der gemmes maksimalt 50 runder pr. bruger.</p>
+      <p className="mt-2 text-sm text-zinc-600">{infoLine}</p>
 
       {rows.length === 0 ? (
         <div className="mt-6 rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-700">
           Ingen runder endnu. Start en runde i Eksamen.
         </div>
       ) : (
-        <div className="mt-6 space-y-2">
+        <ul className="mt-6 divide-y divide-zinc-200 rounded-2xl border border-zinc-200 bg-white">
           {rows.map((r) => {
             const folderName = r.folder_id ? folderMap.get(r.folder_id) ?? "Ukendt mappe" : null;
-            const label = folderName ?? compactFolderLabel(readMetaFolderIds(r.meta), folderMap) ?? "Flere mapper";
+            const label = folderName ?? compactFolderLabel(readMetaFolderIds(r.meta), folderMap);
+            const detailPath =
+              mode === "mundtlig"
+                ? `/traener/mundtlig/historik/${r.id}`
+                : `/traener/simulator/historik/${r.id}`;
+            const detailHref = `${detailPath}?backTo=${encodeURIComponent(historyHref)}`;
             return (
-              <div key={r.id} className="rounded-2xl border border-zinc-200 bg-white p-4">
-                <div className="flex items-center justify-between text-sm">
+              <li key={r.id} className="flex items-center justify-between gap-4 px-4 py-3 text-sm">
+                <div className="min-w-0">
                   <div className="font-medium text-zinc-900">{formatScore(r.score)}</div>
-                  <div className="text-zinc-500">{formatDT(r.created_at)}</div>
+                  {label ? <div className="mt-1 truncate text-xs text-zinc-600">{label}</div> : null}
+                  <div className="mt-1 text-[11px] text-zinc-500">{formatDT(r.created_at)}</div>
                 </div>
-                <div className="mt-1 text-xs text-zinc-600">{label}</div>
-              </div>
+                <Link href={detailHref} className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
+                  Åbn
+                </Link>
+              </li>
             );
           })}
-        </div>
+        </ul>
       )}
     </div>
   );

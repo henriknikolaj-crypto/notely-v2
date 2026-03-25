@@ -1,6 +1,8 @@
 // app/traener/mc/historik/page.tsx
 import "server-only";
 import Link from "next/link";
+import { getHistoryWindowForPlan } from "@/lib/plan/history";
+import { getUserPlan } from "@/lib/plan/limits";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
 export const dynamic = "force-dynamic";
@@ -12,7 +14,7 @@ async function getOwnerId(sb: any): Promise<string | null> {
     const { data } = await sb.auth.getUser();
     if (data?.user?.id) return data.user.id as string;
   } catch {}
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 function fmt(iso: string | null | undefined) {
@@ -52,14 +54,14 @@ export default async function MCHistoryPage({
   if (!ownerId) {
     return (
       <main className="mx-auto max-w-3xl p-6">
-        <p className="text-sm text-red-600">Mangler bruger-id.</p>
+        <p className="text-sm text-red-600">Du skal være logget ind for at se MC-historik.</p>
       </main>
     );
   }
 
-  const { data, error, count } = await sb
+  const { data, error } = await sb
     .from("exam_sessions")
-    .select("id, score, created_at, source_type", { count: "exact" })
+    .select("id, score, created_at, source_type, folder_id", { count: "exact" })
     .eq("owner_id", ownerId)
     .eq("source_type", "mc")
     .order("created_at", { ascending: false })
@@ -82,13 +84,34 @@ export default async function MCHistoryPage({
     );
   }
 
+  const plan = await getUserPlan(sb, ownerId);
+  const historyWindow = getHistoryWindowForPlan(plan);
+
   const sessions =
-    (data as { id: string; score: number | null; created_at: string | null }[]) ??
+    (data as { id: string; score: number | null; created_at: string | null; folder_id: string | null }[]) ??
     [];
 
-  const totalRaw = count ?? sessions.length;
-  const total = Math.min(totalRaw, LIMIT); // vis aldrig tal over 50
-  const shown = sessions.length;
+  const visibleSessions = sessions.slice(0, historyWindow.mcVisibleItems);
+  const folderIds = Array.from(
+    new Set(
+      visibleSessions
+        .map((session) => session.folder_id)
+        .filter((id): id is string => typeof id === "string" && id.trim().length > 0),
+    ),
+  );
+
+  let folderNameById = new Map<string, string>();
+  if (folderIds.length > 0) {
+    const { data: folders } = await sb
+      .from("folders")
+      .select("id, name")
+      .in("id", folderIds);
+    folderNameById = new Map(
+      ((folders ?? []) as Array<{ id: string; name: string | null }>)
+        .map((folder) => [folder.id, String(folder.name ?? "").trim()] as const)
+        .filter((entry) => entry[0] && entry[1]),
+    );
+  }
 
   return (
     <main className="mx-auto max-w-3xl p-6 space-y-4">
@@ -103,13 +126,7 @@ export default async function MCHistoryPage({
       </div>
 
       <header>
-        <h1 className="text-lg font-semibold text-zinc-900">
-          MC-historik (seneste {shown} af {total})
-        </h1>
-        <p className="mt-1 text-sm text-zinc-600">
-          Oversigt over dine Multiple Choice-forsøg. Brug den til at se
-          udviklingen over tid. Der gemmes maksimalt {LIMIT} forsøg pr. bruger.
-        </p>
+        <h1 className="text-lg font-semibold text-zinc-900">MC-historik (seneste 20)</h1>
       </header>
 
       {sessions.length === 0 ? (
@@ -118,27 +135,20 @@ export default async function MCHistoryPage({
         </p>
       ) : (
         <ul className="divide-y divide-zinc-200 rounded-2xl border border-zinc-200 bg-white">
-          {sessions.map((s) => (
+          {visibleSessions.map((s) => (
             <li
               key={s.id}
-              className="flex items-center justify-between px-4 py-2 text-sm"
+              className="px-4 py-2 text-sm"
             >
               <div>
                 <div className="font-medium text-zinc-900">
                   Score: {s.score ?? 0}/100
                 </div>
-                <div className="text-[11px] text-zinc-500">
-                  {fmt(s.created_at)}
-                </div>
+                <div className="text-[11px] text-zinc-500">{fmt(s.created_at)}</div>
+                {s.folder_id && folderNameById.get(s.folder_id) ? (
+                  <div className="text-[11px] text-zinc-500">{folderNameById.get(s.folder_id)}</div>
+                ) : null}
               </div>
-              {/* placeholder til fremtidig detaljevisning */}
-              <button
-                type="button"
-                disabled
-                className="cursor-default rounded-lg border border-zinc-200 px-3 py-1 text-xs text-zinc-400"
-              >
-                Detaljer (kommer senere)
-              </button>
             </li>
           ))}
         </ul>

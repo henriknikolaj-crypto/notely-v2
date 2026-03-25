@@ -2,6 +2,9 @@ import "server-only";
 
 import { NextRequest } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { extractPdfWithFallback } from "@/lib/pdf/extractPdfWithFallback";
+import { buildChunksFromExtractedPages } from "@/lib/pdf/chunkStructuredPages";
+import { requireDevSecret } from "@/lib/dev/guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,80 +17,10 @@ function supaService() {
   return createClient(SUPA_URL, SUPA_SERVICE);
 }
 
-function chunkText(text: string, target = 1400, overlap = 200) {
-  const clean = text
-    .replace(/\r/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\u0000/g, "")
-    .trim();
-  if (!clean) return [];
-
-  const paras = clean
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  const chunks: string[] = [];
-  let cur = "";
-
-  for (const p of paras) {
-    const next = cur ? `${cur}\n\n${p}` : p;
-    if (next.length <= target) {
-      cur = next;
-      continue;
-    }
-
-    if (cur) chunks.push(cur);
-
-    if (p.length > target) {
-      let i = 0;
-      while (i < p.length) {
-        const end = Math.min(p.length, i + target);
-        chunks.push(p.slice(i, end).trim());
-        i = Math.max(end - overlap, end);
-      }
-      cur = "";
-    } else {
-      cur = p;
-    }
-  }
-
-  if (cur) chunks.push(cur);
-  return chunks.filter((c) => c.trim().length > 0);
-}
-
-async function extractTextPdfJs(buf: Buffer) {
-  // pdfjs-dist v3 legacy build (du installerede 3.11.174)
-  const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.js");
-
-  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buf) });
-  const pdf = await loadingTask.promise;
-
-  let out = "";
-  try {
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const tc = await page.getTextContent();
-      const strings = (tc.items || [])
-        .map((it: any) => (typeof it?.str === "string" ? it.str : ""))
-        .filter(Boolean);
-      out += strings.join(" ") + "\n\n";
-    }
-  } finally {
-    try {
-      await pdf.cleanup?.();
-      await pdf.destroy?.();
-    } catch {}
-  }
-
-  return out.trim();
-}
-
 export async function POST(req: NextRequest) {
-  // auth (dev)
-  const hdr = req.headers.get("x-shared-secret") || "";
-  if (process.env.IMPORT_SHARED_SECRET && hdr !== process.env.IMPORT_SHARED_SECRET) {
-    return new Response("Unauthorized", { status: 401 });
+  const guard = requireDevSecret(req);
+  if (!guard.ok) {
+    return new Response(guard.message, { status: guard.status });
   }
 
   const url = new URL(req.url);
@@ -98,7 +31,7 @@ export async function POST(req: NextRequest) {
 
   const { data: f, error: fErr } = await sb
     .from("files")
-    .select("id, owner_id, folder_id, storage_path, original_name, name")
+    .select("id, owner_id, folder_id, storage_path, original_name, name, md5")
     .eq("id", fileId)
     .maybeSingle();
 
@@ -115,38 +48,87 @@ export async function POST(req: NextRequest) {
 
   const buf = Buffer.from(await dl.data.arrayBuffer());
 
-  let text = "";
+  let extraction: Awaited<ReturnType<typeof extractPdfWithFallback>>;
   try {
-    text = await extractTextPdfJs(buf);
+    extraction = await extractPdfWithFallback(buf, {
+      fileName: String((f as any).original_name || (f as any).name || "document.pdf"),
+    });
   } catch (e: any) {
     return new Response(`pdf parse failed: ${e?.message ?? "unknown"}`, { status: 400 });
   }
 
-  if (!text) return new Response("Ingen tekst fundet i PDF", { status: 400 });
-
-  const chunks = chunkText(text, 1400, 200);
-  if (!chunks.length) return new Response("Kunne ikke danne chunks", { status: 400 });
+  if (!extraction.pages.length || !extraction.pages.some((p) => p.text.trim().length > 0)) {
+    return new Response("Ingen tekst fundet i PDF", { status: 400 });
+  }
 
   const ownerId = String((f as any).owner_id || "");
   const folderId = (f as any).folder_id ? String((f as any).folder_id) : null;
   const source = String((f as any).original_name || (f as any).name || "");
 
-  // delete eksisterende chunks for filen
   await sb.from("doc_chunks").delete().eq("owner_id", ownerId).eq("file_id", fileId);
 
-  // VIGTIGT: INGEN token_count i insert (ellers får du "non-DEFAULT value")
-  const rows = chunks.map((content) => ({
-    owner_id: ownerId,
-    file_id: fileId,
-    folder_id: folderId,
-    content,
-    source,
-    source_type: "user_upload",
-    allow_in_answer: true,
-  }));
+  const rows = buildChunksFromExtractedPages(extraction.pages)
+    .map((chunk) => ({
+      owner_id: ownerId,
+      file_id: fileId,
+      folder_id: folderId,
+      content: chunk.content || "",
+      source,
+      source_type: "user_upload",
+      allow_in_answer: true,
+      page_from: chunk.pageNumber,
+      page_to: chunk.pageNumber,
+      source_page: chunk.pageNumber,
+      extraction_method: chunk.extractionMethod,
+      extraction_quality: chunk.extractionQuality,
+    }))
+    .filter((row) => row.content.trim().length > 0);
+
+  if (!rows.length) return new Response("Kunne ikke danne chunks", { status: 400 });
 
   const ins = await sb.from("doc_chunks").insert(rows);
   if (ins.error) return new Response(`doc_chunks insert failed: ${ins.error.message}`, { status: 400 });
 
-  return Response.json({ ok: true, fileId, chunkCount: chunks.length });
+  await sb
+    .from("files")
+    .update({
+      page_count: extraction.pageCount,
+      ocr_pages: extraction.ocrPages,
+      extraction_method: extraction.extractionMethod,
+      extraction_quality: extraction.extractionQuality,
+      extraction_meta: extraction.extractionMeta,
+    })
+    .eq("id", fileId)
+    .eq("owner_id", ownerId);
+
+  await sb.from("ocr_texts").delete().eq("owner_id", ownerId).eq("file_id", fileId);
+  if (extraction.ocrTexts.length) {
+    await sb.from("ocr_texts").insert(
+      extraction.ocrTexts.map((entry) => ({
+        owner_id: ownerId,
+        file_id: fileId,
+        file_md5: String((f as any).md5 || ""),
+        page: entry.page,
+        text: entry.text,
+        engine: entry.engine,
+      })),
+    );
+  }
+
+  return Response.json({
+    ok: true,
+    fileId,
+    chunkCount: rows.length,
+    extractionMethod: extraction.extractionMethod,
+    extractionQuality: extraction.extractionQuality,
+    ocrPages: extraction.ocrPages,
+    extractionMeta: extraction.extractionMeta,
+    chunkPreview: rows.slice(0, 4).map((row, idx) => ({
+      idx,
+      page_from: row.page_from,
+      extraction_quality: row.extraction_quality,
+      extraction_method: row.extraction_method,
+      content_preview: String(row.content ?? "").slice(0, 240),
+    })),
+  });
 }

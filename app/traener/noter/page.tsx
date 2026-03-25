@@ -1,4 +1,4 @@
-﻿// app/traener/noter/page.tsx
+// app/traener/noter/page.tsx
 import "server-only";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import GenerateFromSource from "./ui/GenerateFromSource";
@@ -12,9 +12,9 @@ async function getOwnerId(sb: any): Promise<string | null> {
       if (data?.user?.id) return data.user.id as string;
     }
   } catch {
-    // ignore – falder tilbage til DEV_USER_ID
+    // ignore
   }
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 type FileOption = {
@@ -67,7 +67,7 @@ export default async function Page({
   if (!ownerId) {
     return (
       <section className="p-6 text-sm text-red-600">
-        Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+        Du skal være logget ind for at åbne Noter.
       </section>
     );
   }

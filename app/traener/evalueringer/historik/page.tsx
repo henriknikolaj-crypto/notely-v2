@@ -2,6 +2,7 @@
 import "server-only";
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { getCanonicalUserPlan } from "@/lib/plan/limits";
 
 export const dynamic = "force-dynamic";
 
@@ -10,7 +11,7 @@ async function getOwnerId(sb: any): Promise<string | null> {
     const { data } = await sb.auth.getUser();
     if (data?.user?.id) return data.user.id as string;
   } catch {}
-  return process.env.DEV_USER_ID ?? null;
+  return null;
 }
 
 function fmt(iso: string | null | undefined) {
@@ -46,20 +47,23 @@ export default async function TrainerEvaluationsHistoryPage({
   }
   const qs = qp.toString();
   const backHref = qs ? `/traener?${qs}` : "/traener";
+  const scopeParam = typeof sp.scope === "string" ? sp.scope : undefined;
 
   if (!ownerId) {
     return (
       <main className="mx-auto max-w-3xl p-6">
-        <p className="text-sm text-red-600">Mangler bruger-id.</p>
+        <p className="text-sm text-red-600">Du skal være logget ind for at se evalueringer.</p>
       </main>
     );
   }
 
-  const LIMIT = 50;
+  const planInfo = await getCanonicalUserPlan(sb, ownerId);
+  const isFreemium = planInfo.normalizedPlan === "freemium";
+  const LIMIT = isFreemium ? 5 : 50;
 
-  const { data, error, count } = await sb
+  const { data, error } = await sb
     .from("exam_sessions")
-    .select("id, score, created_at", { count: "exact" })
+    .select("id, score, created_at")
     .eq("owner_id", ownerId)
     .eq("source_type", "trainer")
     .order("created_at", { ascending: false })
@@ -87,8 +91,13 @@ export default async function TrainerEvaluationsHistoryPage({
   const evals =
     (data as { id: string; score: number | null; created_at: string | null }[]) ??
     [];
-  const total = count ?? evals.length;
   const shown = evals.length;
+  const infoLine =
+    isFreemium
+      ? "Viser seneste 5 på Freemium."
+      : shown >= LIMIT
+      ? "Viser de 50 nyeste evalueringer."
+      : `Viser ${shown} evalueringer.`;
 
   return (
     <main className="mx-auto max-w-3xl p-6 space-y-4">
@@ -103,12 +112,8 @@ export default async function TrainerEvaluationsHistoryPage({
       </div>
 
       <header>
-        <h1 className="text-lg font-semibold text-zinc-900">
-          Træner-evalueringer (seneste {shown} af {total})
-        </h1>
-        <p className="mt-1 text-sm text-slate-600">
-          Evalueringer fra Træner-øvelser. Klik for at se detaljer.
-        </p>
+        <h1 className="text-lg font-semibold text-zinc-900">Træner-evalueringer</h1>
+        <p className="mt-1 text-sm text-slate-600">{infoLine}</p>
       </header>
 
       {!evals.length ? (
@@ -131,11 +136,11 @@ export default async function TrainerEvaluationsHistoryPage({
                 </div>
               </div>
               <Link
-                href={
-                  qs
-                    ? `/traener/evalueringer/${e.id}?${qs}`
-                    : `/traener/evalueringer/${e.id}`
-                }
+                href={`/traener/evalueringer/${e.id}?backTo=${encodeURIComponent(
+                  scopeParam
+                    ? `/traener/evalueringer/historik?scope=${encodeURIComponent(scopeParam)}`
+                    : "/traener/evalueringer/historik",
+                )}`}
                 className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50"
               >
                 Åbn

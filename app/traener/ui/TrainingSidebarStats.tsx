@@ -3,10 +3,13 @@
 
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
+import { useState } from "react";
 import SidebarRecentMC from "../mc/SidebarRecentMC";
 import SidebarFlashcards from "../flashcards/SidebarFlashcards";
 import SidebarQuotaBox from "./SidebarQuotaBox";
 import SidebarExamInfo from "../simulator/SidebarExamInfo";
+
+const SIDEBAR_SEE_ALL_CLASS = "text-[11px] text-zinc-500 hover:text-zinc-700";
 
 type Note = {
   id: string;
@@ -59,9 +62,17 @@ function classifyNote(note: Note): "resume" | "focus" | "trainer" | "other" {
   const t = (note.title ?? "").toLowerCase().trim();
 
   // Foretræk eksplicit note_type
-  if (nt === "resume") return "resume";
+  if (nt === "resume" || nt === "summary") return "resume";
   if (nt === "focus") return "focus";
-  if (nt === "feedback" || nt === "trainer" || nt === "trainer_feedback") return "trainer";
+  if (
+    nt === "feedback" ||
+    nt === "trainer" ||
+    nt === "trainer_feedback" ||
+    nt === "trainer_note" ||
+    nt === "trainer_eval"
+  ) {
+    return "trainer";
+  }
 
   // Fallback til titel
   if (t.startsWith("resumé") || t.startsWith("resum")) return "resume";
@@ -74,15 +85,12 @@ function classifyNote(note: Note): "resume" | "focus" | "trainer" | "other" {
 export default function TrainingSidebarStats({
   latestNotes,
   latestEvals,
-  notesCount,
   evalCount,
   resumeCount,
   focusCount,
 }: {
   latestNotes: Note[];
   latestEvals: Eval[];
-  /** Antal Træner-noter (feedback) i alt */
-  notesCount?: number;
   /** Antal Træner-evalueringer i alt */
   evalCount?: number;
   /** Antal resumé-noter i alt */
@@ -92,30 +100,24 @@ export default function TrainingSidebarStats({
 }) {
   const pathname = usePathname() || "";
   const sp = useSearchParams();
+  const [mcTotal, setMcTotal] = useState(0);
 
-  const notes = latestNotes ?? [];
   const evals = latestEvals ?? [];
 
-  // Del noter op i typer – brug fuld liste til totaler
+  const notes = latestNotes ?? [];
   const allResumeNotes = notes.filter((n) => classifyNote(n) === "resume");
   const allFocusNotes = notes.filter((n) => classifyNote(n) === "focus");
-  const allTrainerNotes = notes.filter((n) => classifyNote(n) === "trainer");
-
   const resumeNotes = allResumeNotes.slice(0, 3);
   const focusNotes = allFocusNotes.slice(0, 3);
-  const trainerNotes = allTrainerNotes.slice(0, 3);
 
   const recentEvals = evals.slice(0, 3);
-
-  // Totaler
-  const totalTrainerNotes =
-    typeof notesCount === "number" ? notesCount : allTrainerNotes.length || notes.length;
 
   const totalResume = typeof resumeCount === "number" ? resumeCount : allResumeNotes.length;
   const totalFocus = typeof focusCount === "number" ? focusCount : allFocusNotes.length;
   const totalEvals = typeof evalCount === "number" ? evalCount : evals.length;
 
   const scopeFromUrl = sp?.get("scope") || undefined;
+  const folderFromUrl = sp?.get("folder") || undefined;
 
   // Link til Træner-evalueringer (beholder alle nuværende query params)
   const evalHistoryHref = (() => {
@@ -123,15 +125,6 @@ export default function TrainingSidebarStats({
     const params = new URLSearchParams(sp.toString());
     const qs = params.toString();
     return qs ? `/traener/evalueringer/historik?${qs}` : "/traener/evalueringer/historik";
-  })();
-
-  // "Se alle" for Træner-noter – sender træner-scope videre som tscope
-  const notesFeedbackHref = (() => {
-    const params = new URLSearchParams();
-    if (scopeFromUrl) params.set("tscope", scopeFromUrl);
-    params.set("scope", "feedback");
-    const qs = params.toString();
-    return qs ? `/notes?${qs}` : "/notes";
   })();
 
   // MC-historik med scope videre
@@ -146,42 +139,17 @@ export default function TrainingSidebarStats({
   const isTrainerMain = pathname === "/traener" || pathname === "/traener/";
 
   if (isTrainerMain) {
-    const mainNotes = trainerNotes.length > 0 ? trainerNotes : notes.slice(0, 3);
-
     return (
       <div className="mt-4 space-y-5 px-2 text-[12px]">
-        {/* SENESTE NOTER (TRÆNER) */}
-        <div>
-          <div className="mb-1 flex items-center justify-between">
-            <div className="font-semibold text-zinc-800">Seneste noter</div>
-            <Link href={notesFeedbackHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-              Se alle
-            </Link>
-          </div>
-
-          {mainNotes.length === 0 ? (
-            <div className="text-[11px] text-zinc-400">Ingen noter endnu.</div>
-          ) : (
-            <ul className="space-y-1">
-              {mainNotes.map((n) => (
-                <li key={n.id} className="text-zinc-700">
-                  <div className="truncate">{trimTitle(n.title)}</div>
-                  <div className="text-[10px] text-zinc-500">{formatSidebarDate(n.created_at)}</div>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <div className="mt-1 text-[10px] text-zinc-400">I alt {totalTrainerNotes} noter</div>
-        </div>
-
         {/* SENESTE EVALUERINGER */}
         <div>
           <div className="mb-1 flex items-center justify-between">
             <div className="font-semibold text-zinc-800">Seneste evalueringer</div>
-            <Link href={evalHistoryHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-              Se alle
-            </Link>
+            {totalEvals > 0 ? (
+              <Link href={evalHistoryHref} className={SIDEBAR_SEE_ALL_CLASS}>
+                Se alle
+              </Link>
+            ) : null}
           </div>
 
           {recentEvals.length === 0 ? (
@@ -211,14 +179,16 @@ export default function TrainingSidebarStats({
       const params = new URLSearchParams();
       params.set("scope", "resume");
       if (scopeFromUrl) params.set("tscope", scopeFromUrl);
-      const qs = params.toString();
-      return qs ? `/notes?${qs}` : "/notes";
+      if (folderFromUrl) params.set("tfolder", folderFromUrl);
+      const fullQs = params.toString();
+      return fullQs ? `/notes?${fullQs}` : "/notes";
     })();
 
     const notesFocusHref = (() => {
       const params = new URLSearchParams();
       params.set("scope", "focus");
       if (scopeFromUrl) params.set("tscope", scopeFromUrl);
+      if (folderFromUrl) params.set("tfolder", folderFromUrl);
       const qs = params.toString();
       return qs ? `/notes?${qs}` : "/notes";
     })();
@@ -228,9 +198,11 @@ export default function TrainingSidebarStats({
         <div>
           <div className="mb-1 flex items-center justify-between">
             <div className="font-semibold text-zinc-800">Seneste resuméer</div>
-            <Link href={notesResumeHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-              Se alle
-            </Link>
+            {totalResume > 0 ? (
+              <Link href={notesResumeHref} className={SIDEBAR_SEE_ALL_CLASS}>
+                Se alle
+              </Link>
+            ) : null}
           </div>
 
           {resumeNotes.length === 0 ? (
@@ -252,9 +224,11 @@ export default function TrainingSidebarStats({
         <div>
           <div className="mb-1 flex items-center justify-between">
             <div className="font-semibold text-zinc-800">Seneste fokus-noter</div>
-            <Link href={notesFocusHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-              Se alle
-            </Link>
+            {totalFocus > 0 ? (
+              <Link href={notesFocusHref} className={SIDEBAR_SEE_ALL_CLASS}>
+                Se alle
+              </Link>
+            ) : null}
           </div>
 
           {focusNotes.length === 0 ? (
@@ -285,11 +259,13 @@ export default function TrainingSidebarStats({
         <div>
           <div className="mb-1 flex items-center justify-between">
             <div className="font-semibold text-zinc-800">Seneste MC</div>
-            <Link href={mcHistoryHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-              Se alle
-            </Link>
+            {mcTotal > 0 ? (
+              <Link href={mcHistoryHref} className={SIDEBAR_SEE_ALL_CLASS}>
+                Se alle
+              </Link>
+            ) : null}
           </div>
-          <SidebarRecentMC />
+          <SidebarRecentMC onCountChange={setMcTotal} />
         </div>
 
         <SidebarQuotaBox />

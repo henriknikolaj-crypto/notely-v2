@@ -1,10 +1,13 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
-import { requireFlowModel } from "@/lib/openai/requireModel";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
 import { danish7ToScore100, type Danish7Grade } from "@/lib/grading/danish7";
 import { buildOralContext } from "@/lib/oral/context";
 
@@ -13,6 +16,24 @@ export const dynamic = "force-dynamic";
 
 type Grade = "-3" | "00" | "02" | "4" | "7" | "10" | "12";
 type Segment = { start: number; end: number; text: string };
+type WeakPointSeverity = "low" | "medium" | "high";
+type OralWeakPoint = {
+  key: string;
+  label: string;
+  action?: string;
+  summary?: string;
+  next_step?: string;
+  evidence?: string;
+  severity?: WeakPointSeverity;
+};
+type OralEvalJson = {
+  grade?: unknown;
+  score?: unknown;
+  summary?: unknown;
+  strengths?: unknown;
+  improvements?: unknown;
+  weak_points?: unknown;
+};
 
 const ALLOWED_GRADES = new Set<Grade>(["-3", "00", "02", "4", "7", "10", "12"]);
 
@@ -34,6 +55,50 @@ function normalizeScore(raw: unknown, fallbackGrade: Grade): number {
 function normalizeStringArray(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((x) => String(x ?? "").trim()).filter(Boolean);
+}
+
+function normalizeSeverity(raw: unknown): WeakPointSeverity | undefined {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "low" || v === "medium" || v === "high") return v;
+  return undefined;
+}
+
+function normalizeOralWeakPoints(raw: unknown): OralWeakPoint[] {
+  if (!Array.isArray(raw)) return [];
+
+  const out: OralWeakPoint[] = [];
+  const seen = new Set<string>();
+
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const rawLabel = String(obj.label ?? obj.text ?? obj.key ?? "").trim();
+    const rawKey = String(obj.key ?? rawLabel).trim().toLowerCase();
+    const summary = String(obj.summary ?? "").trim();
+    const nextStep = String(obj.next_step ?? obj.nextStep ?? obj.action ?? "").trim();
+    const evidence = String(obj.evidence ?? "").trim();
+    const severity = normalizeSeverity(obj.severity);
+    const key = rawKey || rawLabel.toLowerCase();
+    const label = rawLabel || rawKey;
+
+    if (!key || !label) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      key,
+      label,
+      ...(nextStep ? { action: nextStep } : {}),
+      ...(summary ? { summary } : {}),
+      ...(nextStep ? { next_step: nextStep } : {}),
+      ...(evidence ? { evidence } : {}),
+      ...(severity ? { severity } : {}),
+    });
+
+    if (out.length >= 3) break;
+  }
+
+  return out;
 }
 
 function parseScopeFolderIds(form: FormData): string[] {
@@ -110,7 +175,7 @@ function safeParseTurns(raw: string): TurnForMeta[] {
         questionText: String(t?.questionText ?? "").trim(),
         transcriptText: String(t?.transcriptText ?? "").trim(),
         notes: String(t?.notes ?? "").trim() || undefined,
-        kind: t?.kind === "followup" ? "followup" : t?.kind === "new" ? "new" : undefined,
+        kind: t?.kind === "followup" || t?.kind === "new" ? t.kind : undefined,
         threadId: typeof t?.threadId === "string" ? t.threadId : null,
         followupCount: Number.isFinite(Number(t?.followupCount)) ? Number(t.followupCount) : undefined,
       }))
@@ -129,13 +194,30 @@ function buildConversationText(turns: TurnForMeta[]) {
   return blocks.join("\n\n");
 }
 
+function supabaseAdminOrNull() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 export async function POST(req: NextRequest) {
+  const requestId = randomUUID();
   try {
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY." }, { status: 500 });
     }
 
-    const transcribeModel = String(process.env.OPENAI_TRANSCRIBE_MODEL ?? "").trim();
+    const transcribeModel = resolveModelForFeature("transcribe");
     if (!transcribeModel) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_TRANSCRIBE_MODEL." }, { status: 500 });
     }
@@ -168,6 +250,20 @@ export async function POST(req: NextRequest) {
     const priorTurns = safeParseTurns(String(form.get("turns") ?? ""));
 
     const { sb, id: ownerId } = await requireUser(req);
+    const admin = supabaseAdminOrNull();
+    if (!admin) {
+      return NextResponse.json({ ok: false, error: "Server config mangler." }, { status: 500 });
+    }
+
+    // Why: Mundtlig eksamen skal håndhæves server-side som Pro-only, så client-bypass ikke virker.
+    const { data: profile } = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+    const plan = normalizePlan((profile as any)?.plan);
+    if (plan !== "pro") {
+      return NextResponse.json(
+        { ok: false, error: "Kræver Pro", code: "PRO_REQUIRED", requestId },
+        { status: 403 },
+      );
+    }
 
     // Rate limit: turns må ske ofte; final eval skal være strammere
     const rl = await enforceRateLimit(
@@ -254,39 +350,46 @@ export async function POST(req: NextRequest) {
       maxChars: 8000,
     });
 
-    const model = requireFlowModel("oral"); // OPENAI_MODEL_ORAL = gpt-5.2
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: [
-            "Du er en dansk censor for mundtlig eksamen.",
-            "Du evaluerer hele samtalen (flere spørgsmål/svar) samlet.",
-            "Vurder ud fra samtaletekst, noter og kontekst. Giv én samlet karakter.",
-            "Svar KUN som JSON i format:",
-            '{"grade":"7","score":70,"summary":"...","strengths":["..."],"improvements":["..."]}',
-            'grade skal være en af "-3","00","02","4","7","10","12".',
-            "score skal være 0-100.",
-            "summary skal være kort og konkret på dansk.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            conversation: conversationText,
-            notes,
-            context: ctx.contextText || null,
-          }),
-        },
-      ],
+    const model = resolveModelForFeature("oral_eval");
+    const { completion } = await createChatCompletion(openai, {
+      feature: "oral_eval",
+      purpose: "json",
+      modelOverride: model,
+      payload: {
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: [
+              "Du er en dansk censor for mundtlig eksamen.",
+              "Du evaluerer hele samtalen (flere spørgsmål/svar) samlet.",
+              "Vurder ud fra samtaletekst, noter og kontekst. Giv én samlet karakter.",
+              "Svar KUN som JSON i format:",
+              '{"grade":"7","score":70,"summary":"...","strengths":["..."],"improvements":["..."],"weak_points":[{"key":"begrebsbrug","label":"Begrebsbrug","summary":"...","next_step":"...","evidence":"...","severity":"medium"}]}',
+              'grade skal være en af "-3","00","02","4","7","10","12".',
+              "score skal være 0-100.",
+              "summary skal være kort og konkret på dansk.",
+              "weak_points skal være et array med 1-3 mundtlige/faglige svagheder, eller tomt array hvis der ikke er nogen tydelige.",
+              "Hver weak_point skal have key, label, summary, next_step og evidence. severity må være low, medium eller high.",
+              "Brug konkrete mundtlige kategorier som begrebsbrug, præcision, materialehenvisning, argumentation eller direkte besvarelse af spørgsmålet.",
+            ].join(" "),
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              conversation: conversationText,
+              notes,
+              context: ctx.contextText || null,
+            }),
+          },
+        ],
+      },
     });
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
-    let evalJson: any = {};
+    let evalJson: OralEvalJson = {};
     try {
-      evalJson = JSON.parse(raw);
+      evalJson = JSON.parse(raw) as OralEvalJson;
     } catch {
       evalJson = {};
     }
@@ -298,6 +401,7 @@ export async function POST(req: NextRequest) {
       "Du viser gode takter. Løft svaret med mere præcis fagterminologi og tydeligere struktur.";
     const strengths = normalizeStringArray(evalJson?.strengths).slice(0, 6);
     const improvements = normalizeStringArray(evalJson?.improvements).slice(0, 6);
+    const weakPoints = normalizeOralWeakPoints(evalJson?.weak_points);
 
     const feedbackText = [
       `Samlet vurdering: ${summary}`,
@@ -306,6 +410,15 @@ export async function POST(req: NextRequest) {
     ]
       .filter(Boolean)
       .join("\n");
+
+    const structuredResult = {
+      overall: {
+        grade,
+        summary,
+        strengths,
+        improvements,
+      },
+    };
 
     const { error: insertError } = await sb.from("exam_sessions").insert({
       owner_id: ownerId,
@@ -316,11 +429,14 @@ export async function POST(req: NextRequest) {
       folder_id: sessionFolderId,
       source_type: "oral",
       meta: {
+        mode: "oral",
         ...(folderIdsMeta ? { folder_ids: folderIdsMeta } : {}),
         durationMin,
         startedAt,
         endedAt,
         notes,
+        result: structuredResult,
+        weak_points: weakPoints,
         turns: allTurns,
         // segments for sidste tur (hvis vi fik dem)
         transcriptSegmentsLast: transcriptSegments,

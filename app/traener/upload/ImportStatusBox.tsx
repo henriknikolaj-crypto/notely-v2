@@ -36,6 +36,17 @@ type ImportStatusResponse = {
   details?: string;
 };
 
+type QuotaCurrentResponse = {
+  ok: boolean;
+  plan?: string;
+  resetAt?: string | null;
+  import?: {
+    usedThisMonth?: number | null;
+    limitPerMonth?: number | null;
+  };
+  error?: string;
+};
+
 function n0(x: any) {
   const n = typeof x === "number" ? x : Number(x);
   return Number.isFinite(n) ? n : 0;
@@ -87,27 +98,60 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
     try {
       setErr(null);
 
-      const res = await fetch(url, {
-        method: "GET",
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-      });
+      const [statusRes, quotaRes] = await Promise.all([
+        fetch(url, {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        }),
+        fetch("/api/quota/current", {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        }),
+      ]);
 
-      const json = (await safeJson(res)) as ImportStatusResponse | null;
+      const statusJson = (await safeJson(statusRes)) as ImportStatusResponse | null;
+      const quotaJson = (await safeJson(quotaRes)) as QuotaCurrentResponse | null;
 
-      if (!res.ok || !json) {
+      if (statusRes.status === 401 || quotaRes.status === 401) {
         setData(null);
-        setErr(`Kunne ikke hente status (${res.status}).`);
+        setErr("Login mangler i denne browser. Upload-status kan ikke vises uden en gyldig session.");
         return;
       }
 
-      if (json.ok === false) {
+      if (!statusRes.ok || !statusJson) {
         setData(null);
-        setErr(String(json.error ?? "Kunne ikke hente status."));
+        setErr(`Kunne ikke hente status (${statusRes.status}).`);
         return;
       }
 
-      setData(json);
+      if (statusJson.ok === false) {
+        setData(null);
+        setErr(String(statusJson.error ?? "Kunne ikke hente status."));
+        return;
+      }
+
+      const merged: ImportStatusResponse =
+        quotaRes.ok && quotaJson?.ok
+          ? {
+              ...statusJson,
+              plan: quotaJson.plan ?? statusJson.plan,
+              resetAt: quotaJson.resetAt ?? statusJson.resetAt ?? statusJson.quota?.resetAt ?? null,
+              usedThisMonth: n0(quotaJson.import?.usedThisMonth ?? statusJson.usedThisMonth ?? statusJson.quota?.usedThisMonth ?? 0),
+              monthlyLimit:
+                (quotaJson.import?.limitPerMonth ?? statusJson.monthlyLimit ?? statusJson.quota?.limitPerMonth ?? null) as number | null,
+              quota: {
+                usedThisMonth: n0(quotaJson.import?.usedThisMonth ?? statusJson.quota?.usedThisMonth ?? 0),
+                limitPerMonth:
+                  (quotaJson.import?.limitPerMonth ?? statusJson.quota?.limitPerMonth ?? null) as number | null,
+                resetAt: quotaJson.resetAt ?? statusJson.quota?.resetAt,
+                plan: quotaJson.plan ?? statusJson.quota?.plan,
+              },
+            }
+          : statusJson;
+
+      setData(merged);
     } catch (e) {
       console.error("[ImportStatusBox] load error", e);
       setData(null);
@@ -123,11 +167,13 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
 
     const onRefresh = () => void load();
     window.addEventListener("notely:import-status-refresh", onRefresh);
+    window.addEventListener("notely-quota-changed", onRefresh);
 
     const t = setInterval(() => void load(), Math.max(5000, refreshMs));
 
     return () => {
       window.removeEventListener("notely:import-status-refresh", onRefresh);
+      window.removeEventListener("notely-quota-changed", onRefresh);
       clearInterval(t);
     };
   }, [load, refreshMs]);
@@ -194,7 +240,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
 
       <div className="mt-4 rounded-xl bg-zinc-50 p-4">
         <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold text-zinc-900">Filer i alt</div>
+          <div className="text-sm font-semibold text-zinc-900">Uploadede filer</div>
           <div className="text-sm font-semibold text-zinc-900">{filesTotal}</div>
         </div>
 
@@ -204,9 +250,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
               Senest: {latestName}
               {latestAt ? ` · ${fmtDa(latestAt)}` : ""}
             </>
-          ) : (
-            "Ingen filer endnu."
-          )}
+          ) : null}
         </div>
       </div>
 

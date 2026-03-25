@@ -1,28 +1,13 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function json(status: number, payload: any) {
   return NextResponse.json(payload, { status });
-}
-
-async function getOwnerId(req: NextRequest, sb: ReturnType<typeof supabaseServerRoute>) {
-  try {
-    const { data } = await (sb as any).auth.getUser();
-    if (data?.user?.id) return data.user.id as string;
-  } catch {
-    // ignore
-  }
-
-  const expected = process.env.DEV_BYPASS_SECRET;
-  const devHeader = req.headers.get("x-dev-secret") || req.headers.get("x-shared-secret");
-  if (expected && devHeader && devHeader === expected) return process.env.DEV_USER_ID ?? null;
-
-  return null;
 }
 
 // Leitner/SM2-lite (simple)
@@ -50,7 +35,8 @@ function addDaysIso(days: number) {
 }
 
 export async function POST(req: NextRequest) {
-  const sb = supabaseServerRoute();
+  let sb: any;
+  let ownerId: string;
 
   let body: { cardId?: string; rating?: number };
   try {
@@ -59,8 +45,13 @@ export async function POST(req: NextRequest) {
     return json(400, { ok: false, error: "Bad JSON" });
   }
 
-  const ownerId = await getOwnerId(req, sb);
-  if (!ownerId) return json(401, { ok: false, error: "Unauthorized (mangler login eller dev-bypass)." });
+  try {
+    const auth = await requireUser(req);
+    sb = auth.sb;
+    ownerId = auth.id;
+  } catch {
+    return json(401, { ok: false, error: "Unauthorized (mangler login eller dev-bypass)." });
+  }
 
   const cardId = String(body.cardId ?? "").trim();
   const rating = Number(body.rating);
@@ -69,7 +60,7 @@ export async function POST(req: NextRequest) {
   if (![0, 1, 2, 3].includes(rating)) return json(400, { ok: false, error: "rating skal være 0..3" });
 
   // Load card (owner-scoped)
-  const { data: card, error: cardErr } = await (sb as any)
+  const { data: card, error: cardErr } = await sb
     .from("flashcard_cards")
     .select("id,owner_id,box")
     .eq("id", cardId)
@@ -86,7 +77,7 @@ export async function POST(req: NextRequest) {
   const nowIso = new Date().toISOString();
 
   // 1) Insert review event
-  const { error: insErr } = await (sb as any)
+  const { error: insErr } = await sb
     .from("flashcard_reviews")
     .insert({
       owner_id: ownerId,
@@ -99,7 +90,7 @@ export async function POST(req: NextRequest) {
   }
 
   // 2) Update card schedule
-  const { error: updErr } = await (sb as any)
+  const { error: updErr } = await sb
     .from("flashcard_cards")
     .update({
       box: nextBox,

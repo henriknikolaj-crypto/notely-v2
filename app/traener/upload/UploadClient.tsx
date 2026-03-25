@@ -2,7 +2,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type Folder = {
   id: string;
@@ -17,10 +19,25 @@ type FileRow = {
   uploadedAt: string | null;
 };
 
+type UploadResult = {
+  kind: "pdf" | "audio";
+  fileName: string;
+  message: string;
+  noteCount?: number;
+  audioNoteMode?: "resume" | "focus" | "both";
+};
+
+type GeneratedUploadNote = {
+  id: string;
+  title?: string | null;
+  note_type?: string | null;
+};
+
 type Props = {
   folders: Folder[];
   initialFolderId: string | null;
   ownerId: string;
+  onFoldersChange?: (folders: Folder[]) => void;
 };
 
 function asString(v: any): string | null {
@@ -84,9 +101,29 @@ function safeJson(text: string) {
   }
 }
 
-export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId }: Props) {
+function isAudioFile(file: File | null) {
+  if (!file) return false;
+  const mime = String(file.type ?? "").toLowerCase();
+  if (mime.startsWith("audio/")) return true;
+  return /\.(mp3|m4a|wav|mp4|mpeg|mpga|webm|ogg|oga|flac|aac)$/i.test(file.name ?? "");
+}
+
+function pickImportQuota(json: any): { used: number; limit: number | null } {
+  const used =
+    (typeof json?.import?.usedThisMonth === "number" ? json.import.usedThisMonth : null) ??
+    (typeof json?.usedThisMonth === "number" ? json.usedThisMonth : 0);
+
+  const limit =
+    (typeof json?.import?.limitPerMonth === "number" ? json.import.limitPerMonth : null) ??
+    (typeof json?.monthlyLimit === "number" ? json.monthlyLimit : null);
+
+  return { used: Number.isFinite(used) ? used : 0, limit: typeof limit === "number" ? limit : null };
+}
+
+export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId, onFoldersChange }: Props) {
   // NOTE: props bruges primært til at fixe typecheck + give hurtig initial state
   void ownerId;
+  const router = useRouter();
 
   // folders
   const [folders, setFolders] = useState<Folder[]>(() => (Array.isArray(initialFolders) ? initialFolders : []));
@@ -114,7 +151,10 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const [quotaBlocked, setQuotaBlocked] = useState<string | null>(null);
+  const [audioNoteMode, setAudioNoteMode] = useState<"resume" | "focus" | "both">("both");
+  const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
 
   // delete
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -138,6 +178,30 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
   const folderOptions = useMemo(() => folders, [folders]);
 
+  useEffect(() => {
+    const nextFolders = Array.isArray(initialFolders) ? initialFolders : [];
+    setFolders(nextFolders);
+    setFoldersLoading(false);
+
+    if (nextFolders.length === 0) {
+      setUploadFolderId(null);
+      setListFolderId(null);
+      return;
+    }
+
+    const fallback = nextFolders[0].id;
+    setUploadFolderId((prev) => {
+      if (prev && nextFolders.some((f) => f.id === prev)) return prev;
+      if (initialFolderId && nextFolders.some((f) => f.id === initialFolderId)) return initialFolderId;
+      return fallback;
+    });
+    setListFolderId((prev) => {
+      if (prev && nextFolders.some((f) => f.id === prev)) return prev;
+      if (initialFolderId && nextFolders.some((f) => f.id === initialFolderId)) return initialFolderId;
+      return fallback;
+    });
+  }, [initialFolders, initialFolderId]);
+
   const loadFolders = useCallback(async () => {
     setFoldersLoading(true);
     setFoldersError(null);
@@ -151,6 +215,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       const text = await res.text();
       const json = safeJson(text);
+
+      if (res.status === 401) {
+        setFolders([]);
+        setFoldersError("Login mangler i denne browser. Mapper kan ikke hentes endnu.");
+        setUploadFolderId(null);
+        setListFolderId(null);
+        return;
+      }
 
       if (!res.ok) {
         setFolders([]);
@@ -179,6 +251,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       const normalized = raw.map(normalizeFolderRow).filter(Boolean) as Folder[];
       setFolders(normalized);
+      onFoldersChange?.(normalized);
 
       if (normalized.length > 0) {
         setFoldersError(null);
@@ -210,7 +283,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     } finally {
       setFoldersLoading(false);
     }
-  }, [initialFolderId]);
+  }, [initialFolderId, onFoldersChange]);
 
   const loadFiles = useCallback(async (folderId: string | null) => {
     if (!folderId) {
@@ -226,6 +299,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const res = await fetch(url, { method: "GET", cache: "no-store", headers: { Accept: "application/json" } });
       const text = await res.text();
       const json = safeJson(text);
+
+      if (res.status === 401) {
+        setFiles([]);
+        setFilesError("Login mangler i denne browser. Filer kan ikke hentes endnu.");
+        return;
+      }
 
       if (!res.ok) {
         setFiles([]);
@@ -252,32 +331,72 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   }, []);
 
   useEffect(() => {
-    // Hvis der allerede er initial folders, kan vi nøjes med at hente filer først
-    void loadFolders();
-  }, [loadFolders]);
-
-  useEffect(() => {
     void loadFiles(listFolderId);
   }, [listFolderId, loadFiles]);
 
   function onPickFile(f: File | null) {
     setUploadError(null);
-    setQuotaBlocked(null);
+    setUploadNotice(null);
+    setUploadResult(null);
     setPickedFile(f);
   }
 
-  const canUpload = !!pickedFile && !!uploadFolderId && !uploading && !quotaBlocked && !foldersLoading;
+  const precheckQuota = useCallback(async (force = false) => {
+    try {
+      const json = await fetchQuotaCurrent({ force });
+      if (!json?.ok) return false;
+
+      const { used, limit } = pickImportQuota(json);
+      if (typeof limit === "number" && limit > 0) {
+        const remaining = Math.max(0, limit - used);
+        if (remaining <= 0) {
+          setQuotaBlocked("Du har nået din månedlige upload-kvote.");
+          setUploadError(null);
+          return true;
+        }
+      }
+
+      setQuotaBlocked(null);
+      return false;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void precheckQuota();
+
+    const onQuota = () => void precheckQuota(true);
+    window.addEventListener("notely-quota-changed", onQuota);
+    return () => window.removeEventListener("notely-quota-changed", onQuota);
+  }, [precheckQuota]);
+
+  const hasValidUploadFolder = !!uploadFolderId && folderOptions.some((folder) => folder.id === uploadFolderId);
+  const canUpload = !!pickedFile && hasValidUploadFolder && !uploading && !quotaBlocked && !foldersLoading;
 
   async function doUpload() {
+    if (!hasValidUploadFolder) {
+      setUploadError("Du skal oprette eller vælge en mappe, før du kan uploade materiale.");
+      return;
+    }
     if (!pickedFile || !uploadFolderId) return;
+    if (quotaBlocked) return;
+
+    const blocked = await precheckQuota(true);
+    if (blocked) return;
 
     setUploading(true);
     setUploadError(null);
+    setUploadNotice(null);
+    setUploadResult(null);
 
     try {
       const fd = new FormData();
       fd.append("file", pickedFile);
       fd.append("folder_id", uploadFolderId);
+      if (isAudioFile(pickedFile)) {
+        fd.append("audio_note_mode", audioNoteMode);
+      }
 
       const res = await fetch("/api/trainer/upload", { method: "POST", body: fd });
 
@@ -296,7 +415,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             j?.error ??
             "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
         );
-        setUploadError(msg);
+        setUploadNotice(msg);
         return;
       }
 
@@ -318,12 +437,46 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         return;
       }
 
+      const data = safeJson(await res.text()) ?? {};
+      const uploadKind = data?.uploadKind === "audio" ? "audio" : "pdf";
+      const noteCount = Array.isArray(data?.generatedNotes) ? data.generatedNotes.length : 0;
+      const generatedNotes = Array.isArray(data?.generatedNotes) ? (data.generatedNotes as GeneratedUploadNote[]) : [];
+      const notesHistoryHref = uploadFolderId ? `/traener/noter/historik?scope=${encodeURIComponent(uploadFolderId)}` : "/traener/noter/historik";
+
       setPickedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
+      setUploadResult(
+        uploadKind === "audio"
+          ? {
+              kind: "audio",
+              fileName: pickedFile.name,
+              noteCount,
+              audioNoteMode,
+              message:
+                noteCount > 0
+                  ? `Lydfil modtaget. Vi gør den klar nu. ${noteCount === 1 ? "1 note" : `${noteCount} noter`} ligger under Noter.`
+                  : "Lydfil modtaget. Vi gør den klar nu. Se resultatet under Noter.",
+            }
+          : {
+              kind: "pdf",
+              fileName: pickedFile.name,
+              message: "Fil modtaget. Materialet bliver gjort klar til brug i Notely.",
+            },
+      );
       dispatchQuotaChanged();
 
       await loadFolders();
       await loadFiles(listFolderIdRef.current ?? uploadFolderId);
+
+      if (uploadKind === "audio" && generatedNotes.length > 0) {
+        const firstNoteId = String(generatedNotes[0]?.id ?? "").trim();
+        if (generatedNotes.length === 1 && firstNoteId) {
+          router.push(`/notes/${encodeURIComponent(firstNoteId)}?back=${encodeURIComponent(notesHistoryHref)}`);
+        } else {
+          router.push(notesHistoryHref);
+        }
+        return;
+      }
     } catch (e) {
       console.error("[UploadClient] upload error", e);
       setUploadError("Upload fejlede. Prøv igen.");
@@ -419,8 +572,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     setFiles((prev) => prev.filter((f) => f.id !== fileId));
     setDeletingId(null);
-
-    await loadFiles(listFolderIdRef.current);
     dispatchImportStatusRefresh();
   }
 
@@ -430,7 +581,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
         <div className="text-sm font-semibold text-zinc-900">Upload materiale</div>
         <div className="mt-1 text-xs text-zinc-600">
-          Vælg mappe og upload noter/slides som PDF. Når materialet er gjort klar, kan det bruges på tværs af Notely.
+          Vælg mappe og upload PDF eller lyd. Upload-siden er kun til indlevering; du ser og arbejder med output under Noter.
         </div>
 
         <div className="mt-4">
@@ -456,6 +607,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             Mapper styrer, hvilket fag/forløb materialet bliver knyttet til.
           </div>
           {foldersError ? <div className="mt-2 text-[11px] text-red-600">{foldersError}</div> : null}
+          {!foldersLoading && !hasValidUploadFolder ? (
+            <div className="mt-2 text-[11px] text-amber-700">
+              <div>Du skal oprette eller vælge en mappe, før du kan uploade materiale.</div>
+              <div>Opret en mappe under &quot;Mapper og perioder&quot; længere nede på siden.</div>
+            </div>
+          ) : null}
         </div>
 
         {/* Dropzone */}
@@ -488,8 +645,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             onPickFile(f);
           }}
         >
-          <div className="text-sm font-medium text-zinc-900">Træk en PDF herind eller klik for at vælge.</div>
-          <div className="mt-1 text-xs text-zinc-500">Maks. størrelse afhænger af din plan (typisk ~10–30 MB pr. fil).</div>
+          <div className="text-sm font-medium text-zinc-900">Træk en PDF eller lydfil herind eller klik for at vælge.</div>
+          <div className="mt-1 text-xs text-zinc-500">Understøtter PDF samt almindelige lydfiler som mp3, m4a, wav, webm og ogg.</div>
 
           <div className="mt-4 flex items-center justify-center gap-2">
             <span className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium">Vælg fil</span>
@@ -519,7 +676,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           <input
             ref={fileInputRef}
             type="file"
-            accept="application/pdf"
+            accept="application/pdf,audio/*,.mp3,.m4a,.wav,.mp4,.mpeg,.mpga,.webm,.ogg,.oga,.flac,.aac"
             className="hidden"
             onChange={(e) => {
               const f = e.target.files?.[0] ?? null;
@@ -528,9 +685,39 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           />
         </label>
 
-        {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
-        {uploadError ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
+        {isAudioFile(pickedFile) ? (
+          <div className="mt-4 rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
+            <div className="text-xs font-medium text-zinc-900">Output til Noter</div>
+            <div className="mt-1 text-[11px] text-zinc-600">
+              Vælg hvad der skal oprettes fra lydfilen. Resultatet vises ikke her, men under Noter.
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {[
+                { value: "resume", label: "Resumé" },
+                { value: "focus", label: "Fokus-noter" },
+                { value: "both", label: "Begge" },
+              ].map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setAudioNoteMode(option.value as "resume" | "focus" | "both")}
+                  className={[
+                    "rounded-full border px-3 py-1.5 text-xs font-medium",
+                    audioNoteMode === option.value
+                      ? "border-zinc-900 bg-zinc-900 text-white"
+                      : "border-zinc-300 bg-white text-zinc-700",
+                  ].join(" ")}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
+        {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
+        {uploadNotice ? <LimitNotice className="mt-3">{uploadNotice}</LimitNotice> : null}
+        {uploadError ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
         <div className="mt-4 flex items-center justify-between">
           <button
             type="button"
@@ -556,7 +743,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm font-semibold text-zinc-900">Materiale i dine mapper</div>
-            <div className="mt-1 text-xs text-zinc-600">Viser filer i den mappe, du vælger herunder.</div>
+            <div className="mt-1 text-xs text-zinc-600">Viser PDF- og lydfiler i den mappe, du vælger herunder.</div>
           </div>
 
           <button

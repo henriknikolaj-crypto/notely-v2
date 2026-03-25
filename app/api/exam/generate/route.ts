@@ -8,11 +8,15 @@ import { createClient } from "@supabase/supabase-js";
 
 import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
+import { createChatCompletion } from "@/lib/openai/buildRequest";
+import { resolveModelForFeature } from "@/lib/openai/model";
+import { ensureProfile } from "@/lib/server/ensureProfile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Difficulty = "easy" | "medium" | "hard";
+type FocusMode = "normal" | "weakest";
 
 type ExamGenerateRequest = {
   count?: number;
@@ -21,6 +25,8 @@ type ExamGenerateRequest = {
 
   // mappe-scope (fra venstre menu / scope=... i URL)
   scopeFolderIds?: string[];
+  folderId?: string | null;
+  focusMode?: FocusMode;
 
   // anti-repeat fra klienten
   avoidQuestions?: string[];
@@ -50,6 +56,10 @@ type ExamGenerateOk = {
     usedFileIds: string[];
     usedChunkIds: string[];
     maxContextChunks: number;
+    focusMode: FocusMode;
+    biasApplied: boolean;
+    focusTargets: Array<{ key: string; label: string }>;
+    weakSessionCount: number;
   };
 };
 
@@ -75,6 +85,12 @@ type ChunkRow = {
   content: string | null;
   created_at: string | null;
   source_url?: string | null;
+};
+
+type WeakPointTarget = {
+  key: string;
+  label: string;
+  action?: string;
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -105,6 +121,10 @@ function pickDifficulty(raw: any): Difficulty {
   return raw === "easy" || raw === "hard" ? raw : "medium";
 }
 
+function pickFocusMode(raw: any): FocusMode {
+  return raw === "weakest" ? "weakest" : "normal";
+}
+
 function uniqTrimmed(ids: unknown) {
   if (!Array.isArray(ids)) return [];
   const seen = new Set<string>();
@@ -132,12 +152,62 @@ function fileTitle(row: any) {
   return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
 }
 
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 function normalizeQuestion(s: string) {
   return String(s ?? "")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .replace(/[.,;:!?()"'’”“\[\]{}]/g, "")
     .trim();
+}
+
+function normalizeWeakPointTarget(raw: unknown): WeakPointTarget | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const keyRaw = String(obj.key ?? "").trim();
+  const labelRaw = String(obj.label ?? "").trim();
+  const actionRaw = String(obj.action ?? "").trim();
+
+  const key = keyRaw || labelRaw.toLowerCase().replace(/\s+/g, "_").slice(0, 80);
+  const label = labelRaw || keyRaw.replace(/_/g, " ");
+  if (!key || !label) return null;
+
+  const out: WeakPointTarget = { key, label };
+  if (actionRaw) out.action = actionRaw;
+  return out;
+}
+
+function deriveFocusTargetsFromWeakSessions(rows: Array<{ metadata: any }>): WeakPointTarget[] {
+  const acc = new Map<string, { target: WeakPointTarget; weight: number }>();
+
+  for (let i = 0; i < rows.length; i++) {
+    const weight = i < 10 ? 2 : 1;
+    const metadata = rows[i]?.metadata as Record<string, unknown> | null;
+    const weakRaw = metadata?.weak_points;
+    if (!Array.isArray(weakRaw)) continue;
+
+    for (const item of weakRaw) {
+      const normalized = normalizeWeakPointTarget(item);
+      if (!normalized) continue;
+      const existing = acc.get(normalized.key);
+      if (existing) {
+        existing.weight += weight;
+      } else {
+        acc.set(normalized.key, { target: normalized, weight });
+      }
+    }
+  }
+
+  return Array.from(acc.values())
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 2)
+    .map((x) => x.target);
 }
 
 export async function POST(req: NextRequest) {
@@ -159,10 +229,26 @@ export async function POST(req: NextRequest) {
     const count = clampInt(body.count, 1, 15, 10);
     const difficulty = pickDifficulty(body.difficulty);
     const maxContextChunks = clampInt(body.maxContextChunks, 6, 40, 16);
+    const requestedFocusMode = pickFocusMode(body.focusMode);
 
     const scopeFolderIds = uniqTrimmed(body.scopeFolderIds);
+    const explicitFolderId = String(body.folderId ?? "").trim();
     const avoidQuestions = uniqTrimmed(body.avoidQuestions).slice(0, 60);
     const avoidNorm = new Set(avoidQuestions.map(normalizeQuestion));
+
+    let effectiveFocusMode: FocusMode = requestedFocusMode;
+    let focusScopeFolderId: string | null = null;
+    if (requestedFocusMode === "weakest") {
+      if (explicitFolderId) {
+        focusScopeFolderId = explicitFolderId;
+      } else if (scopeFolderIds.length === 1) {
+        focusScopeFolderId = scopeFolderIds[0];
+      } else {
+        effectiveFocusMode = "normal";
+      }
+    }
+    let focusTargets: WeakPointTarget[] = [];
+    let weakSessionCount = 0;
 
     // Auth
     let ownerId = "";
@@ -198,6 +284,40 @@ export async function POST(req: NextRequest) {
         requestId,
       };
       return NextResponse.json(err, { status: 500 });
+    }
+
+    await ensureProfile(admin, ownerId);
+
+    // Why: Eksamen skal håndhæves server-side som Pro-only, så client-bypass ikke virker.
+    const { data: profile } = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+    const plan = normalizePlan((profile as any)?.plan);
+    if (plan !== "pro") {
+      const err: ExamGenerateErr = {
+        ok: false,
+        error: "Kræver Pro",
+        code: "PRO_REQUIRED",
+        requestId,
+      };
+      return NextResponse.json(err, { status: 403 });
+    }
+
+    if (effectiveFocusMode === "weakest" && focusScopeFolderId) {
+      const { data: weakRows } = await admin
+        .from("exam_sessions")
+        .select("created_at,metadata")
+        .eq("owner_id", ownerId)
+        .eq("folder_id", focusScopeFolderId)
+        .in("source_type", ["trainer", "simulator"])
+        .not("metadata->weak_points", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(25);
+
+      const weakRowsArr = (weakRows ?? []) as Array<{ metadata: any }>;
+      weakSessionCount = weakRowsArr.length;
+      focusTargets = deriveFocusTargetsFromWeakSessions(weakRowsArr);
+      if (focusTargets.length === 0) {
+        effectiveFocusMode = "normal";
+      }
     }
 
     // Hent filer i scope (eller alle hvis ingen scope)
@@ -293,12 +413,22 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(err, { status: 400 });
     }
 
-    const model = process.env.OPENAI_MODEL_EXAM || process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const model = resolveModelForFeature("simulator");
 
     const avoidBlock =
       avoidQuestions.length > 0
         ? `\nUNDGÅ at gentage nogen af disse spørgsmål (nøjagtigt eller næsten):\n- ${avoidQuestions.join("\n- ")}\n`
         : "";
+    const focusBiasBlock =
+      effectiveFocusMode === "weakest" && focusTargets.length > 0
+        ? [
+            `Fokusér især på: ${focusTargets.map((t) => t.label).join(", ")}. Spørgsmålene skal træne disse områder.`,
+            ...focusTargets
+              .map((t) => (t.action ? `Hint - ${t.label}: ${t.action}` : ""))
+              .filter(Boolean),
+          ].join("\n")
+        : "";
+    const biasApplied = effectiveFocusMode === "weakest" && focusTargets.length > 0;
 
     const systemPrompt = `
 Du skriver skriftlige eksamensspørgsmål på dansk.
@@ -317,6 +447,7 @@ FORMAT:
     const userPrompt = [
       `Antal spørgsmål: ${count}`,
       `Sværhedsgrad: ${difficulty}`,
+      focusBiasBlock,
       avoidBlock.trim(),
       "",
       "KONTEKST (brug dette som eneste grundlag):",
@@ -331,16 +462,19 @@ FORMAT:
     let outQuestions: ExamQuestion[] = [];
 
     for (let attempt = 0; attempt < 2; attempt++) {
-      const completion = await openai.chat.completions.create({
-        model,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        // matcher din /api/generate-question
-        temperature: 0.9,
-        top_p: 0.95,
+      const { completion } = await createChatCompletion(openai, {
+        feature: "simulator",
+        purpose: "json",
+        modelOverride: model,
+        payload: {
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.9,
+          top_p: 0.95,
+        },
       });
 
       const raw = completion.choices[0]?.message?.content ?? "{}";
@@ -397,6 +531,10 @@ FORMAT:
         usedFileIds,
         usedChunkIds,
         maxContextChunks,
+        focusMode: effectiveFocusMode,
+        biasApplied,
+        focusTargets: focusTargets.map((t) => ({ key: t.key, label: t.label })),
+        weakSessionCount,
       },
     };
 

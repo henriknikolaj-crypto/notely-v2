@@ -4,6 +4,7 @@ import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 import { getOwnerCtx } from "@/lib/auth/owner";
+import { ensureProfile } from "@/lib/server/ensureProfile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -115,6 +116,8 @@ export async function POST(req: NextRequest) {
     }
 
     const table = await resolveFoldersTable(sb);
+
+    await ensureProfile(sb, owner.ownerId);
 
     // Max 1 nesting level: hvis parent_id er sat, må parent ikke selv have parent_id
     if (parent_id) {

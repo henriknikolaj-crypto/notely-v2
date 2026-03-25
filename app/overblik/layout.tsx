@@ -3,6 +3,7 @@ import "server-only";
 
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import TrainingSidebarMainNav from "../traener/ui/TrainingSidebarMainNav";
 import TrainingSidebarFolders from "../traener/ui/TrainingSidebarFolders";
 import TrainingSidebarStats from "../traener/ui/TrainingSidebarStats";
@@ -35,6 +36,13 @@ export const dynamic = "force-dynamic";
 
 export default async function OverblikLayout({ children }: { children: React.ReactNode }) {
   const sb = await supabaseServerRSC();
+  let currentUserEmail: string | null = null;
+  try {
+    const { data } = await sb.auth.getUser();
+    currentUserEmail = data?.user?.email ?? null;
+  } catch {
+    currentUserEmail = null;
+  }
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
@@ -42,7 +50,7 @@ export default async function OverblikLayout({ children }: { children: React.Rea
       <main className="min-h-screen bg-[#fffef9]">
         <header className="border-b border-zinc-200 bg-white">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-            <Link href="/" className="logo-script text-4xl leading-none">
+            <Link href="/" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
               Notely.
             </Link>
             <Link href="/auth/login" className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
@@ -93,28 +101,22 @@ export default async function OverblikLayout({ children }: { children: React.Rea
     (latestEvalsData as { id: string; score: number | null; created_at: string | null }[]) ?? [];
 
   // ---- Counts ----
-  const { count: notesCountRaw } = await sb
-    .from("notes")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", ownerId);
-
   const { count: evalCountRaw } = await sb
     .from("exam_sessions")
     .select("id", { count: "exact", head: true })
     .eq("owner_id", ownerId);
 
-  const notesCount = notesCountRaw ?? 0;
   const evalCount = evalCountRaw ?? 0;
 
   return (
     <main className="min-h-screen bg-[#fffef9]">
       <header className="border-b border-zinc-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-          <Link href="/overblik" className="logo-script text-4xl leading-none">
+          <Link href="/traener/overblik" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
             Notely.
           </Link>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-zinc-700">henriknikolaj@gmail.com</span>
+            <span className="text-xs text-zinc-700">{currentUserEmail ?? ""}</span>
             <Link href="/auth/logout" className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
               Log ud
             </Link>
@@ -125,7 +127,7 @@ export default async function OverblikLayout({ children }: { children: React.Rea
       {/* ✅ 3 kolonner på desktop: venstre nav / content / højre “Dine fag” */}
       <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-4 py-6 md:px-6 lg:grid-cols-[256px_minmax(0,1fr)_256px]">
         {/* Venstre: kun “Mit Notely” */}
-        <aside className="shrink-0">
+        <aside className="hidden shrink-0 lg:block">
           <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
             <div className="px-2 pb-1 pt-1 font-semibold text-zinc-800">Mit Notely</div>
             <TrainingSidebarMainNav />
@@ -133,10 +135,13 @@ export default async function OverblikLayout({ children }: { children: React.Rea
         </aside>
 
         {/* Midt: sideindhold */}
-        <section className="min-w-0 bg-transparent">{children}</section>
+        <section className="min-w-0 bg-transparent">
+          <MobileBackToMenu href="/m" label="← Tilbage til hovedmenu" />
+          {children}
+        </section>
 
         {/* Højre: “Dine fag” + stats */}
-        <aside className="shrink-0">
+        <aside className="hidden shrink-0 lg:block">
           <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
             <div className="px-4 pb-1 pt-2 font-semibold text-zinc-800">Dine fag</div>
             <TrainingSidebarFolders folders={foldersForSidebar} />
@@ -144,7 +149,6 @@ export default async function OverblikLayout({ children }: { children: React.Rea
             <TrainingSidebarStats
               latestNotes={latestNotes}
               latestEvals={latestEvals}
-              notesCount={notesCount}
               evalCount={evalCount}
             />
           </div>

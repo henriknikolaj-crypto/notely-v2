@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
 
+const SIDEBAR_SEE_ALL_CLASS = "text-[11px] text-zinc-500 hover:text-zinc-700";
+
 type Item = {
   id: string;
   created_at: string | null;
@@ -123,9 +125,11 @@ export default function SidebarExamInfo({ mode: modeProp }: { mode?: "skrift" | 
     <div className="space-y-2">
       <div className="mb-1 flex items-center justify-between">
         <div className="font-semibold text-zinc-800">Seneste runder</div>
-        <Link href={historyHref} className="text-[11px] text-zinc-500 hover:text-zinc-700">
-          Se alle
-        </Link>
+        {(total ?? 0) > 0 ? (
+          <Link href={historyHref} className={SIDEBAR_SEE_ALL_CLASS}>
+            Se alle
+          </Link>
+        ) : null}
       </div>
 
       {loading ? <p className="text-[11px] text-zinc-500">Henter runder …</p> : null}

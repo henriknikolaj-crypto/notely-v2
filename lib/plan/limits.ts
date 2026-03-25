@@ -3,6 +3,8 @@
 
  
 
+import { supabaseAdminOrNull } from "@/lib/quota/rpc";
+
 export type PlanCode = "freemium" | "basis" | "pro" | string;
 
 export type PlanLimits = {
@@ -48,6 +50,14 @@ function buildFallbackLimits(plan: PlanCode): PlanLimits {
   };
 }
 
+export function normalizePlanCode(raw: unknown): PlanCode {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p) return "freemium";
+  if (p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 /**
  * Slår brugerens plan op i profiles.
  * Antagelse: profiles.id == auth.user.id og har en kolonne "plan".
@@ -68,11 +78,54 @@ export async function getUserPlan(
     }
 
     const rawPlan = (data?.plan as string | null) ?? null;
-    const plan = (rawPlan || "freemium") as PlanCode;
+    const plan = normalizePlanCode(rawPlan);
     return plan;
   } catch (err) {
     console.error("[plan] getUserPlan exception:", err);
     return "freemium";
+  }
+}
+
+export async function getCanonicalUserPlan(
+  sb: any,
+  ownerId: string,
+): Promise<{ rawPlan: string | null; normalizedPlan: PlanCode; source: "admin" | "rsc" | "fallback" }> {
+  try {
+    const admin = supabaseAdminOrNull();
+    if (admin) {
+      const { data, error } = await admin
+        .from("profiles")
+        .select("plan")
+        .eq("id", ownerId)
+        .maybeSingle();
+      if (!error) {
+        const rawPlan = (data?.plan as string | null) ?? null;
+        return {
+          rawPlan,
+          normalizedPlan: normalizePlanCode(rawPlan),
+          source: "admin",
+        };
+      }
+      console.error("[plan] getCanonicalUserPlan admin error:", error);
+    }
+  } catch (err) {
+    console.error("[plan] getCanonicalUserPlan admin exception:", err);
+  }
+
+  try {
+    const rawPlan = await getUserPlan(sb, ownerId);
+    return {
+      rawPlan: String(rawPlan ?? "").trim() || null,
+      normalizedPlan: normalizePlanCode(rawPlan),
+      source: "rsc",
+    };
+  } catch (err) {
+    console.error("[plan] getCanonicalUserPlan rsc exception:", err);
+    return {
+      rawPlan: null,
+      normalizedPlan: "freemium",
+      source: "fallback",
+    };
   }
 }
 
@@ -85,47 +138,55 @@ export async function getPlanLimits(
   plan: PlanCode,
 ): Promise<PlanLimits> {
   try {
-    const { data, error } = await sb
+    const baseFallback = buildFallbackLimits(plan);
+    const { data, error }: {
+      data: Array<{ plan?: string | null; feature?: string | null; monthly_limit?: number | null; is_unlimited?: boolean | null }> | null;
+      error: any;
+    } = await sb
       .from("plan_limits")
-      .select(
-        "plan, oral_minutes_per_month, evals_per_month, mc_questions_per_month, max_files, max_folders",
-      )
-      .eq("plan", plan)
-      .maybeSingle();
+      .select("plan, feature, monthly_limit, is_unlimited")
+      .eq("plan", plan);
 
     if (error) {
       console.error("[plan] getPlanLimits error:", error);
     }
 
     if (!data) {
-      // Ingen række i plan_limits → brug fallback defaults
       return buildFallbackLimits(plan);
     }
 
-    const baseFallback = buildFallbackLimits(plan);
+    const byFeature = new Map<string, number | null>();
+    for (const row of data) {
+      const feature = String(row?.feature ?? "").trim();
+      if (!feature) continue;
+      if (row?.is_unlimited === true) {
+        byFeature.set(feature, null);
+        continue;
+      }
+      const monthlyLimit =
+        typeof row?.monthly_limit === "number" ? row.monthly_limit : row?.monthly_limit == null ? null : undefined;
+      byFeature.set(feature, monthlyLimit ?? null);
+    }
+
+    const trainerRoundLimit = byFeature.get("trainer_round");
+    const mcGenerateLimit = byFeature.get("mc_generate");
 
     return {
-      plan: (data.plan as string) ?? plan,
+      plan: String(data[0]?.plan ?? plan),
       oralMinutesPerMonth:
-        typeof data.oral_minutes_per_month === "number"
-          ? data.oral_minutes_per_month
-          : baseFallback.oralMinutesPerMonth,
+        baseFallback.oralMinutesPerMonth,
       evalsPerMonth:
-        typeof data.evals_per_month === "number"
-          ? data.evals_per_month
+        typeof trainerRoundLimit === "number"
+          ? trainerRoundLimit
           : baseFallback.evalsPerMonth,
       mcQuestionsPerMonth:
-        typeof data.mc_questions_per_month === "number"
-          ? data.mc_questions_per_month
+        typeof mcGenerateLimit === "number"
+          ? mcGenerateLimit
           : baseFallback.mcQuestionsPerMonth,
       maxFiles:
-        typeof data.max_files === "number"
-          ? data.max_files
-          : baseFallback.maxFiles,
+        baseFallback.maxFiles,
       maxFolders:
-        typeof data.max_folders === "number"
-          ? data.max_folders
-          : baseFallback.maxFolders,
+        baseFallback.maxFolders,
     };
   } catch (err) {
     console.error("[plan] getPlanLimits exception:", err);

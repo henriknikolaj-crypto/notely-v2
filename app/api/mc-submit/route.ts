@@ -10,6 +10,8 @@ export const runtime = "nodejs";
 type Body = {
   questionId?: string;
   question?: string;
+  roundId?: string;
+  questionHash?: string;
   selectedOptionId?: string;
   selectedOptionText?: string;
   isCorrect?: boolean;
@@ -68,6 +70,8 @@ export async function POST(req: NextRequest) {
 
     const questionId = String(body.questionId ?? "").trim();
     const question = String(body.question ?? "").trim();
+    const roundId = String(body.roundId ?? "").trim() || null;
+    const questionHash = String(body.questionHash ?? "").trim() || null;
     const selectedOptionId = String(body.selectedOptionId ?? "").trim();
     const selectedOptionText = String(body.selectedOptionText ?? "").trim();
     const isCorrect = !!body.isCorrect;
@@ -101,7 +105,9 @@ export async function POST(req: NextRequest) {
       folder_id: folderId,
       meta: {
         mode,
+        roundId,
         questionId,
+        questionHash,
         selectedOptionId,
         selectedOptionText,
         isCorrect,

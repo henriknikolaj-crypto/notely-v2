@@ -2,8 +2,11 @@ import "server-only";
 
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { unstable_noStore as noStore } from "next/cache";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ClientWrittenExam from "./ClientWrittenExam";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
@@ -13,10 +16,8 @@ async function getOwnerId(sb: any): Promise<string | null> {
       const { data } = await sb.auth.getUser();
       if (data?.user?.id) return data.user.id as string;
     }
-  } catch {
-    // DEV fallback
-  }
-  return process.env.DEV_USER_ID ?? null;
+  } catch {}
+  return null;
 }
 
 function cx(...xs: Array<string | false | null | undefined>) {
@@ -73,11 +74,19 @@ function compactFolderLabel(folderIds: string[], folderMap: Map<string, string>)
   return extra > 0 ? `${first} +${extra}` : first;
 }
 
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
 export default async function Page({
   searchParams,
 }: {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
+  noStore();
   const sp = (await searchParams) ?? {};
 
   const modeRaw = pickString(sp, "mode").toLowerCase();
@@ -129,8 +138,19 @@ export default async function Page({
   }
 
   const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
-
-  const scopeHelp = "Vælg mappe";
+  const resolvedTrainingFolderIds = trainingFolderIds.filter((id) => folderMap.has(id));
+  const resolvedActiveFolderId = resolvedTrainingFolderIds[0] ?? null;
+  const { data: profile } = await sb
+    .from("profiles")
+    .select("plan")
+    .eq("id", ownerId)
+    .maybeSingle();
+  const planRaw = (profile as any)?.plan ?? null;
+  const planNorm = normalizePlan(planRaw);
+  const isPro = planNorm === "pro";
+  if (process.env.NODE_ENV !== "production") {
+    console.log("[exam page]", { ownerId, planRaw, planNorm, isPro });
+  }
 
   return (
     <main>
@@ -143,13 +163,13 @@ export default async function Page({
       </header>
 
       <section className="mt-2 space-y-4">
-        {/* ✅ Skrift/Mundtlig toggle */}
+        {/* ✅ Skriftlig/Mundtlig toggle */}
         <div className="inline-flex overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
           <Link
             href={hrefSkrift}
             className={cx("px-4 py-2 text-sm text-zinc-900", "bg-zinc-200 text-zinc-900")}
           >
-            Skrift
+            Skriftlig
           </Link>
 
           <Link
@@ -163,17 +183,25 @@ export default async function Page({
           </Link>
         </div>
 
-        <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-          <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
+        <TrainingScopeCard
+          names={scopeCompact ? [scopeCompact] : []}
+          className="md:hidden"
+          emptyLabel="Vælg en mappe direkte her."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        >
+          <FeatureScopePicker
+            selectedNames={scopeCompact ? [scopeCompact] : []}
+            selectedScopeIds={resolvedTrainingFolderIds}
+          />
+          <div id="written-exam-training-area-slot" />
+        </TrainingScopeCard>
 
-          {scopeCompact ? (
-            <p className="text-xs text-zinc-600">{scopeCompact}</p>
-          ) : (
-            <p className="text-xs text-zinc-600">{scopeHelp}</p>
-          )}
-        </section>
-
-        <ClientWrittenExam scopeFolderIds={scopeIds} activeFolderId={activeFolderId} />
+        <ClientWrittenExam
+          scopeFolderIds={resolvedTrainingFolderIds}
+          activeFolderId={resolvedActiveFolderId}
+          trainingAreaSlotId="written-exam-training-area-slot"
+          isPro={isPro}
+        />
       </section>
     </main>
   );

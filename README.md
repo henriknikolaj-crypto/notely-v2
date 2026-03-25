@@ -34,3 +34,30 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## OpenAI Model Configuration
+
+`.env.local` er source of truth for feature -> model mapping.
+
+- `OPENAI_MODEL` (global fallback)
+- `OPENAI_MODEL_TRAINER`
+- `OPENAI_MODEL_SIMULATOR`
+- `OPENAI_MODEL_ORAL`
+- `OPENAI_MODEL_ORAL_QUESTION`
+- `OPENAI_MODEL_ORAL_EVAL`
+- `OPENAI_MODEL_WEAKNESS`
+- `OPENAI_MODEL_NOTES`
+- `OPENAI_MODEL_MC`
+- `OPENAI_MODEL_FLASHCARDS`
+- `OPENAI_MODEL_GENERATE_QUESTION`
+- `OPENAI_TRANSCRIBE_MODEL`
+- `OPENAI_TTS_MODEL`
+
+Routes kalder et centralt compatibility layer i `lib/openai/buildRequest.ts`:
+
+- `resolveModelForFeature(feature)` vælger model ud fra env + fallback.
+- `sanitizeOpenAIPayload(model, payload)` fjerner model-inkompatible felter (fx sampling-params for GPT-5).
+- `createChatCompletion(...)` anvender disse regler ét sted og logger dev-only:
+  - feature
+  - resolved model
+  - fjernede payload-felter

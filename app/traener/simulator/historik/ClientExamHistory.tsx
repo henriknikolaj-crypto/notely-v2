@@ -78,7 +78,7 @@ export default function ClientExamHistory({ mode }: { mode: "skrift" | "mundtlig
   return (
     <div className="space-y-3">
       <div className="text-sm font-medium text-zinc-900">
-        {mode === "mundtlig" ? "Mundtlig-historik" : "Skrift-historik"} (seneste {shown.length} af {Math.min(total, 50)})
+        {mode === "mundtlig" ? "Mundtlig-historik" : "Skriftlig-historik"} (seneste {shown.length} af {Math.min(total, 50)})
       </div>
 
       {error ? <div className="text-sm text-red-600">{error}</div> : null}

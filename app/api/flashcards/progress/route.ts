@@ -1,7 +1,8 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireUser } from "@/lib/auth";
+import { hasScopeOverlap, parseScopeFolderIds } from "../_scope";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,42 +11,14 @@ function json(status: number, payload: any) {
   return NextResponse.json(payload, { status });
 }
 
-async function getOwnerId(req: NextRequest, sb: any): Promise<string | null> {
-  // 1) Real auth
-  try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return data.user.id as string;
-  } catch {}
-
-  // 2) Dev fallback for browser (ingen headers)
-  if (process.env.NODE_ENV !== "production" && process.env.DEV_USER_ID) {
-    return process.env.DEV_USER_ID;
-  }
-
-  // 3) Header bypass (PowerShell)
-  const expected = process.env.DEV_BYPASS_SECRET;
-  const h = req.headers.get("x-dev-secret") || req.headers.get("x-shared-secret");
-  if (expected && h && h === expected) return process.env.DEV_USER_ID ?? null;
-
-  return null;
-}
-
-function parseScope(req: NextRequest): string[] {
-  const url = new URL(req.url);
-  const a = url.searchParams.getAll("scopeFolderIds[]").filter(Boolean);
-  if (a.length > 0) return a;
-
-  return (url.searchParams.get("scopeFolderIds") ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 export async function GET(req: NextRequest) {
-  const sb = await supabaseServerRoute(); // ✅ vigtig
-  const ownerId = await getOwnerId(req, sb);
-
-  if (!ownerId) {
+  let sb: any;
+  let ownerId: string;
+  try {
+    const auth = await requireUser(req);
+    sb = auth.sb;
+    ownerId = auth.id;
+  } catch {
     return json(401, { ok: false, error: "Unauthorized (mangler login eller dev-bypass)." });
   }
 
@@ -56,66 +29,70 @@ export async function GET(req: NextRequest) {
   const dailyGoal = 20;
 
   if (!sinceIso) {
-    return json(200, { ok: true, doneToday: 0, dailyGoal });
+    return json(200, { ok: true, doneToday: 0, todayUsed: 0, dailyGoal, lastSessionAt: null });
   }
 
-  const scopeFolderIds = parseScope(req);
-
-  // Scope-aware: count reviews for cards in sessions that overlap scope
-  if (scopeFolderIds.length > 0) {
-    const { data: sess, error: sErr } = await sb
-      .from("flashcard_sessions")
-      .select("id")
-      .eq("owner_id", ownerId)
-      .overlaps("scope_folder_ids", scopeFolderIds)
-      .order("created_at", { ascending: false })
-      .limit(1000);
-
-    if (sErr) {
-      return json(500, { ok: false, error: "Kunne ikke hente sessions for scope.", detail: String(sErr.message ?? sErr) });
-    }
-
-    const sessionIds = (sess ?? []).map((r: any) => String(r.id));
-    if (sessionIds.length === 0) return json(200, { ok: true, doneToday: 0, dailyGoal });
-
-    const { data: cards, error: cErr } = await sb
-      .from("flashcard_cards")
-      .select("id")
-      .eq("owner_id", ownerId)
-      .in("session_id", sessionIds)
-      .limit(5000);
-
-    if (cErr) {
-      return json(500, { ok: false, error: "Kunne ikke hente cards for scope.", detail: String(cErr.message ?? cErr) });
-    }
-
-    const cardIds = (cards ?? []).map((r: any) => String(r.id));
-    if (cardIds.length === 0) return json(200, { ok: true, doneToday: 0, dailyGoal });
-
-    const { count, error: rErr } = await sb
-      .from("flashcard_reviews")
-      .select("id", { count: "exact", head: true })
-      .eq("owner_id", ownerId)
-      .gte("created_at", sinceIso)
-      .in("card_id", cardIds);
-
-    if (rErr) {
-      return json(500, { ok: false, error: "Kunne ikke hente doneToday (scope).", detail: String(rErr.message ?? rErr) });
-    }
-
-    return json(200, { ok: true, doneToday: count ?? 0, dailyGoal });
+  const scope = parseScopeFolderIds(req);
+  const scopeFolderIds = scope.scopeFolderIds;
+  if (scope.hadInvalidScope && process.env.NODE_ENV !== "production") {
+    console.warn("[flashcards/progress] invalid scope values ignored:", scope.rawScopeFolderIds);
   }
-
-  // No scope: count all reviews since
-  const { count, error } = await sb
-    .from("flashcard_reviews")
-    .select("id", { count: "exact", head: true })
+  const q = sb
+    .from("flashcard_sessions")
+    .select("id, scope_folder_ids, returned, requested, created_at")
     .eq("owner_id", ownerId)
-    .gte("created_at", sinceIso);
+    .gte("created_at", sinceIso)
+    .order("created_at", { ascending: false })
+    .limit(1000);
 
+  const { data: sessions, error } = await q;
   if (error) {
-    return json(500, { ok: false, error: "Kunne ikke hente doneToday.", detail: String(error.message ?? error) });
+    return json(500, { ok: false, error: "Kunne ikke hente flashcards-progress.", detail: String(error.message ?? error) });
   }
 
-  return json(200, { ok: true, doneToday: count ?? 0, dailyGoal });
+  const allRows = (sessions ?? []) as Array<{
+    id?: string | null;
+    scope_folder_ids?: string[] | null;
+    returned?: number | null;
+    requested?: number | null;
+    created_at?: string | null;
+  }>;
+  const rows = allRows.filter((r) => hasScopeOverlap(r.scope_folder_ids, scopeFolderIds));
+  const dedupedMap = new Map<string, (typeof rows)[number]>();
+  const withoutId: (typeof rows)[number][] = [];
+  for (const row of rows) {
+    const id = String(row?.id ?? "").trim();
+    if (!id) {
+      withoutId.push(row);
+      continue;
+    }
+    if (!dedupedMap.has(id)) dedupedMap.set(id, row);
+  }
+  const deduped = [...Array.from(dedupedMap.values()), ...withoutId].sort((a, b) =>
+    String(b?.created_at ?? "").localeCompare(String(a?.created_at ?? "")),
+  );
+
+  let todayUsed = 0;
+  for (const row of deduped) {
+    const returned = Number(row?.returned);
+    const requested = Number(row?.requested);
+    if (Number.isFinite(returned)) {
+      todayUsed += Math.max(0, Math.round(returned));
+    } else if (Number.isFinite(requested)) {
+      todayUsed += Math.max(0, Math.round(requested));
+    }
+  }
+
+  if (process.env.NODE_ENV !== "production" && scopeFolderIds.length > 1) {
+    console.log("[flashcards/progress] multi-scope dedupe", {
+      scopeFolderIds,
+      rowsBefore: allRows.length,
+      rowsAfterFilter: rows.length,
+      rowsAfterDedupe: deduped.length,
+      usedToday: todayUsed,
+    });
+  }
+
+  const lastSessionAt = deduped[0]?.created_at ?? null;
+  return json(200, { ok: true, doneToday: todayUsed, todayUsed, dailyGoal, lastSessionAt });
 }

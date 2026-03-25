@@ -1,6 +1,9 @@
 import "server-only";
 
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import FlashcardsClient from "./FlashcardsClient";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
@@ -9,11 +12,57 @@ type SearchParams =
   | undefined;
 
 function parseScopeIds(scopeRaw: unknown): string[] {
-  const s = typeof scopeRaw === "string" ? scopeRaw : "";
-  return s
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
+  if (typeof scopeRaw === "string") {
+    return scopeRaw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  if (Array.isArray(scopeRaw)) {
+    return scopeRaw
+      .join(",")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+async function getOwnerId(sb: any): Promise<string | null> {
+  try {
+    if (sb?.auth?.getUser) {
+      const { data } = await sb.auth.getUser();
+      if (data?.user?.id) return data.user.id as string;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+async function getResolvedScope(sb: any, ownerId: string, folderIds: string[]) {
+  if (!folderIds.length) return { scopeFolderIds: [] as string[], names: [] as string[] };
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .in("id", folderIds);
+
+  if (error) {
+    console.error("[flashcards/page] folders load error:", error);
+    return { scopeFolderIds: [] as string[], names: [] as string[] };
+  }
+
+  const map = new Map<string, string>();
+  for (const r of (data ?? []) as any[]) {
+    const id = String(r.id);
+    const name = String(r.name ?? "").trim();
+    if (id && name) map.set(id, name);
+  }
+
+  const scopeFolderIds = folderIds.filter((id) => map.has(id));
+  const names = scopeFolderIds.map((id) => map.get(id) as string);
+  return { scopeFolderIds, names };
 }
 
 export default async function Page({
@@ -21,15 +70,22 @@ export default async function Page({
 }: {
   searchParams?: Promise<SearchParams>;
 }) {
-  const sp = (await searchParams) ?? {};
-  const scopeFolderIds = parseScopeIds(sp.scope);
+  const sb = await supabaseServerRSC();
+  const ownerId = await getOwnerId(sb);
+  if (!ownerId) {
+    return (
+      <section className="p-6 text-sm text-red-600">
+        Du skal være logget ind for at åbne Flashcards.
+      </section>
+    );
+  }
 
-  const label =
-    scopeFolderIds.length === 0
-      ? "Alle mapper"
-      : scopeFolderIds.length === 1
-        ? "1 valgt mappe"
-        : `${scopeFolderIds.length} valgte mapper`;
+  const sp = (await searchParams) ?? {};
+  const requestedScopeFolderIds = parseScopeIds(sp.scope);
+  const resolvedScope = await getResolvedScope(sb, ownerId, requestedScopeFolderIds);
+  const scopeFolderIds = resolvedScope.scopeFolderIds;
+  const names = resolvedScope.names;
+  const hasScope = scopeFolderIds.length > 0;
 
   return (
     <section className="space-y-4">
@@ -41,18 +97,17 @@ export default async function Page({
         </p>
       </header>
 
-      <div className="rounded-2xl border border-zinc-200 bg-white p-4">
-        <div className="text-[11px] font-semibold tracking-wide text-zinc-500">
-          DU TRÆNER PÅ
-        </div>
-        <div className="mt-1 text-sm font-semibold text-zinc-900">{label}</div>
-        <div className="mt-1 text-xs text-zinc-600">
-          Du kan ændre mapper i venstre side, før du genererer en runde.
-        </div>
+      <TrainingScopeCard
+        names={names}
+        className="md:hidden"
+        emptyLabel="Vælg en mappe direkte her."
+        helpText={!hasScope ? "Flashcards er låst, indtil du har valgt en mappe." : undefined}
+      >
+        <FeatureScopePicker selectedNames={names} selectedScopeIds={scopeFolderIds} />
+      </TrainingScopeCard>
 
-        <div className="mt-4">
-          <FlashcardsClient scopeFolderIds={scopeFolderIds} />
-        </div>
+      <div className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+        <FlashcardsClient scopeFolderIds={scopeFolderIds} />
       </div>
     </section>
   );

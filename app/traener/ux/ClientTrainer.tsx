@@ -1,9 +1,15 @@
 ﻿// app/traener/ux/ClientTrainer.tsx
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import LimitNotice from "../_ui/LimitNotice";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
+import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 type Folder = { id: string; name: string };
 
@@ -12,6 +18,9 @@ type Props = {
   activeFolderId?: string | null;
   folders?: Folder[];
   scopeFolderIds?: string[];
+  showFirstUseCta?: boolean;
+  demoMode?: boolean;
+  demoScopeName?: string | null;
 
   folderId?: string | null;
   folderName?: string | null;
@@ -33,6 +42,8 @@ type EvalResult = {
   usedFileId: string | null;
 };
 
+type FocusMode = "normal" | "weakest";
+
 type CitationObj = {
   chunkId?: string;
   id?: string;
@@ -43,6 +54,43 @@ type CitationObj = {
 };
 
 const EVAL_ATTEMPTS_MAX = 2;
+const EVAL_LOADING_STEPS = [
+  "Læser dit svar…",
+  "Finder relevante pointer i materialet…",
+  "Vurderer faglighed og struktur…",
+  "Skriver feedback…",
+] as const;
+
+// Fixed demo hook: replace these constants if/when a stronger Samfund source is added.
+const DEMO_SOURCE_TITLE = "Samfund: velfærdsstat og politisk deltagelse (demo)";
+const DEMO_SOURCE_URL = "/traener?demo=1";
+const DEMO_QUESTION =
+  "Redegør for, hvordan den danske velfærdsstat finansieres gennem skatter og afgifter.\n\nVurder kort, hvordan høj skat både kan styrke velfærden og skabe udfordringer for borgere eller virksomheder. Brug centrale samfundsfaglige begreber i din forklaring.";
+const DEMO_KEYWORDS = ["skat", "velfærdsstat", "offentlige ydelser", "fordel", "udfordring", "omfordeling", "borger"] as const;
+
+function preserveDanishText(value: string) {
+  return String(value ?? "").normalize("NFC");
+}
+
+async function trackClientEvent(eventName: string, metadata?: Record<string, unknown>) {
+  const payload = JSON.stringify({ eventName, metadata: metadata ?? {} });
+  try {
+    if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+      const blob = new Blob([payload], { type: "application/json" });
+      const queued = navigator.sendBeacon("/api/track", blob);
+      if (queued) return;
+    }
+
+    await fetch("/api/track", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: payload,
+    });
+  } catch {
+    // best effort
+  }
+}
 
 function clampScore(x: unknown): number | null {
   const n = typeof x === "number" ? x : Number(x);
@@ -117,14 +165,67 @@ function citationLabel(c: Citation, i: number) {
   return c.title || c.url || `Kilde ${i + 1}`;
 }
 
-async function readJsonSafe(res: Response) {
-  const text = await res.text();
-  try {
-    return text.trim() ? JSON.parse(text) : {};
-  } catch {
-    const snippet = text.replace(/\s+/g, " ").slice(0, 160);
-    throw new Error(`HTTP ${res.status}: ${snippet}`);
+function evaluateDemoAnswer(answer: string): EvalResult {
+  const lower = answer.toLowerCase();
+  const found = DEMO_KEYWORDS.filter((keyword) => lower.includes(keyword));
+  const coverage = DEMO_KEYWORDS.length > 0 ? found.length / DEMO_KEYWORDS.length : 0;
+  const score = Math.max(35, Math.min(100, Math.round(coverage * 100)));
+  const answerLength = answer.trim().length;
+  const mentionsPublicServices = /(offentlige ydelser|sundhed|uddannelse|velfærd)/.test(lower);
+  const mentionsTradeoff = /(udfordring|ulempe|arbejdsudbud|virksom|incitament|konkurrence)/.test(lower);
+
+  let overall = "Overordnet et fint udgangspunkt, hvor du viser forståelse for sammenhængen mellem skat og finansiering af velfærdsstaten.";
+  let strengths = ["Du rammer emnet og får koblet skat til finansiering af velfærdsstaten på en fagligt relevant måde."];
+  let improvements = ["Gør diskussionen skarpere ved tydeligt at skille mellem fordelene ved finansiering og de mulige samfundsøkonomiske omkostninger."];
+  const nextSteps = ["Skriv et forbedret svar, hvor du bruger 2-3 centrale begreber og afslutter med en kort samlet vurdering."];
+
+  if (coverage >= 0.72) {
+    overall = "Overordnet et stærkt og træner-relevant svar, hvor du både redegør og vurderer med en klar faglig retning.";
+    strengths = [
+      "Du kommer godt omkring både finansiering, omfordeling og konsekvenserne af høj skat.",
+      "Svaret ligner en rigtig træner-besvarelse, fordi du både redegør og vurderer i samme svar.",
+    ];
+    improvements = [
+      "Løft svaret yderligere ved at bruge endnu tydeligere fagbegreber.",
+      "Afslut gerne med en kort samlet vurdering af balancen mellem tryghed og incitamenter.",
+    ];
+  } else if (coverage >= 0.45) {
+    overall = "Overordnet et fornuftigt svar, som er på rette vej, men som stadig kan blive mere præcist og mere vurderende.";
+    strengths = ["Du har et fornuftigt fagligt udgangspunkt og får koblet skat til velfærdsstaten på en måde, der fungerer i Trainer."];
   }
+
+  if (!mentionsPublicServices) {
+    improvements.push("Nævn gerne konkrete offentlige ydelser som sundhed, uddannelse eller overførsler.");
+  }
+
+  if (!mentionsTradeoff) {
+    improvements.push("Få også en tydelig udfordring med, fx arbejdsudbud, incitament eller konkurrenceevne.");
+  }
+
+  if (answerLength < 180) {
+    improvements.push("Skriv lidt mere uddybende, så din argumentation bliver lettere at vurdere.");
+  }
+
+  const feedback = buildTrainerFeedbackText({
+    overall,
+    strengths,
+    improvements,
+    nextSteps,
+  });
+
+  return {
+    score,
+    feedback,
+    usedFileId: "demo-samfund-source",
+    citations: [
+      {
+        chunkId: "demo-samfund-source",
+        fileId: null,
+        title: DEMO_SOURCE_TITLE,
+        url: DEMO_SOURCE_URL,
+      },
+    ],
+  };
 }
 
 function clampInt(n: any, min: number, max: number) {
@@ -141,9 +242,7 @@ function pickTrainerQuota(json: any): { used: number; limit: number | null } {
 
   const limit =
     (typeof json?.trainer_round?.limitPerMonth === "number" ? json.trainer_round.limitPerMonth : null) ??
-    (typeof json?.trainer_round?.limit_per_month === "number" ? json.trainer_round.limit_per_month : null) ??
     (typeof json?.trainerLimitPerMonth === "number" ? json.trainerLimitPerMonth : null) ??
-    (typeof json?.trainer_round?.monthlyLimit === "number" ? json.trainer_round.monthlyLimit : null) ??
     null;
 
   return { used: clampInt(used, 0, 1_000_000), limit: typeof limit === "number" ? clampInt(limit, 0, 1_000_000) : null };
@@ -154,22 +253,30 @@ export default function ClientTrainer({
   activeFolderId,
   folders,
   scopeFolderIds,
+  showFirstUseCta = false,
+  demoMode = false,
+  demoScopeName = null,
   folderId,
-  folderName,
   noteId,
-  selectedNoteTitle,
 }: Props) {
   void ownerId;
 
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const prefillAppliedRef = useRef(false);
+  const [prefilledFolderId, setPrefilledFolderId] = useState<string | null>(null);
 
-  const effectiveFolderId = folderId ?? activeFolderId ?? null;
+  const effectiveFolderId = prefilledFolderId ?? folderId ?? activeFolderId ?? null;
+  const effectiveScopeFolderIds = useMemo(() => {
+    if ((scopeFolderIds?.length ?? 0) > 0) return scopeFolderIds ?? [];
+    return effectiveFolderId ? [effectiveFolderId] : [];
+  }, [scopeFolderIds, effectiveFolderId]);
 
-  const effectiveFolderName =
-    folderName ?? (effectiveFolderId ? folders?.find((f) => f.id === effectiveFolderId)?.name ?? null : null);
-
-  const scopeNames =
-    scopeFolderIds && folders ? folders.filter((f) => scopeFolderIds.includes(f.id)).map((f) => f.name) : [];
+  const selectedScopeNames = useMemo(() => {
+    const ids = Array.from(new Set(effectiveScopeFolderIds.map((id) => String(id ?? "").trim()).filter(Boolean)));
+    const folderMap = new Map((folders ?? []).map((f) => [f.id, f.name]));
+    return ids.map((id) => folderMap.get(id)).filter(Boolean) as string[];
+  }, [effectiveScopeFolderIds, folders]);
 
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
@@ -177,6 +284,7 @@ export default function ClientTrainer({
 
   const [questionFileId, setQuestionFileId] = useState<string | null>(null);
   const [evalResult, setEvalResult] = useState<EvalResult | null>(null);
+  const questionTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // ✅ runde-id (betales på generate)
   const [roundId, setRoundId] = useState<string | null>(null);
@@ -189,35 +297,63 @@ export default function ClientTrainer({
 
   const [loadingQuestion, setLoadingQuestion] = useState(false);
   const [loadingEval, setLoadingEval] = useState(false);
-  const [savingNote, setSavingNote] = useState(false);
-
-  const [noteSavedMsg, setNoteSavedMsg] = useState<string | null>(null);
+  const [loadingEvalStep, setLoadingEvalStep] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [focusMode, setFocusMode] = useState<FocusMode>("normal");
 
   // ✅ quota state som MC: vis med det samme + disable knap
   const [limitReached, setLimitReached] = useState(false);
   const [limitMessage, setLimitMessage] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (prefillAppliedRef.current) return;
+
+    const folderParam = searchParams.get("folder");
+    const scopeParam = searchParams.get("scope");
+    const focusParam = searchParams.get("focus");
+
+    if (!folderParam && !focusParam) {
+      prefillAppliedRef.current = true;
+      return;
+    }
+
+    if (scopeParam) {
+      setFocusMode(focusParam === "weakest" ? "weakest" : "normal");
+      prefillAppliedRef.current = true;
+      return;
+    }
+
+    const canValidate = Array.isArray(scopeFolderIds) || Array.isArray(folders);
+    if (folderParam && !canValidate) return;
+
+    const folderAllowed =
+      !!folderParam &&
+      (((scopeFolderIds?.length ?? 0) > 0 && (scopeFolderIds?.includes(folderParam) ?? false)) ||
+        (folders?.some((f) => f.id === folderParam) ?? false));
+
+    if (folderAllowed) {
+      setPrefilledFolderId(folderParam);
+      setFocusMode(focusParam === "weakest" ? "weakest" : "normal");
+      router.replace(`/traener?scope=${encodeURIComponent(folderParam)}`);
+    } else {
+      setFocusMode("normal");
+      router.replace("/traener");
+    }
+
+    prefillAppliedRef.current = true;
+  }, [folders, router, scopeFolderIds, searchParams]);
+
+  useEffect(() => {
+    const el = questionTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+    el.style.overflowY = "hidden";
+  }, [question]);
+
   const clearMessages = () => {
     setErrorMsg(null);
-    setNoteSavedMsg(null);
   };
-
-  const scopeLabel = (() => {
-    if (noteId) {
-      return selectedNoteTitle ? `Udvalgt materiale: ${selectedNoteTitle}` : "Udvalgt materiale i mappen";
-    }
-
-    if (scopeNames.length > 1) {
-      const preview = scopeNames.length <= 3 ? scopeNames.join(", ") : `${scopeNames.slice(0, 3).join(", ")} m.fl.`;
-      return `Flere mapper: ${preview}`;
-    }
-
-    if (scopeNames.length === 1) return `Hele mappen: ${scopeNames[0]}`;
-    if (effectiveFolderName) return `Hele mappen: ${effectiveFolderName}`;
-
-    return "Vælg en mappe eller et materiale i venstre side.";
-  })();
 
   const dispatchQuotaChanged = () => {
     try {
@@ -228,12 +364,14 @@ export default function ClientTrainer({
   };
 
   const checkQuotaNow = useMemo(() => {
-    return async () => {
+    return async (force = false) => {
+      if (demoMode) {
+        setLimitReached(false);
+        setLimitMessage(null);
+        return;
+      }
       try {
-        const res = await fetch("/api/quota/current", { method: "GET", cache: "no-store" });
-        if (!res.ok) return;
-
-        const json = await readJsonSafe(res).catch(() => null);
+        const json = await fetchQuotaCurrent({ force });
         if (!json?.ok) return;
 
         const { used, limit } = pickTrainerQuota(json);
@@ -248,7 +386,7 @@ export default function ClientTrainer({
         // fail-open
       }
     };
-  }, []);
+  }, [demoMode]);
 
   // ✅ ved load + når sidebar siger quota ændret
   useEffect(() => {
@@ -259,7 +397,7 @@ export default function ClientTrainer({
       await checkQuotaNow();
     })();
 
-    const onQuota = () => void checkQuotaNow();
+    const onQuota = () => void checkQuotaNow(true);
     window.addEventListener("notely-quota-changed", onQuota);
     return () => {
       alive = false;
@@ -267,21 +405,66 @@ export default function ClientTrainer({
     };
   }, [checkQuotaNow]);
 
+  useEffect(() => {
+    if (!loadingEval) {
+      setLoadingEvalStep(0);
+      return;
+    }
+
+    setLoadingEvalStep(0);
+    const timeouts = [
+      window.setTimeout(() => setLoadingEvalStep(1), 3000),
+      window.setTimeout(() => setLoadingEvalStep(2), 6000),
+      window.setTimeout(() => setLoadingEvalStep(3), 9000),
+    ];
+
+    return () => {
+      for (const timeoutId of timeouts) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [loadingEval]);
+
+  const hasSelectedFolder = !!effectiveFolderId || effectiveScopeFolderIds.length > 0;
+  const effectiveFocusMode: FocusMode = !demoMode && hasSelectedFolder ? focusMode : "normal";
+
   const handleGenerateQuestion = async () => {
     clearMessages();
 
     if (limitReached) return;
+    if (!demoMode && !hasSelectedFolder) {
+      setErrorMsg("Vælg en mappe før du genererer et spørgsmål.");
+      return;
+    }
 
     setLoadingQuestion(true);
 
     try {
+      if (demoMode) {
+        setQuestion(preserveDanishText(DEMO_QUESTION));
+        setQuestionEditable(false);
+        setAnswer("");
+        setEvalResult(null);
+        setQuestionFileId("demo-samfund-source");
+        setRoundId("demo-samfund-round");
+        setEvalAttemptsUsed(0);
+        void trackClientEvent("trainer_question_generated", {
+          source: "demo",
+          file_id: "demo-samfund-source",
+          feature: "trainer",
+          scope: demoScopeName ?? "Samfund",
+        });
+        return;
+      }
+
       const res = await fetch("/api/generate-question", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           folderId: effectiveFolderId ?? null,
-          scopeFolderIds: scopeFolderIds ?? [],
+          scopeFolderIds: effectiveScopeFolderIds,
           roundId,
+          focusMode: effectiveFocusMode,
         }),
       });
 
@@ -310,7 +493,7 @@ export default function ClientTrainer({
       const newRoundIdRaw = (data as any)?.roundId ?? (data as any)?.round_id ?? null;
       const newRoundId = newRoundIdRaw ? String(newRoundIdRaw) : null;
 
-      setQuestion(String(q));
+      setQuestion(preserveDanishText(String(q)));
       setQuestionEditable(false);
       setAnswer("");
       setEvalResult(null);
@@ -352,6 +535,18 @@ export default function ClientTrainer({
     setLoadingEval(true);
 
     try {
+      if (demoMode) {
+        setEvalResult(evaluateDemoAnswer(answer));
+        setEvalAttemptsUsed((n) => Math.min(EVAL_ATTEMPTS_MAX, n + 1));
+        void trackClientEvent("trainer_answer_evaluated", {
+          source: "demo",
+          file_id: "demo-samfund-source",
+          feature: "trainer",
+          scope: demoScopeName ?? "Samfund",
+        });
+        return;
+      }
+
       const res = await fetch("/api/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -362,7 +557,7 @@ export default function ClientTrainer({
           includeBackground,
           folder_id: effectiveFolderId ?? null,
           note_id: noteId ?? null,
-          scopeFolderIds: scopeFolderIds ?? [],
+          scopeFolderIds: effectiveScopeFolderIds,
           source_type: "trainer",
 
           round_id: roundId,
@@ -410,82 +605,90 @@ export default function ClientTrainer({
     }
   };
 
-  const handleSaveNote = async () => {
-    clearMessages();
-
-    if (!question && !answer && !evalResult?.feedback) {
-      setErrorMsg("Der er intet at gemme som note endnu.");
-      return;
-    }
-
-    setSavingNote(true);
-
-    try {
-      const baseTitle = effectiveFolderName ? `${effectiveFolderName} – træner` : "Træner";
-
-      const title =
-        noteId && selectedNoteTitle
-          ? `${baseTitle}: ${selectedNoteTitle}`
-          : `${baseTitle}: ${question ? question.replace(/\s+/g, " ").slice(0, 80) : "Øvelse"}`;
-
-      const citationsLines =
-        evalResult?.citations?.length
-          ? dedupeCitations(evalResult.citations).map((c, idx) => {
-              const label = citationLabel(c, idx);
-              return c.url ? `- ${label} (${c.url})` : `- ${label}`;
-            })
-          : [];
-
-      const contentLines = [
-        question ? `**Spørgsmål**\n${question}` : "",
-        answer ? `\n\n**Svar**\n${answer}` : "",
-        evalResult?.score != null ? `\n\n**Score**: ${evalResult.score}/100` : "",
-        evalResult?.feedback ? `\n\n**Feedback**\n${evalResult.feedback}` : "",
-        citationsLines.length ? `\n\n**Kilder**\n${citationsLines.join("\n")}` : "",
-      ].filter(Boolean);
-
-      const content = contentLines.join("");
-
-      const res = await fetch("/api/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title,
-          content,
-          source_title: "Træner",
-          source_url: "/traener",
-          folder_id: effectiveFolderId ?? null,
-          note_type: "trainer_feedback",
-        }),
-      });
-
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data) {
-        const msg = (data as any)?.error || "Kunne ikke gemme note";
-        throw new Error(msg);
-      }
-
-      setNoteSavedMsg("Note gemt.");
-      router.refresh();
-    } catch (err: any) {
-      setErrorMsg(err?.message || "Fejl ved gem som note.");
-    } finally {
-      setSavingNote(false);
-    }
-  };
-
   const evalBtnText =
-    loadingEval ? "Evaluerer..." : evalAttemptsUsed === 1 ? "Prøv igen" : "Evaluer svar";
+    loadingEval ? EVAL_LOADING_STEPS[loadingEvalStep] : evalAttemptsUsed === 1 ? "Prøv igen" : "Evaluer svar";
 
   const evalBtnDisabled = loadingEval || evalAttemptsUsed >= EVAL_ATTEMPTS_MAX;
+  const scopeEmptyLabel = showFirstUseCta
+    ? "Upload eget materiale eller prøv demo for at komme i gang."
+    : "Vælg eller skift mappe her.";
 
   return (
     <div className="space-y-4">
-      <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-1 text-base font-semibold">Valgt emne</h2>
-        <p className="text-xs text-zinc-600">Træn på hele mapper eller udvalgte noter/materialer fra venstre side.</p>
-        <p className="mt-1 text-xs text-zinc-500">{scopeLabel}</p>
-      </section>
+      {showFirstUseCta ? (
+        <section className="rounded-2xl border border-zinc-200 bg-zinc-50 p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-zinc-900">Kom i gang</h2>
+          <p className="mt-1 text-sm text-zinc-600">
+            Du har ikke eget materiale klar endnu. Du kan starte med en demo eller uploade dit eget materiale.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+                          <Link
+                            href="/traener?demo=1"
+                            className="rounded-lg border px-3 py-2 text-xs font-medium text-black"
+                            onClick={() =>
+                              void trackClientEvent("demo_started", {
+                                source: "demo",
+                                feature: "trainer",
+                                scope: "Samfund",
+                              })
+                            }
+                            style={{
+                              borderColor: "#ffbf00",
+                              backgroundColor: "#ffbf00",
+                              color: "#000000",
+                            }}
+                          >
+              Prøv demo
+            </Link>
+            <Link
+              href="/traener/upload"
+              className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs font-medium text-zinc-900 hover:bg-zinc-50"
+            >
+              Upload eget materiale
+            </Link>
+          </div>
+        </section>
+      ) : null}
+
+      <TrainingScopeCard names={selectedScopeNames} className="p-4 md:hidden" emptyLabel={scopeEmptyLabel}>
+        {!demoMode ? (
+          <FeatureScopePicker selectedNames={selectedScopeNames} selectedScopeIds={effectiveScopeFolderIds} />
+        ) : null}
+        {demoMode ? (
+          <div
+            className="mb-3 inline-flex rounded-full border px-2 py-1 text-[11px] font-medium"
+            style={{
+              borderColor: "#ffbf00",
+              backgroundColor: "#ffbf00",
+              color: "#000000",
+            }}
+          >
+            Demo-materiale
+          </div>
+        ) : null}
+        {!demoMode ? (
+          <label className="mt-3 inline-flex items-start gap-2 text-xs text-zinc-700">
+            <input
+              type="checkbox"
+              checked={effectiveFocusMode === "weakest"}
+              disabled={!hasSelectedFolder}
+              onChange={(e) => setFocusMode(e.target.checked ? "weakest" : "normal")}
+              className="mt-0.5 h-4 w-4 rounded border-zinc-300 accent-black text-zinc-900 focus:ring-zinc-900/20 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <span>
+              <span className="block font-medium">Træn på mine svage punkter</span>
+              <span className="block text-zinc-500">Bruger seneste vurderinger i valgt mappe.</span>
+            </span>
+          </label>
+        ) : null}
+        {effectiveFocusMode === "weakest" ? (
+          <div className="mt-2">
+            <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-medium text-emerald-700">
+              Målrettet
+            </span>
+          </div>
+        ) : null}
+      </TrainingScopeCard>
 
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
@@ -505,7 +708,7 @@ export default function ClientTrainer({
             <button
               type="button"
               onClick={handleGenerateQuestion}
-              disabled={loadingQuestion || limitReached}
+              disabled={loadingQuestion || limitReached || (!demoMode && !hasSelectedFolder)}
               className="rounded-lg border border-zinc-200 bg-zinc-100 px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-200 disabled:opacity-50"
             >
               {loadingQuestion ? "Genererer..." : "Generér nyt spørgsmål"}
@@ -515,18 +718,29 @@ export default function ClientTrainer({
 
         {limitReached ? <LimitNotice feature="trainer_round" message={limitMessage} /> : null}
 
+        {!question ? (
+          <div className="rounded-xl border border-dashed border-zinc-200 bg-zinc-50 px-3 py-3 text-sm text-zinc-600">
+            Generér et spørgsmål, når du er klar. Notely laver en øvelse ud fra dit valgte materiale.
+          </div>
+        ) : null}
+
         <textarea
+          ref={questionTextareaRef}
           readOnly={!questionEditable}
           className="mt-1 w-full min-h-[96px] rounded-xl border border-zinc-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-zinc-900/5 read-only:bg-zinc-50"
           value={question}
           onChange={(e) => {
             clearMessages();
-            setQuestion(e.target.value);
+            setQuestion(preserveDanishText(e.target.value));
           }}
-          placeholder="Tryk “Generér nyt spørgsmål” for at starte."
+          placeholder="Dit spørgsmål vises her."
         />
 
-        <p className="text-[10px] text-zinc-500">Du kan tilpasse spørgsmålet til det stof, du vil træne.</p>
+        <p className="text-[10px] text-zinc-500">
+          {demoMode
+            ? `Demoen bruger en fast ${demoScopeName ?? "Samfund"}-kilde, så du kan prøve træner-flowet uden eget materiale.`
+            : "Du kan tilpasse spørgsmålet til det stof, du vil træne."}
+        </p>
       </section>
 
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
@@ -543,6 +757,10 @@ export default function ClientTrainer({
           </button>
         </div>
 
+        {!question ? (
+          <p className="text-xs text-zinc-500">Når du har et spørgsmål, kan du skrive dit svar her og få feedback.</p>
+        ) : null}
+
         <textarea
           className="mt-1 w-full min-h-[140px] rounded-xl border border-zinc-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-zinc-900/5"
           value={answer}
@@ -550,21 +768,13 @@ export default function ClientTrainer({
             clearMessages();
             setAnswer(e.target.value);
           }}
-          placeholder="Skriv dit svar her..."
+          placeholder={question ? "Skriv dit svar her..." : "Dit svarfelt bliver klar, når du har et spørgsmål."}
         />
       </section>
 
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-semibold">Feedback</h3>
-          <button
-            type="button"
-            onClick={handleSaveNote}
-            disabled={savingNote}
-            className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs hover:bg-zinc-50 disabled:opacity-60"
-          >
-            {savingNote ? "Gemmer..." : "Gem som note"}
-          </button>
         </div>
 
         <div className="text-xs text-zinc-600">
@@ -596,16 +806,10 @@ export default function ClientTrainer({
               )}
             </>
           ) : (
-            <p>Ingen feedback endnu. Skriv dit svar og tryk &quot;Evaluer svar&quot;.</p>
+            <p>{question ? "Skriv dit svar og tryk på “Evaluer svar”, så får du konkret feedback her." : "Din feedback vises her, når du har arbejdet med et spørgsmål."}</p>
           )}
         </div>
       </section>
-
-      {noteSavedMsg && (
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-          {noteSavedMsg}
-        </div>
-      )}
       {errorMsg && (
         <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           {errorMsg}

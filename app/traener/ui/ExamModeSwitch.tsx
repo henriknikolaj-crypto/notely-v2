@@ -27,7 +27,7 @@ export default function ExamModeSwitch() {
           onWritten ? "bg-black text-white" : "bg-white text-zinc-900 hover:bg-zinc-50"
         )}
       >
-        Skrift
+        Skriftlig
       </Link>
 
       <Link
