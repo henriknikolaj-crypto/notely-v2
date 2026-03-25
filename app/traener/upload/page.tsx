@@ -1,7 +1,7 @@
 ﻿// app/traener/upload/page.tsx
 import "server-only";
 
-import Link from "next/link";
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import UploadClient from "./UploadClient";
 import FolderManagerClient from "./FolderManagerClient";
@@ -20,7 +20,6 @@ type FolderRow = {
 
 async function getOwnerCtxRsc(sb: any): Promise<
   | { ownerId: string; mode: "auth"; email: string | null }
-  | { ownerId: string; mode: "dev"; email: null }
   | null
 > {
   try {
@@ -29,9 +28,6 @@ async function getOwnerCtxRsc(sb: any): Promise<
   } catch {
     // ignore
   }
-
-  const dev = (process.env.DEV_USER_ID ?? "").trim();
-  if (dev) return { ownerId: dev, mode: "dev", email: null };
 
   return null;
 }
@@ -45,14 +41,7 @@ export default async function UploadPage({
   const owner = await getOwnerCtxRsc(sb);
 
   if (!owner?.ownerId) {
-    return (
-      <main className="min-h-screen bg-[#fffef9] p-6 text-sm text-zinc-800">
-        <p>Du er ikke logget ind.</p>
-        <Link href="/auth/login" className="mt-2 inline-block rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
-          Gå til login
-        </Link>
-      </main>
-    );
+    redirect("/auth/login");
   }
 
   const ownerId = owner.ownerId;
@@ -103,12 +92,6 @@ export default async function UploadPage({
             <p className="mt-1 text-sm text-zinc-600">
               Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
             </p>
-
-            {owner.mode === "dev" && (
-              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                Du kører i <b>DEV</b> (DEV_USER_ID). Log ind for at se dine egne data.
-              </div>
-            )}
           </header>
 
           <ImportStatusBox folderId={null} />

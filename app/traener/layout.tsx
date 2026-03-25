@@ -27,13 +27,19 @@ type LatestNoteRow = {
   created_at: string | null;
 };
 
-async function getOwnerId(sb: any): Promise<string | null> {
+async function getOwnerCtx(sb: any): Promise<{ id: string; email: string | null } | null> {
   try {
     const { data } = await sb.auth.getUser();
-    return (data?.user?.id as string) ?? null;
+    if (data?.user?.id) {
+      return {
+        id: String(data.user.id),
+        email: (data.user.email as string | null | undefined) ?? null,
+      };
+    }
   } catch {
-    return null;
+    // ignore
   }
+  return null;
 }
 
 const TRAINER_NOTE_TYPES = ["feedback", "trainer", "trainer_feedback"];
@@ -44,11 +50,12 @@ export default async function TraenerLayout({
   children: React.ReactNode;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const owner = await getOwnerCtx(sb);
 
-  if (!ownerId) {
+  if (!owner?.id) {
     redirect("/auth/login");
   }
+  const ownerId = owner.id;
 
   // ---- Mapper i venstre træ ----
   const { data: foldersData, error: foldersError } = await sb
@@ -177,7 +184,7 @@ export default async function TraenerLayout({
           </Link>
           <div className="flex items-center gap-3">
             <span className="text-xs text-zinc-700">
-              henriknikolaj@gmail.com
+              {owner.email ?? ""}
             </span>
             <Link
               href="/auth/logout"
