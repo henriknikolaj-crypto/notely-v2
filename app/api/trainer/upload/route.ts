@@ -9,7 +9,13 @@ import { buildChunksFromExtractedPages } from "@/lib/pdf/chunkStructuredPages";
 import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
 import { quotaTryConsume } from "@/lib/quota/rpc";
 import { resolveModelForFeature } from "@/lib/openai/model";
-import { FREEMIUM_NOTES_LIMIT_MESSAGE, getNoteEntitlement } from "@/lib/notes/entitlements";
+import {
+  assertCanGenerateNoteType,
+  FREEMIUM_FOCUS_MONTHLY_LIMIT_MESSAGE,
+  FREEMIUM_NOTES_LIMIT_MESSAGE,
+  FREEMIUM_SUMMARY_MONTHLY_LIMIT_MESSAGE,
+  getNoteEntitlement,
+} from "@/lib/notes/entitlements";
 import { generateNotesForFile } from "@/lib/notes/generateFromFile";
 import { requireUser } from "@/lib/auth";
 import { ensureProfile } from "@/lib/server/ensureProfile";
@@ -676,6 +682,9 @@ export async function POST(req: NextRequest) {
     if (uploadKind === "audio") {
       try {
         const requestedModes = parseRequestedNoteModes(form.get("audio_note_mode"));
+        for (const mode of requestedModes) {
+          await assertCanGenerateNoteType(admin, ownerId, mode === "golden" ? "focus" : "resume");
+        }
         const noteEntitlement = await getNoteEntitlement(admin, ownerId);
         if (
           noteEntitlement.maxStoredNotes != null &&
@@ -698,6 +707,18 @@ export async function POST(req: NextRequest) {
         if (String(e?.code ?? "") === "NOTES_LIMIT_REACHED") {
           return NextResponse.json(
             { ok: false, code: "NOTES_LIMIT_REACHED", error: FREEMIUM_NOTES_LIMIT_MESSAGE, requestId },
+            { status: 403 },
+          );
+        }
+        if (String(e?.code ?? "") === "NOTES_SUMMARY_MONTHLY_LIMIT_REACHED") {
+          return NextResponse.json(
+            { ok: false, code: "NOTES_SUMMARY_MONTHLY_LIMIT_REACHED", error: FREEMIUM_SUMMARY_MONTHLY_LIMIT_MESSAGE, requestId },
+            { status: 403 },
+          );
+        }
+        if (String(e?.code ?? "") === "NOTES_FOCUS_MONTHLY_LIMIT_REACHED") {
+          return NextResponse.json(
+            { ok: false, code: "NOTES_FOCUS_MONTHLY_LIMIT_REACHED", error: FREEMIUM_FOCUS_MONTHLY_LIMIT_MESSAGE, requestId },
             { status: 403 },
           );
         }
@@ -807,6 +828,5 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: e?.message ?? "Uventet fejl i upload.", requestId }, { status: 500 });
   }
 }
-
 
 

@@ -431,6 +431,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         return;
       }
 
+      if (res.status === 403) {
+        const j = safeJson(await res.text());
+        setUploadNotice(String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."));
+        return;
+      }
+
       if (!res.ok) {
         const j = safeJson(await res.text());
         setUploadError(String(j?.message ?? j?.error ?? `Upload fejlede (${res.status}).`));

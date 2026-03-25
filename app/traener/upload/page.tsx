@@ -1,11 +1,10 @@
 ﻿// app/traener/upload/page.tsx
 import "server-only";
 
-import Link from "next/link";
+import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import ImportStatusBox from "./ImportStatusBox";
 import UploadPageClient from "./UploadPageClient";
-import AuthStateNotice from "@/components/ui/AuthStateNotice";
 
 export const dynamic = "force-dynamic";
 
@@ -18,21 +17,13 @@ type FolderRow = {
   end_date?: string | null;
 };
 
-async function getOwnerCtxRsc(sb: any): Promise<
-  | { ownerId: string; mode: "auth"; email: string | null }
-  | { ownerId: string; mode: "dev"; email: null }
-  | null
-> {
+async function getOwnerId(sb: any): Promise<string | null> {
   try {
     const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return { ownerId: data.user.id as string, mode: "auth", email: data.user.email ?? null };
+    if (data?.user?.id) return data.user.id as string;
   } catch {
     // ignore
   }
-
-  const dev = (process.env.DEV_USER_ID ?? "").trim();
-  if (dev) return { ownerId: dev, mode: "dev", email: null };
-
   return null;
 }
 
@@ -42,35 +33,9 @@ export default async function UploadPage({
   searchParams?: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const sb = await supabaseServerRSC();
-  const owner = await getOwnerCtxRsc(sb);
+  const ownerId = await getOwnerId(sb);
 
-  if (!owner?.ownerId) {
-    return (
-      <main className="min-h-screen bg-[#fffef9] p-6 text-sm text-zinc-800">
-        <p>Du er ikke logget ind.</p>
-        <Link href="/auth/login" className="mt-2 inline-block rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
-          Gå til login
-        </Link>
-      </main>
-    );
-  }
-
-  const ownerId = owner.ownerId;
-
-  if (owner.mode === "dev") {
-    return (
-      <section className="space-y-6">
-        <header className="border-b border-zinc-200 pb-3">
-          <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
-          <p className="mt-1 text-sm text-zinc-600">
-            Mobil-LAN kraever en rigtig login-session for stabile uploads, mapper og status-kald.
-          </p>
-        </header>
-
-        <AuthStateNotice message="Denne browser koerer kun paa serverens DEV_USER_ID fallback. Derfor vil klientkald til mapper, upload-status og filer ende i unauthorized. Log ind i samme browser for at bruge upload sikkert." />
-      </section>
-    );
-  }
+  if (!ownerId) redirect("/auth/login");
 
   const { data: foldersData, error: foldersError } = await sb
     .from("folders")
