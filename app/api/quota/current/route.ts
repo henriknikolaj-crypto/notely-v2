@@ -2,8 +2,9 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
-import { requireUser } from "@/lib/auth";
+import { getOwnerCtx } from "@/lib/auth/owner";
 import { getMonthlyNoteGenerationUsage } from "@/lib/notes/entitlements";
 import { quotaTryConsume } from "@/lib/quota/rpc";
 
@@ -92,6 +93,26 @@ function supabaseAdmin() {
 
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function supabaseAuthReadOnly(req: NextRequest) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !anon) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+  }
+
+  return createServerClient(url, anon, {
+    cookies: {
+      getAll() {
+        return req.cookies.getAll();
+      },
+      setAll() {
+        // Read-only auth lookup: quota/current må ikke cleare eller rotere auth-cookies.
+      },
+    },
   });
 }
 
@@ -246,9 +267,13 @@ export async function GET(req: NextRequest) {
   let mode: "auth" | "dev" = "auth";
 
   try {
-    const u = await requireUser(req);
-    ownerId = u.id;
-    mode = u.mode;
+    const sb = supabaseAuthReadOnly(req);
+    const owner = await getOwnerCtx(req, sb);
+    if (!owner) {
+      return jsonNoStore({ ok: false, error: "unauthorized" }, 401);
+    }
+    ownerId = owner.ownerId;
+    mode = owner.mode;
   } catch {
     return jsonNoStore({ ok: false, error: "unauthorized" }, 401);
   }
