@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
@@ -13,24 +13,8 @@ type Props = {
   selectedNames: string[];
   selectedScopeIds?: string[];
   disabled?: boolean;
-  initialFolders?: FolderOption[];
+  initialFolders: FolderOption[];
 };
-
-function parseJson(text: string) {
-  try {
-    return text ? JSON.parse(text) : null;
-  } catch {
-    return null;
-  }
-}
-
-function buildNextHref(pathname: string, searchParams: URLSearchParams, folderId: string) {
-  const next = new URLSearchParams(searchParams.toString());
-  next.set("scope", folderId);
-  next.delete("folder");
-  const qs = next.toString();
-  return qs ? `${pathname}?${qs}` : pathname;
-}
 
 function toggleScopeHref(pathname: string, searchParams: URLSearchParams, selectedScopeIds: string[], folderId: string) {
   const next = new Set(selectedScopeIds.map((id) => String(id ?? "").trim()).filter(Boolean));
@@ -58,71 +42,9 @@ export default function FeatureScopePicker({
   const router = useRouter();
 
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(() => !Array.isArray(initialFolders));
-  const [error, setError] = useState<string | null>(null);
-  const [folders, setFolders] = useState<FolderOption[]>(() => (Array.isArray(initialFolders) ? initialFolders : []));
-
-  useEffect(() => {
-    if (Array.isArray(initialFolders)) {
-      setFolders(initialFolders);
-      setLoading(false);
-      setError(null);
-      return;
-    }
-
-    let alive = true;
-
-    void (async () => {
-      setLoading(true);
-      setError(null);
-
-      try {
-        const res = await fetch("/api/folders", {
-          method: "GET",
-          cache: "no-store",
-          headers: { Accept: "application/json" },
-        });
-        const json = parseJson(await res.text());
-
-        if (!alive) return;
-
-        if (res.status === 401) {
-          setFolders([]);
-          setError("Mapper kan ikke opdateres i denne browser lige nu.");
-          return;
-        }
-
-        if (!res.ok || !json?.ok) {
-          setFolders([]);
-          setError(String(json?.error ?? "Kunne ikke hente mapper."));
-          return;
-        }
-
-        const nextFolders = Array.isArray(json.folders)
-          ? json.folders
-              .map((item: any) => {
-                const id = String(item?.id ?? "").trim();
-                const name = String(item?.name ?? "").trim();
-                if (!id || !name) return null;
-                return { id, name };
-              })
-              .filter(Boolean)
-          : [];
-
-        setFolders(nextFolders as FolderOption[]);
-      } catch {
-        if (!alive) return;
-        setFolders([]);
-        setError("Kunne ikke hente mapper.");
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-
-    return () => {
-      alive = false;
-    };
-  }, []);
+  const loading = false;
+  const error = null;
+  const folders = initialFolders;
 
   const selectedLabel = useMemo(() => {
     const clean = selectedNames.map((name) => String(name ?? "").trim()).filter(Boolean);
