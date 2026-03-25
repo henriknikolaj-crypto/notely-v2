@@ -2,7 +2,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
@@ -41,7 +41,7 @@ async function countInTable(sb: any, table: string, where: Record<string, any>):
 export async function PATCH(req: NextRequest, ctx: Ctx) {
   const { id } = await ctx.params;
 
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const ownerId = await resolveOwnerId(req, sb);
   if (!ownerId) {
     return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
@@ -84,7 +84,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
 export async function DELETE(req: NextRequest, ctx: Ctx) {
   const { id } = await ctx.params;
 
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const ownerId = await resolveOwnerId(req, sb);
   if (!ownerId) {
     return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });

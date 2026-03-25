@@ -1,7 +1,7 @@
 ﻿import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
@@ -27,7 +27,7 @@ function normDate(v: any): string | null {
 }
 
 export async function GET(req: NextRequest) {
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const owner = await getOwnerCtx(req, sb);
   if (!owner) {
     return jsonUtf8({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
@@ -49,7 +49,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const owner = await getOwnerCtx(req, sb);
   if (!owner) {
     return jsonUtf8({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
