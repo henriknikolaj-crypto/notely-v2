@@ -3,6 +3,7 @@ import "server-only";
 
 import Link from "next/link";
 import { unstable_noStore as noStore } from "next/cache";
+import { redirect } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
@@ -67,31 +68,7 @@ export default async function TraenerLayout({
     ownerId = null;
   }
 
-  if (!ownerId) {
-    return (
-      <main className="min-h-screen bg-[#fffef9]">
-        <header className="border-b border-zinc-200 bg-white">
-          <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-            <Link href="/" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
-              Notely.
-            </Link>
-            <Link
-              href="/auth/login"
-              className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50"
-            >
-              Log ind
-            </Link>
-          </div>
-        </header>
-        <div className="mx-auto max-w-6xl p-6">
-          <h1 className="mb-2 text-2xl font-semibold">Træning</h1>
-          <p className="text-sm text-red-600">
-            Du skal være logget ind for at åbne Træner.
-          </p>
-        </div>
-      </main>
-    );
-  }
+  if (!ownerId) redirect("/auth/login");
 
   let isPro = false;
   try {

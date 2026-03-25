@@ -101,13 +101,7 @@ export default async function Page({
   const sb = await supabaseServerRSC();
   const ownerId = await getOwnerId(sb);
 
-  if (!ownerId) {
-    return (
-      <main className="p-6 text-sm text-red-600">
-        Du skal være logget ind for at åbne Træner.
-      </main>
-    );
-  }
+  if (!ownerId) redirect("/auth/login");
 
   const { data, error } = await sb
     .from("folders")

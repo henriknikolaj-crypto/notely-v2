@@ -51,6 +51,11 @@ function normalizePlan(raw: any) {
   return p;
 }
 
+function isAuthError(msg: string | null | undefined) {
+  const s = String(msg ?? "").trim().toLowerCase();
+  return s === "unauthorized" || s === "login kræves." || s.includes("unauthorized");
+}
+
 export default function SidebarQuotaBox({
   compact = false,
 }: {
@@ -74,7 +79,7 @@ export default function SidebarQuotaBox({
       }
 
       setData(json);
-      if (!json?.ok) setError(json?.error ?? "Kunne ikke hente forbrug.");
+      if (!json?.ok) setError(isAuthError(json?.error) ? null : (json?.error ?? "Kunne ikke hente forbrug."));
       else setError(null);
     } catch (e) {
       // eslint-disable-next-line no-console
