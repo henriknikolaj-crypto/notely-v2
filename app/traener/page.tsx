@@ -94,16 +94,20 @@ export default async function Page({
     console.error("TRÆNER page auth error:", authError);
   }
 
-  if (!ownerId) {
-    redirect("/auth/login");
-  }
+  let data: FolderRow[] | null = null;
+  let error: unknown = null;
 
-  const { data, error } = await sb
-    .from("folders")
-    .select("id,name,parent_id")
-    .eq("owner_id", ownerId)
-    .is("archived_at", null)
-    .order("name", { ascending: true });
+  if (ownerId) {
+    const foldersResult = await sb
+      .from("folders")
+      .select("id,name,parent_id")
+      .eq("owner_id", ownerId)
+      .is("archived_at", null)
+      .order("name", { ascending: true });
+
+    data = (foldersResult.data ?? null) as FolderRow[] | null;
+    error = foldersResult.error;
+  }
 
   if (error) {
     console.error("TRÆNER page folders error:", error);
