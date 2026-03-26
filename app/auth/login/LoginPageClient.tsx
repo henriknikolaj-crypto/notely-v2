@@ -78,7 +78,7 @@ export default function LoginPageClient() {
       const res = await fetch("/api/auth/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
+        credentials: "include",
         body: JSON.stringify({
           access_token: accessToken,
           refresh_token: refreshToken,
@@ -134,7 +134,24 @@ export default function LoginPageClient() {
         error: error?.message ?? null,
       });
       if (error) throw error;
-      await syncServerSession(data.session);
+      const accessToken = String(data.session?.access_token ?? "").trim();
+      const refreshToken = String(data.session?.refresh_token ?? "").trim();
+      if (!accessToken || !refreshToken) {
+        console.error("[auth-debug] login missing tokens for server sync", {
+          hasAccessToken: !!accessToken,
+          hasRefreshToken: !!refreshToken,
+        });
+        setMsg("Kunne ikke oprette serversession i preview. Prøv igen eller brug magic link.");
+        return;
+      }
+      const sessionSynced = await syncServerSession(data.session);
+      if (!sessionSynced) {
+        console.error("[auth-debug] login server session sync failed", {
+          vercelEnv: typeof window !== "undefined" ? "preview-or-browser" : null,
+        });
+        setMsg("Kunne ikke oprette serversession i preview. Prøv igen eller brug magic link.");
+        return;
+      }
       await trackLoginCompleted(data.user?.id ?? null, { feature: "auth_login", method: "password" });
       console.info("[auth-debug] login redirect target", { target });
       await redirectAfterAuth(target);
