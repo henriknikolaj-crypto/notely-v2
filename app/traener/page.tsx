@@ -90,6 +90,16 @@ export default async function Page({
   const { data: authData, error: authError } = await sb.auth.getUser();
   const ownerId = authData?.user?.id ? String(authData.user.id) : null;
 
+  if (process.env.VERCEL_ENV === "preview") {
+    console.log("[trainer-page-preview-debug]", {
+      vercelEnv: process.env.VERCEL_ENV ?? null,
+      hasUser: !!ownerId,
+      userId: ownerId,
+      scopeFolderIds,
+      folderParam,
+    });
+  }
+
   if (authError) {
     console.error("TRÆNER page auth error:", authError);
   }

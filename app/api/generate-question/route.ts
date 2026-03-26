@@ -291,33 +291,56 @@ export async function POST(req: NextRequest) {
     const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 500);
     const avoidChunkSet = new Set<string>(avoidChunkIds);
 
+    const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
+    const hasCookieHeader = cookieNames.length > 0;
+    const hasSbAuthCookie = cookieNames.some((name) => name.includes("auth-token"));
+    const hasVercelJwtCookie = cookieNames.some((name) => name.toLowerCase().includes("vercel") && name.toLowerCase().includes("jwt"));
+
     // Auth
     try {
       const sbAuth = await supabaseServerRoute();
       const { data: authData, error: authError } = await sbAuth.auth.getUser();
       if (authError || !authData?.user?.id) {
-        if (process.env.VERCEL_ENV === "preview") {
-          const hasAuthCookie = req.cookies.getAll().some((cookie) => cookie.name.includes("auth-token"));
-          console.warn("[generate-question] preview auth missing", {
-            requestId,
-            hasAuthCookie,
-            authError: authError?.message ?? null,
-          });
-        }
-        const err: GenerateQuestionErr = { ok: false, error: "Unauthorized", requestId };
+        const err: GenerateQuestionErr = {
+          ok: false,
+          error: "Unauthorized",
+          requestId,
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  vercelEnv: process.env.VERCEL_ENV ?? null,
+                  hasCookieHeader,
+                  cookieNames,
+                  hasSbAuthCookie,
+                  hasVercelJwtCookie,
+                  getUserError: authError?.message ?? null,
+                  userId: authData?.user?.id ? String(authData.user.id) : null,
+                },
+              }
+            : {}),
+        };
         return NextResponse.json(err, { status: 401 });
       }
       ownerId = String(authData.user.id);
     } catch (error: any) {
-      if (process.env.VERCEL_ENV === "preview") {
-        const hasAuthCookie = req.cookies.getAll().some((cookie) => cookie.name.includes("auth-token"));
-        console.warn("[generate-question] preview auth missing", {
-          requestId,
-          hasAuthCookie,
-          authError: error?.message ?? null,
-        });
-      }
-      const err: GenerateQuestionErr = { ok: false, error: "Unauthorized", requestId };
+      const err: GenerateQuestionErr = {
+        ok: false,
+        error: "Unauthorized",
+        requestId,
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                vercelEnv: process.env.VERCEL_ENV ?? null,
+                hasCookieHeader,
+                cookieNames,
+                hasSbAuthCookie,
+                hasVercelJwtCookie,
+                getUserError: error?.message ?? null,
+                userId: null,
+              },
+            }
+          : {}),
+      };
       return NextResponse.json(err, { status: 401 });
     }
 
