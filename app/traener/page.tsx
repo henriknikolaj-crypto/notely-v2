@@ -1,6 +1,5 @@
 ﻿// app/traener/page.tsx
 import "server-only";
-import { resolveSupabaseServerUser } from "@/lib/supabase/auth-server";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { redirect } from "next/navigation";
 import ClientTrainer from "./ux/ClientTrainer";
@@ -88,7 +87,8 @@ export default async function Page({
   }
 
   const sb = await supabaseServerRSC();
-  const { userId: ownerId, authError } = await resolveSupabaseServerUser(sb);
+  const { data: authData, error: authError } = await sb.auth.getUser();
+  const ownerId = authData?.user?.id ? String(authData.user.id) : null;
 
   if (process.env.VERCEL_ENV === "preview") {
     console.log("[trainer-page-preview-debug]", {
