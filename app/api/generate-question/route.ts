@@ -14,6 +14,7 @@ import { createClient } from "@supabase/supabase-js";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { resolveSupabaseServerUser } from "@/lib/supabase/auth-server";
 import {
   buildGenerateQuestionPrompts,
   clampInt,
@@ -299,8 +300,8 @@ export async function POST(req: NextRequest) {
     // Auth
     try {
       const sbAuth = await supabaseServerRoute();
-      const { data: authData, error: authError } = await sbAuth.auth.getUser();
-      if (authError || !authData?.user?.id) {
+      const { userId, authError } = await resolveSupabaseServerUser(sbAuth);
+      if (!userId) {
         const err: GenerateQuestionErr = {
           ok: false,
           error: "Unauthorized",
@@ -313,15 +314,15 @@ export async function POST(req: NextRequest) {
                   cookieNames,
                   hasSbAuthCookie,
                   hasVercelJwtCookie,
-                  getUserError: authError?.message ?? null,
-                  userId: authData?.user?.id ? String(authData.user.id) : null,
+                  getUserError: authError,
+                  userId,
                 },
               }
             : {}),
         };
         return NextResponse.json(err, { status: 401 });
       }
-      ownerId = String(authData.user.id);
+      ownerId = userId;
     } catch (error: any) {
       const err: GenerateQuestionErr = {
         ok: false,
