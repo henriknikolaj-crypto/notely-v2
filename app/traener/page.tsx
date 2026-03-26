@@ -103,17 +103,33 @@ export default async function Page({
   }
 
   const folders = (data ?? []) as FolderRow[];
+  const hasTrustedFolderCatalog = !error && folders.length > 0;
   const validFolderIds = new Set(folders.map((folder) => folder.id));
   const sanitizedScopeFolderIds = isDemoMode
     ? [DEMO_SCOPE_ID]
-    : scopeFolderIds.filter((id) => validFolderIds.has(id));
+    : hasTrustedFolderCatalog
+      ? scopeFolderIds.filter((id) => validFolderIds.has(id))
+      : scopeFolderIds;
   const fallbackFolderId = folders[0]?.id ?? null;
   const sanitizedFolderParam =
-    isDemoMode || !folderParam || !validFolderIds.has(folderParam) ? null : folderParam;
+    isDemoMode || !folderParam
+      ? null
+      : hasTrustedFolderCatalog
+        ? validFolderIds.has(folderParam)
+          ? folderParam
+          : null
+        : folderParam;
   const shouldFallbackScope =
-    !isDemoMode && scopeFolderIds.length > 0 && sanitizedScopeFolderIds.length === 0 && !!fallbackFolderId;
+    !isDemoMode &&
+    hasTrustedFolderCatalog &&
+    scopeFolderIds.length > 0 &&
+    sanitizedScopeFolderIds.length === 0 &&
+    !!fallbackFolderId;
   const shouldPromoteLegacyFolderToScope =
-    !isDemoMode && sanitizedScopeFolderIds.length === 0 && !!sanitizedFolderParam;
+    !isDemoMode &&
+    hasTrustedFolderCatalog &&
+    sanitizedScopeFolderIds.length === 0 &&
+    !!sanitizedFolderParam;
   const finalScopeFolderIds = shouldFallbackScope
     ? [fallbackFolderId as string]
     : shouldPromoteLegacyFolderToScope
@@ -122,9 +138,10 @@ export default async function Page({
   const activeFolderId = isDemoMode ? DEMO_SCOPE_ID : finalScopeFolderIds[0] ?? null;
   const scopeChanged =
     !isDemoMode &&
+    hasTrustedFolderCatalog &&
     (finalScopeFolderIds.length !== scopeFolderIds.length ||
       finalScopeFolderIds.some((id, index) => id !== scopeFolderIds[index]));
-  const folderChanged = !isDemoMode && !!folderParam;
+  const folderChanged = !isDemoMode && hasTrustedFolderCatalog && !!folderParam;
 
   if (!isDemoMode && (scopeChanged || folderChanged)) {
     const params = new URLSearchParams();
