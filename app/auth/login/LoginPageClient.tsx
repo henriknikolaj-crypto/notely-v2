@@ -58,54 +58,6 @@ export default function LoginPageClient() {
     }
   }
 
-  async function waitForSessionReady() {
-    for (let attempt = 0; attempt < 12; attempt++) {
-      const sessionRes = await supabase.auth.getSession().catch(() => null);
-      const hasSession = !!sessionRes?.data?.session?.access_token;
-      console.info("[auth-debug] login waitForSessionReady", { attempt: attempt + 1, hasSession });
-      if (hasSession) return true;
-      await new Promise((resolve) => window.setTimeout(resolve, 200));
-    }
-    return false;
-  }
-
-  async function syncServerSession(session: { access_token?: string | null; refresh_token?: string | null } | null | undefined) {
-    const accessToken = String(session?.access_token ?? "").trim();
-    const refreshToken = String(session?.refresh_token ?? "").trim();
-    if (!accessToken || !refreshToken) return false;
-
-    try {
-      const res = await fetch("/api/auth/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          access_token: accessToken,
-          refresh_token: refreshToken,
-        }),
-      });
-      const json = await res.json().catch(() => null);
-      console.info("[auth-debug] login syncServerSession", {
-        ok: res.ok,
-        status: res.status,
-        error: json?.error ?? null,
-      });
-      return res.ok;
-    } catch (error: any) {
-      console.error("[auth-debug] login syncServerSession:error", {
-        message: error?.message ?? "Unknown session sync error",
-      });
-      return false;
-    }
-  }
-
-  async function redirectAfterAuth(path: string) {
-    console.info("[auth-debug] login redirectAfterAuth:start", { path });
-    const sessionReady = await waitForSessionReady();
-    console.info("[auth-debug] login redirectAfterAuth:done", { path, sessionReady });
-    window.location.assign(path);
-  }
-
   async function onPassword(e: React.FormEvent) {
     e.preventDefault();
     if (loading) {
@@ -127,34 +79,24 @@ export default function LoginPageClient() {
     setMsg(null);
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-      console.info("[auth-debug] login signInWithPassword:response", {
-        hasUser: !!data?.user,
-        hasSession: !!data?.session,
-        error: error?.message ?? null,
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email, password }),
       });
-      if (error) throw error;
-      const accessToken = String(data.session?.access_token ?? "").trim();
-      const refreshToken = String(data.session?.refresh_token ?? "").trim();
-      if (!accessToken || !refreshToken) {
-        console.error("[auth-debug] login missing tokens for server sync", {
-          hasAccessToken: !!accessToken,
-          hasRefreshToken: !!refreshToken,
-        });
-        setMsg("Kunne ikke oprette serversession i preview. Prøv igen eller brug magic link.");
-        return;
+      const data = await res.json().catch(() => null);
+      console.info("[auth-debug] login server-auth response", {
+        ok: res.ok,
+        status: res.status,
+        error: data?.error ?? null,
+      });
+      if (!res.ok || !data?.ok) {
+        throw new Error(String(data?.error ?? "Login-fejl"));
       }
-      const sessionSynced = await syncServerSession(data.session);
-      if (!sessionSynced) {
-        console.error("[auth-debug] login server session sync failed", {
-          vercelEnv: typeof window !== "undefined" ? "preview-or-browser" : null,
-        });
-        setMsg("Kunne ikke oprette serversession i preview. Prøv igen eller brug magic link.");
-        return;
-      }
-      await trackLoginCompleted(data.user?.id ?? null, { feature: "auth_login", method: "password" });
+      await trackLoginCompleted(data?.userId ?? null, { feature: "auth_login", method: "password" });
       console.info("[auth-debug] login redirect target", { target });
-      await redirectAfterAuth(target);
+      window.location.assign(target);
     } catch (e: any) {
       console.error("[auth-debug] login submit:error", {
         message: e?.message ?? "Login-fejl",
