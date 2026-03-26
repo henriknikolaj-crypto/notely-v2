@@ -136,6 +136,9 @@ export default async function Page({
       ? [sanitizedFolderParam as string]
       : sanitizedScopeFolderIds;
   const activeFolderId = isDemoMode ? DEMO_SCOPE_ID : finalScopeFolderIds[0] ?? null;
+  const selectedScopeNames = finalScopeFolderIds
+    .map((id) => folders.find((folder) => folder.id === id)?.name ?? null)
+    .filter((name): name is string => !!name);
   const scopeChanged =
     !isDemoMode &&
     hasTrustedFolderCatalog &&
@@ -176,6 +179,7 @@ export default async function Page({
           folders={effectiveFolders}
           activeFolderId={activeFolderId}
           scopeFolderIds={effectiveScopeFolderIds}
+          selectedScopeNames={selectedScopeNames}
           showFirstUseCta={showFirstUseCta}
           demoMode={isDemoMode}
           demoScopeName={isDemoMode ? DEMO_SCOPE_NAME : null}

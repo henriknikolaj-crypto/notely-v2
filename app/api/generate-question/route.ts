@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 
-import { requireUser } from "@/lib/auth";
+import { getOwnerCtx } from "@/lib/auth/owner";
 import { captureException } from "@/lib/monitoring/error";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { quotaTryConsume } from "@/lib/quota/rpc";
@@ -30,6 +30,7 @@ import {
   type FocusMode,
   type WeakPointTarget,
 } from "@/lib/trainer/generate-question";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -291,10 +292,12 @@ export async function POST(req: NextRequest) {
     const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 500);
     const avoidChunkSet = new Set<string>(avoidChunkIds);
 
-    // Auth
+    // Auth (preview-stabil read-only cookie lookup)
     try {
-      const u: any = await requireUser(req);
-      ownerId = u.id;
+      const sbAuth = supabaseServerRouteReadOnly(req);
+      const owner = await getOwnerCtx(req, sbAuth);
+      if (!owner?.ownerId) throw new Error("Unauthorized");
+      ownerId = owner.ownerId;
     } catch {
       const err: GenerateQuestionErr = { ok: false, error: "Unauthorized", requestId };
       return NextResponse.json(err, { status: 401 });

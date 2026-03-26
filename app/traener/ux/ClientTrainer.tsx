@@ -18,6 +18,7 @@ type Props = {
   activeFolderId?: string | null;
   folders?: Folder[];
   scopeFolderIds?: string[];
+  selectedScopeNames?: string[];
   showFirstUseCta?: boolean;
   demoMode?: boolean;
   demoScopeName?: string | null;
@@ -253,6 +254,7 @@ export default function ClientTrainer({
   activeFolderId,
   folders,
   scopeFolderIds,
+  selectedScopeNames: selectedScopeNamesProp,
   showFirstUseCta = false,
   demoMode = false,
   demoScopeName = null,
@@ -273,10 +275,12 @@ export default function ClientTrainer({
   }, [scopeFolderIds, effectiveFolderId]);
 
   const selectedScopeNames = useMemo(() => {
+    const explicit = (selectedScopeNamesProp ?? []).map((name) => String(name ?? "").trim()).filter(Boolean);
+    if (explicit.length > 0) return explicit;
     const ids = Array.from(new Set(effectiveScopeFolderIds.map((id) => String(id ?? "").trim()).filter(Boolean)));
     const folderMap = new Map((folders ?? []).map((f) => [f.id, f.name]));
     return ids.map((id) => folderMap.get(id)).filter(Boolean) as string[];
-  }, [effectiveScopeFolderIds, folders]);
+  }, [effectiveScopeFolderIds, folders, selectedScopeNamesProp]);
 
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
