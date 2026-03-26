@@ -69,6 +69,36 @@ export default function LoginPageClient() {
     return false;
   }
 
+  async function syncServerSession(session: { access_token?: string | null; refresh_token?: string | null } | null | undefined) {
+    const accessToken = String(session?.access_token ?? "").trim();
+    const refreshToken = String(session?.refresh_token ?? "").trim();
+    if (!accessToken || !refreshToken) return false;
+
+    try {
+      const res = await fetch("/api/auth/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        }),
+      });
+      const json = await res.json().catch(() => null);
+      console.info("[auth-debug] login syncServerSession", {
+        ok: res.ok,
+        status: res.status,
+        error: json?.error ?? null,
+      });
+      return res.ok;
+    } catch (error: any) {
+      console.error("[auth-debug] login syncServerSession:error", {
+        message: error?.message ?? "Unknown session sync error",
+      });
+      return false;
+    }
+  }
+
   async function redirectAfterAuth(path: string) {
     console.info("[auth-debug] login redirectAfterAuth:start", { path });
     const sessionReady = await waitForSessionReady();
@@ -104,6 +134,7 @@ export default function LoginPageClient() {
         error: error?.message ?? null,
       });
       if (error) throw error;
+      await syncServerSession(data.session);
       await trackLoginCompleted(data.user?.id ?? null, { feature: "auth_login", method: "password" });
       console.info("[auth-debug] login redirect target", { target });
       await redirectAfterAuth(target);

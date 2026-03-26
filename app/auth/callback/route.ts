@@ -1,5 +1,6 @@
 ﻿ 
 import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { createServerClient } from "@supabase/ssr";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
 
@@ -12,17 +13,14 @@ function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null)
 }
 
 export async function GET(request: NextRequest) {
+  const requestId = randomUUID();
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
   const rawNext = searchParams.get("next");
   const rawReturnTo = searchParams.get("returnTo");
   const next = resolvePostAuthPath(rawNext, rawReturnTo);
-  console.info("[auth-debug] callback received", {
-    rawNext,
-    rawReturnTo,
-    normalizedNext: next,
-    hasCode: !!code,
-  });
+  const previewDebug = process.env.VERCEL_ENV === "preview";
+  const cookiesAttemptedToSet: string[] = [];
 
   const redirectResponse = NextResponse.redirect(new URL(next, request.url), { status: 303 });
   const supabase = createServerClient(
@@ -35,6 +33,7 @@ export async function GET(request: NextRequest) {
         },
         setAll(cookiesToSet) {
           for (const cookie of cookiesToSet) {
+            cookiesAttemptedToSet.push(cookie.name);
             request.cookies.set(cookie.name, cookie.value);
             redirectResponse.cookies.set(cookie.name, cookie.value, cookie.options);
           }
@@ -43,19 +42,25 @@ export async function GET(request: NextRequest) {
     },
   );
 
+  let exchangeOk = false;
   if (code) {
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (error) {
       const url = new URL("/auth/login", request.url);
       url.searchParams.set("error", error.message);
       url.searchParams.set("next", next);
-      console.info("[auth-debug] callback exchange failed", {
-        resolvedNext: next,
-        loginRedirect: `${url.pathname}${url.search}`,
-        error: error.message,
-      });
+      if (previewDebug) {
+        console.info("[auth-callback-preview-debug]", {
+          requestId,
+          hasCode: !!code,
+          exchangeOk: false,
+          cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
+          redirectTarget: `${url.pathname}${url.search}`,
+        });
+      }
       return NextResponse.redirect(url, { status: 303 });
     }
+    exchangeOk = true;
   }
 
   try {
@@ -72,9 +77,14 @@ export async function GET(request: NextRequest) {
     // best effort
   }
 
-  console.info("[auth-debug] callback redirecting", {
-    normalizedNext: next,
-    finalRedirectTarget: next,
-  });
+  if (previewDebug) {
+    console.info("[auth-callback-preview-debug]", {
+      requestId,
+      hasCode: !!code,
+      exchangeOk,
+      cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
+      redirectTarget: next,
+    });
+  }
   return redirectResponse;
 }
