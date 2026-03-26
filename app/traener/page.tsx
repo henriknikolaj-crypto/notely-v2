@@ -1,6 +1,5 @@
 ﻿// app/traener/page.tsx
 import "server-only";
-import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { redirect } from "next/navigation";
 import ClientTrainer from "./ux/ClientTrainer";
@@ -88,8 +87,16 @@ export default async function Page({
   }
 
   const sb = await supabaseServerRSC();
-  const { ownerId: sessionOwnerId } = await getTrainerSession();
-  const ownerId = sessionOwnerId ?? "";
+  const { data: authData, error: authError } = await sb.auth.getUser();
+  const ownerId = authData?.user?.id ? String(authData.user.id) : null;
+
+  if (authError) {
+    console.error("TRÆNER page auth error:", authError);
+  }
+
+  if (!ownerId) {
+    redirect("/auth/login");
+  }
 
   const { data, error } = await sb
     .from("folders")
