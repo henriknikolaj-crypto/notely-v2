@@ -88,8 +88,8 @@ export default async function Page({
   }
 
   const sb = await supabaseServerRSC();
-  const { ownerId } = await getTrainerSession();
-  if (!ownerId) return null;
+  const { ownerId: sessionOwnerId } = await getTrainerSession();
+  const ownerId = sessionOwnerId ?? "";
 
   const { data, error } = await sb
     .from("folders")
@@ -140,7 +140,7 @@ export default async function Page({
 
   const effectiveFolders = isDemoMode ? [{ id: DEMO_SCOPE_ID, name: DEMO_SCOPE_NAME }, ...folders] : folders;
   const effectiveScopeFolderIds = finalScopeFolderIds;
-  const showFirstUseCta = !isDemoMode && !(await hasOwnUsableMaterial(sb, ownerId));
+  const showFirstUseCta = !isDemoMode && !!ownerId && !(await hasOwnUsableMaterial(sb, ownerId));
 
   return (
     <main>
