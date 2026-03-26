@@ -5,7 +5,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 
-import { getOwnerCtx } from "@/lib/auth/owner";
 import { captureException } from "@/lib/monitoring/error";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { quotaTryConsume } from "@/lib/quota/rpc";
@@ -30,7 +29,7 @@ import {
   type FocusMode,
   type WeakPointTarget,
 } from "@/lib/trainer/generate-question";
-import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -292,13 +291,32 @@ export async function POST(req: NextRequest) {
     const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 500);
     const avoidChunkSet = new Set<string>(avoidChunkIds);
 
-    // Auth (preview-stabil read-only cookie lookup)
+    // Auth
     try {
-      const sbAuth = supabaseServerRouteReadOnly(req);
-      const owner = await getOwnerCtx(req, sbAuth);
-      if (!owner?.ownerId) throw new Error("Unauthorized");
-      ownerId = owner.ownerId;
-    } catch {
+      const sbAuth = await supabaseServerRoute();
+      const { data: authData, error: authError } = await sbAuth.auth.getUser();
+      if (authError || !authData?.user?.id) {
+        if (process.env.VERCEL_ENV === "preview") {
+          const hasAuthCookie = req.cookies.getAll().some((cookie) => cookie.name.includes("auth-token"));
+          console.warn("[generate-question] preview auth missing", {
+            requestId,
+            hasAuthCookie,
+            authError: authError?.message ?? null,
+          });
+        }
+        const err: GenerateQuestionErr = { ok: false, error: "Unauthorized", requestId };
+        return NextResponse.json(err, { status: 401 });
+      }
+      ownerId = String(authData.user.id);
+    } catch (error: any) {
+      if (process.env.VERCEL_ENV === "preview") {
+        const hasAuthCookie = req.cookies.getAll().some((cookie) => cookie.name.includes("auth-token"));
+        console.warn("[generate-question] preview auth missing", {
+          requestId,
+          hasAuthCookie,
+          authError: error?.message ?? null,
+        });
+      }
       const err: GenerateQuestionErr = { ok: false, error: "Unauthorized", requestId };
       return NextResponse.json(err, { status: 401 });
     }

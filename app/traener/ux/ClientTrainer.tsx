@@ -275,8 +275,11 @@ export default function ClientTrainer({
   }, [scopeFolderIds, effectiveFolderId]);
 
   const selectedScopeNames = useMemo(() => {
-    const explicit = (selectedScopeNamesProp ?? []).map((name) => String(name ?? "").trim()).filter(Boolean);
-    if (explicit.length > 0) return explicit;
+    const explicitNames =
+      Array.isArray(selectedScopeNamesProp) && selectedScopeNamesProp.length > 0
+        ? selectedScopeNamesProp.map((name) => String(name ?? "").trim()).filter(Boolean)
+        : [];
+    if (explicitNames.length > 0) return explicitNames;
     const ids = Array.from(new Set(effectiveScopeFolderIds.map((id) => String(id ?? "").trim()).filter(Boolean)));
     const folderMap = new Map((folders ?? []).map((f) => [f.id, f.name]));
     return ids.map((id) => folderMap.get(id)).filter(Boolean) as string[];
