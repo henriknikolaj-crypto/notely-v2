@@ -186,15 +186,15 @@ export default async function Page({
       {/* Lille margin – så boksen kommer tæt op på stregen som på Noter */}
       <section className="mt-2">
         <ClientTrainer
-          ownerId={ownerId}
-          folders={effectiveFolders}
-          activeFolderId={activeFolderId}
-          scopeFolderIds={effectiveScopeFolderIds}
-          selectedScopeNames={selectedScopeNames}
-          showFirstUseCta={showFirstUseCta}
-          demoMode={isDemoMode}
-          demoScopeName={isDemoMode ? DEMO_SCOPE_NAME : null}
-        />
+  ownerId={ownerId ?? undefined}
+  folders={effectiveFolders}
+  activeFolderId={activeFolderId}
+  scopeFolderIds={effectiveScopeFolderIds}
+  selectedScopeNames={selectedScopeNames}
+  showFirstUseCta={showFirstUseCta}
+  demoMode={isDemoMode}
+  demoScopeName={isDemoMode ? DEMO_SCOPE_NAME : null}
+/>
       </section>
     </main>
   );
