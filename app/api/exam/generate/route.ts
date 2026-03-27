@@ -6,11 +6,11 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { ensureProfile } from "@/lib/server/ensureProfile";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -250,11 +250,40 @@ export async function POST(req: NextRequest) {
     let focusTargets: WeakPointTarget[] = [];
     let weakSessionCount = 0;
 
-    // Auth
+    // Auth: session-first, read-only route client
     let ownerId = "";
+    const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
     try {
-      const u: any = await requireUser(req);
-      ownerId = u.id;
+      const sbAuth = supabaseServerRouteReadOnly(req);
+      const { data: sessionData, error: sessionError } = await sbAuth.auth.getSession();
+      const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+      if (sessionUserId) {
+        ownerId = sessionUserId;
+      } else {
+        const { data: authData, error: authError } = await sbAuth.auth.getUser();
+        if (!authError && authData?.user?.id) {
+          ownerId = String(authData.user.id);
+        } else {
+          const err: ExamGenerateErr = {
+            ok: false,
+            error: "Unauthorized",
+            requestId,
+            ...(process.env.VERCEL_ENV === "preview"
+              ? {
+                  debug: {
+                    hasSession: !!sessionData?.session,
+                    sessionUserId,
+                    sessionError: sessionError?.message ?? null,
+                    getUserError: authError?.message ?? null,
+                    cookieNames,
+                  },
+                }
+              : {}),
+          };
+          return NextResponse.json(err, { status: 401 });
+        }
+      }
     } catch {
       const err: ExamGenerateErr = { ok: false, error: "Unauthorized", requestId };
       return NextResponse.json(err, { status: 401 });
