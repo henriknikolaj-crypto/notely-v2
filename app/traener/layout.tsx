@@ -81,7 +81,7 @@ export default async function TraenerLayout({
     planLabel = null;
   }
 
-  const disableLiveQuotaFetch = process.env.VERCEL_ENV === "preview";
+  const disableLiveQuotaFetch = false;
 
   // ---- Mapper i venstre træ ----
   const { data: foldersData, error: foldersError } = await sb
