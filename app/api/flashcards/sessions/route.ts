@@ -1,8 +1,8 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "@/lib/auth";
 import { formatScopeLabel, hasScopeOverlap, parseScopeFolderIds } from "../_scope";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,10 +14,40 @@ function json(status: number, payload: any) {
 export async function GET(req: NextRequest) {
   let sb: any;
   let ownerId: string;
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
-    const auth = await requireUser(req);
-    sb = auth.sb;
-    ownerId = auth.id;
+    sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let resolvedUserId = sessionUserId;
+    let getUserError: string | null = null;
+
+    if (!resolvedUserId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      resolvedUserId = authData?.user?.id ? String(authData.user.id) : null;
+    }
+
+    if (!resolvedUserId) {
+      return json(401, {
+        ok: false,
+        error: "Unauthorized (mangler login eller dev-bypass).",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: !!sessionData?.session,
+                sessionUserId,
+                sessionError: sessionError?.message ?? null,
+                getUserError,
+                cookieNames,
+              },
+            }
+          : {}),
+      });
+    }
+
+    ownerId = resolvedUserId;
   } catch {
     return json(401, { ok: false, error: "Unauthorized (mangler login eller dev-bypass)." });
   }
