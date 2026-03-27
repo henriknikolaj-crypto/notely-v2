@@ -482,7 +482,6 @@ export default function ClientTrainer({
         setLimitReached(true);
         setLimitMessage(String((data as any)?.error ?? "").trim() || null);
         dispatchQuotaChanged();
-        router.refresh();
         return;
       }
 
@@ -512,7 +511,6 @@ export default function ClientTrainer({
       setEvalAttemptsUsed(0);
 
       dispatchQuotaChanged();
-      router.refresh();
     } catch (err: any) {
       setErrorMsg(err?.message || "Fejl ved generering af spørgsmål.");
     } finally {
@@ -579,7 +577,6 @@ export default function ClientTrainer({
         const msg = String((data as any)?.error ?? "").trim() || "Denne runde er brugt op. Generér et nyt spørgsmål.";
         setEvalAttemptsUsed(EVAL_ATTEMPTS_MAX);
         setErrorMsg(msg);
-        router.refresh();
         return;
       }
 
@@ -603,8 +600,6 @@ export default function ClientTrainer({
 
       // ✅ efter første eval: knappen skal næste gang stå “Prøv igen”
       setEvalAttemptsUsed((n) => Math.min(EVAL_ATTEMPTS_MAX, n + 1));
-
-      router.refresh();
     } catch (err: any) {
       setErrorMsg(err?.message || "Fejl ved evaluering.");
     } finally {

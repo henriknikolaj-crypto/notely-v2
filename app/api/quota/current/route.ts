@@ -4,7 +4,6 @@ import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
-import { getOwnerCtx } from "@/lib/auth/owner";
 import { getMonthlyNoteGenerationUsage } from "@/lib/notes/entitlements";
 import { quotaTryConsume } from "@/lib/quota/rpc";
 
@@ -265,17 +264,63 @@ async function tryQuotaCheck(admin: any, ownerId: string, feature: string) {
 export async function GET(req: NextRequest) {
   let ownerId = "";
   let mode: "auth" | "dev" = "auth";
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
 
   try {
     const sb = supabaseAuthReadOnly(req);
-    const owner = await getOwnerCtx(req, sb);
-    if (!owner) {
-      return jsonNoStore({ ok: false, error: "unauthorized" }, 401);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let resolvedUserId = sessionUserId;
+    let getUserError: string | null = null;
+
+    if (!resolvedUserId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      resolvedUserId = authData?.user?.id ? String(authData.user.id) : null;
     }
-    ownerId = owner.ownerId;
-    mode = owner.mode;
-  } catch {
-    return jsonNoStore({ ok: false, error: "unauthorized" }, 401);
+
+    if (!resolvedUserId) {
+      return jsonNoStore(
+        {
+          ok: false,
+          error: "unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        401,
+      );
+    }
+    ownerId = resolvedUserId;
+    mode = "auth";
+  } catch (error: any) {
+    return jsonNoStore(
+      {
+        ok: false,
+        error: "unauthorized",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: null,
+                sessionUserId: null,
+                sessionError: error?.message ?? null,
+                getUserError: null,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      401,
+    );
   }
 
   let admin: any;
