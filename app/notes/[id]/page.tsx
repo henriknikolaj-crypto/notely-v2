@@ -4,6 +4,7 @@ import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { assertCanAccessVisibleNoteCategory, FREEMIUM_NOTE_LOCKED_MESSAGE } from "@/lib/notes/entitlements";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 
 export const dynamic = "force-dynamic";
 
@@ -14,16 +15,6 @@ type NoteRow = {
   created_at: string | null;
   note_type: string | null;
 };
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {}
-  return null;
-}
 
 function formatDT(iso: string | null | undefined) {
   if (!iso) return "";
@@ -99,7 +90,7 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
   }
 
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { ownerId } = await getTrainerSession();
 
   if (!ownerId) {
     return (

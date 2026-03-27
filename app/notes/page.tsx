@@ -3,6 +3,7 @@ import "server-only";
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { filterVisibleNotes, getNoteEntitlement } from "@/lib/notes/entitlements";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 
 export const dynamic = "force-dynamic";
 
@@ -75,23 +76,13 @@ function isAudioGeneratedNote(note: Pick<NoteRow, "title" | "source_url">) {
   return (note.title ?? "").toLowerCase().includes("fra lyd");
 }
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {}
-  return null;
-}
-
 export default async function NotesPage({
   searchParams,
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { ownerId } = await getTrainerSession();
 
   if (!ownerId) {
     return (
