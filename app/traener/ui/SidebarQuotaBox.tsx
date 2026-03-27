@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type FeatureQuota = {
@@ -65,6 +66,7 @@ export default function SidebarQuotaBox({
   disableLiveFetch?: boolean;
   planLabel?: string | null;
 }) {
+  const pathname = usePathname() || "";
   const [data, setData] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadingRef = useRef(false);
@@ -82,8 +84,14 @@ export default function SidebarQuotaBox({
         return;
       }
 
+      if (!json?.ok && isAuthError(json?.error)) {
+        setData(null);
+        setError(null);
+        return;
+      }
+
       setData(json);
-      if (!json?.ok) setError(isAuthError(json?.error) ? null : (json?.error ?? "Kunne ikke hente forbrug."));
+      if (!json?.ok) setError(json?.error ?? "Kunne ikke hente forbrug.");
       else setError(null);
     } catch (e) {
       // eslint-disable-next-line no-console
@@ -128,7 +136,7 @@ export default function SidebarQuotaBox({
       document.removeEventListener("visibilitychange", onVis);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [disableLiveFetch]);
+  }, [disableLiveFetch, pathname]);
 
   let body: ReactNode = null;
 

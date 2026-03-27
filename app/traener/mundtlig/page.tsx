@@ -69,17 +69,6 @@ function normalizeIds(ids: string[]) {
   return out;
 }
 
-function compactFolderLabel(folderIds: string[], folderMap: Map<string, string>): string | null {
-  const ids = normalizeIds(folderIds);
-  if (ids.length === 0) return null;
-
-  const names = ids.map((id) => folderMap.get(id)).filter((x): x is string => !!x);
-  if (names.length === 0) return null;
-  const first = names[0];
-  const extra = ids.length - 1;
-  return extra > 0 ? `${first} +${extra}` : first;
-}
-
 function normalizePlan(raw: any) {
   const p = String(raw ?? "").trim().toLowerCase();
   if (!p || p === "free") return "freemium";
@@ -151,8 +140,8 @@ export default async function Page({
     }
   }
 
-  const scopeCompact = compactFolderLabel(trainingFolderIds, folderMap);
   const resolvedTrainingFolderIds = trainingFolderIds.filter((id) => folderMap.has(id));
+  const resolvedTrainingFolderNames = resolvedTrainingFolderIds.map((id) => folderMap.get(id) as string);
   const resolvedActiveFolderId = resolvedTrainingFolderIds[0] ?? null;
   const folderOptions = await listFolderOptions(sb, ownerId);
 
@@ -207,17 +196,23 @@ export default async function Page({
         </div>
 
         <TrainingScopeCard
-          names={scopeCompact ? [scopeCompact] : []}
+          names={resolvedTrainingFolderNames}
           className="md:hidden"
           emptyLabel="Vælg en mappe direkte her."
           helpText="Eksamen kan først startes, når en mappe er valgt."
         >
           <FeatureScopePicker
-            selectedNames={scopeCompact ? [scopeCompact] : []}
+            selectedNames={resolvedTrainingFolderNames}
             selectedScopeIds={resolvedTrainingFolderIds}
             initialFolders={folderOptions}
           />
         </TrainingScopeCard>
+        <TrainingScopeCard
+          names={resolvedTrainingFolderNames}
+          className="hidden md:block"
+          emptyLabel="Vælg en mappe i venstre side."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        />
 
         <ClientOralExam scopeFolderIds={resolvedTrainingFolderIds} activeFolderId={resolvedActiveFolderId} isPro={isPro} />
       </section>

@@ -4,6 +4,7 @@ import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import GenerateFromSource from "./ui/GenerateFromSource";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
@@ -70,6 +71,29 @@ async function getScopeNames(sb: any, ownerId: string, folderIds: string[]): Pro
   return folderIds.filter((id) => map.has(id)).map((id) => map.get(id) as string);
 }
 
+async function listFolderOptions(sb: any, ownerId: string) {
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) {
+    console.error("[traener/noter] folder options load error:", error);
+    return [] as Array<{ id: string; name: string }>;
+  }
+
+  return ((data ?? []) as any[])
+    .map((row) => {
+      const id = String(row?.id ?? "").trim();
+      const name = String(row?.name ?? "").trim();
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean) as Array<{ id: string; name: string }>;
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -99,6 +123,7 @@ export default async function Page({
 
   const primaryFolderId = scopeFolderIds[0] ?? null;
   const scopeNames = await getScopeNames(sb, ownerId, scopeFolderIds);
+  const folderOptions = await listFolderOptions(sb, ownerId);
   const files = await listFilesForScope(sb, ownerId, scopeFolderIds);
   const hasScope = scopeFolderIds.length > 0;
 
@@ -111,6 +136,15 @@ export default async function Page({
           styrer hvilke filer der kan vælges som kilde her.
         </p>
       </header>
+
+      <TrainingScopeCard
+        names={scopeNames}
+        className="md:hidden"
+        emptyLabel="Vælg en mappe direkte her."
+        helpText={!hasScope ? "Noter er låst, indtil du har valgt en mappe." : undefined}
+      >
+        <FeatureScopePicker selectedNames={scopeNames} selectedScopeIds={scopeFolderIds} initialFolders={folderOptions} />
+      </TrainingScopeCard>
 
       <TrainingScopeCard
         names={scopeNames}
