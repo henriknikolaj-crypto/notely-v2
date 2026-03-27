@@ -92,6 +92,10 @@ function toUrlSearchParams(obj: SP) {
   return sp;
 }
 
+function withRootPath(options?: Record<string, unknown>) {
+  return { ...(options ?? {}), path: "/" };
+}
+
 export default async function Page(props: { searchParams: Promise<SP> }) {
   const spObj = await props.searchParams;
 
@@ -109,7 +113,7 @@ export default async function Page(props: { searchParams: Promise<SP> }) {
       setAll(cookiesToSet) {
         // Best-effort (kan fejle i visse Server Component contexts – så ignorerer vi)
         try {
-          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, c.options);
+          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, withRootPath(c.options));
         } catch {}
       },
     },

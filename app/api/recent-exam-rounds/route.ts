@@ -54,6 +54,10 @@ function sourceTypesForMode(mode: Mode) {
     : ["simulator", "skrift", "written", "exam_simulator", "skrift_simulator"];
 }
 
+function withRootPath(options?: Record<string, unknown>) {
+  return { ...(options ?? {}), path: "/" };
+}
+
 export async function GET(req: NextRequest) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
@@ -75,7 +79,7 @@ export async function GET(req: NextRequest) {
       },
       setAll(cookiesToSet) {
         try {
-          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, c.options);
+          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, withRootPath(c.options));
         } catch {}
       },
     },
