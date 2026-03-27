@@ -299,8 +299,19 @@ export async function POST(req: NextRequest) {
     // Auth
     try {
       const sbAuth = await supabaseServerRoute();
-      const { data: authData, error: authError } = await sbAuth.auth.getUser();
-      if (authError || !authData?.user?.id) {
+      const { data: sessionData, error: sessionError } = await sbAuth.auth.getSession();
+      const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+      let resolvedUserId = sessionUserId;
+      let getUserError: string | null = null;
+
+      if (!resolvedUserId) {
+        const { data: authData, error: authError } = await sbAuth.auth.getUser();
+        getUserError = authError?.message ?? null;
+        resolvedUserId = authData?.user?.id ? String(authData.user.id) : null;
+      }
+
+      if (!resolvedUserId) {
         const err: GenerateQuestionErr = {
           ok: false,
           error: "Unauthorized",
@@ -313,15 +324,18 @@ export async function POST(req: NextRequest) {
                   cookieNames,
                   hasSbAuthCookie,
                   hasVercelJwtCookie,
-                  getUserError: authError?.message ?? null,
-                  userId: authData?.user?.id ? String(authData.user.id) : null,
+                  sessionError: sessionError?.message ?? null,
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  getUserError,
+                  userId: resolvedUserId,
                 },
               }
             : {}),
         };
         return NextResponse.json(err, { status: 401 });
       }
-      ownerId = String(authData.user.id);
+      ownerId = resolvedUserId;
     } catch (error: any) {
       const err: GenerateQuestionErr = {
         ok: false,
