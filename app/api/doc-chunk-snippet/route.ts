@@ -1,8 +1,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
-import { getOwnerCtx } from "@/lib/auth/owner";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -181,6 +180,7 @@ function hasAnyContent(rows: ChunkRow[]): boolean {
 }
 
 export async function GET(req: NextRequest) {
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
     const chunkIdRaw = String(req.nextUrl.searchParams.get("chunkId") ?? "").trim();
     const fileIdRaw = String(req.nextUrl.searchParams.get("fileId") ?? "").trim();
@@ -197,11 +197,38 @@ export async function GET(req: NextRequest) {
     const topKParsed = Number.parseInt(topKRaw, 10);
     const topK = Number.isFinite(topKParsed) ? Math.min(3, Math.max(1, topKParsed)) : 1;
 
-    const sb = await supabaseServerRoute();
-    const owner = await getOwnerCtx(req, sb);
-    const ownerId = owner?.ownerId ?? null;
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let ownerId = sessionUserId;
+    let getUserError: string | null = null;
+
     if (!ownerId) {
-      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : null;
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
     }
 
     if (!fileId && !folderId && !chunkId) {
