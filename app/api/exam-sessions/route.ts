@@ -1,7 +1,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "@/lib/auth";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -194,8 +194,41 @@ async function getOverview(req: NextRequest, sb: any, ownerId: string) {
 
 // GET /api/exam-sessions?limit=5&folder_id=...&source_type=trainer|mc|...&before=ISO
 export async function GET(req: NextRequest) {
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
-    const { sb, id: ownerId } = await requireUser(req);
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let ownerId = sessionUserId;
+    let getUserError: string | null = null;
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : null;
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
 
     const sp = req.nextUrl.searchParams;
     const mode = asNonEmpty(sp.get("mode"));
