@@ -285,6 +285,18 @@ export default function ClientTrainer({
     return ids.map((id) => folderMap.get(id)).filter(Boolean) as string[];
   }, [effectiveScopeFolderIds, folders, selectedScopeNamesProp]);
 
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[client-trainer-scope-debug]", {
+        selectedScopeNamesProp,
+        effectiveScopeFolderIds,
+        selectedScopeNames,
+        folderCount: folders?.length ?? 0,
+        folders: (folders ?? []).map((folder) => ({ id: folder.id, name: folder.name })),
+      });
+    }
+  }, [effectiveScopeFolderIds, folders, selectedScopeNames, selectedScopeNamesProp]);
+
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const includeBackground = true;

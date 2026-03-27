@@ -160,6 +160,18 @@ export default async function Page({
   const selectedScopeNames = finalScopeFolderIds
     .map((id) => folders.find((folder) => folder.id === id)?.name ?? null)
     .filter((name): name is string => !!name);
+
+  if (process.env.VERCEL_ENV === "preview") {
+    console.log("[trainer-page-scope-debug]", {
+      scopeFolderIds,
+      finalScopeFolderIds,
+      activeFolderId,
+      selectedScopeNames,
+      folderCount: folders.length,
+      folderIds: folders.map((folder) => folder.id),
+    });
+  }
+
   const scopeChanged =
     !isDemoMode &&
     hasTrustedFolderCatalog &&
