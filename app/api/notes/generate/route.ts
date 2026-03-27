@@ -3,8 +3,6 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { captureException } from "@/lib/monitoring/error";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
-import { getOwnerCtx } from "@/lib/auth/owner";
 import {
   assertCanGenerateNoteType,
   FREEMIUM_FOCUS_MONTHLY_LIMIT_MESSAGE,
@@ -13,6 +11,7 @@ import {
 import { generateNotesForFile } from "@/lib/notes/generateFromFile";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { supabaseAdminOrNull } from "@/lib/quota/rpc";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -32,12 +31,37 @@ async function readJsonBody<T>(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const sb = await supabaseServerRoute();
-  const owner = await getOwnerCtx(req, sb);
+  const sb = supabaseServerRouteReadOnly(req);
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
+  const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
 
-  if (!owner) {
+  let ownerId = sessionUserId;
+  let getUserError: string | null = null;
+
+  if (!ownerId) {
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : null;
+  }
+
+  if (!ownerId) {
     return NextResponse.json(
-      { ok: false, error: "Unauthorized (login kræves)." },
+      {
+        ok: false,
+        error: "Unauthorized (login kræves).",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: !!sessionData?.session,
+                sessionUserId,
+                sessionError: sessionError?.message ?? null,
+                getUserError,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
       { status: 401 },
     );
   }
@@ -60,8 +84,6 @@ export async function POST(req: NextRequest) {
   if (!fileId) {
     return NextResponse.json({ ok: false, error: "Mangler fileId." }, { status: 400 });
   }
-
-  const ownerId = owner.ownerId;
 
   try {
     const profileAdmin = supabaseAdminOrNull();
