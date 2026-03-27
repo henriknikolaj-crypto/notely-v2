@@ -17,9 +17,9 @@ import {
   getNoteEntitlement,
 } from "@/lib/notes/entitlements";
 import { generateNotesForFile } from "@/lib/notes/generateFromFile";
-import { requireUser } from "@/lib/auth";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -340,13 +340,64 @@ async function uploadStorageObjectExists(admin: any, storagePath: string) {
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
 
   let ownerId = "";
   try {
-    const auth = await requireUser(req);
-    ownerId = auth.id;
-  } catch {
-    return NextResponse.json({ ok: false, error: "Unauthorized", requestId }, { status: 401 });
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let getUserError: string | null = null;
+    ownerId = sessionUserId ?? "";
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          requestId,
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+        requestId,
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: null,
+                sessionUserId: null,
+                sessionError: error?.message ?? null,
+                getUserError: null,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      { status: 401 },
+    );
   }
 
   let admin: any;
@@ -828,5 +879,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: e?.message ?? "Uventet fejl i upload.", requestId }, { status: 500 });
   }
 }
-
 
