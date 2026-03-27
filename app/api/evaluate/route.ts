@@ -3,7 +3,6 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { requireUser } from "@/lib/auth";
 import { ensureQuotaAndDecrement } from "@/lib/quota";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { type NotelyFlow } from "@/lib/openai/requireModel";
@@ -15,6 +14,7 @@ import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
 import { scopeKeyFromFolderIds } from "@/lib/trainer/generate-question";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -381,6 +381,12 @@ export async function POST(req: NextRequest) {
   let ownerId = "";
   let jobId: string | null = null;
   let t0 = Date.now();
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
+  const hasCookieHeader = cookieNames.length > 0;
+  const hasSbAuthCookie = cookieNames.some((name) => name.includes("auth-token"));
+  const hasVercelJwtCookie = cookieNames.some(
+    (name) => name.toLowerCase().includes("vercel") && name.toLowerCase().includes("jwt"),
+  );
 
   try {
     const parsed = await readJsonBody<Partial<EvalRequest>>(req);
@@ -418,37 +424,92 @@ const roundId = pickRoundId(body);
 const includeBackgroundClient = !!body.includeBackground;
 const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
 
-    // Auth/dev-bypass
-let mode: "auth" | "dev" = "auth";
+    // Auth: session først, getUser kun som fallback
+    let mode: "auth" | "dev" = "auth";
+    try {
+      sb = await supabaseServerRoute();
+      const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+      const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
 
-try {
-  const u = await requireUser(req);
-  sb = u.sb;
-  ownerId = u.id;
-  mode = u.mode;
-  t0 = Date.now();
+      let userId = sessionUserId;
+      let getUserError: string | null = null;
 
-  // Rate-limit (evaluate)
-  const rl = await enforceRateLimit(
-    ownerId,
-    "evaluate",
-    { limit: 6, windowSeconds: 60, minIntervalMs: 5000 },
-    "Evaluer svar",
-  );
+      if (!userId) {
+        const { data: authData, error: authError } = await sb.auth.getUser();
+        getUserError = authError?.message ?? null;
+        userId = authData?.user?.id ? String(authData.user.id) : null;
+      }
 
-  if (!rl.ok) {
-    const retryAfterSec = Math.max(1, Math.ceil(rl.retryAfterMs / 1000));
-    return NextResponse.json(
-      { ok: false, error: rl.message, retryAfterMs: rl.retryAfterMs },
-      { status: 429, headers: { "Retry-After": String(retryAfterSec) } },
-    );
-  }
-} catch (e: any) {
-  const msg = String(e?.message ?? "");
-  const isAuth = msg.toLowerCase().includes("unauthorized");
-  if (!isAuth) console.error("[evaluate] requireUser crash:", e);
-	  return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-	}
+      if (!userId) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "Unauthorized",
+            ...(process.env.VERCEL_ENV === "preview"
+              ? {
+                  debug: {
+                    vercelEnv: process.env.VERCEL_ENV ?? null,
+                    hasCookieHeader,
+                    cookieNames,
+                    hasSbAuthCookie,
+                    hasVercelJwtCookie,
+                    hasSession: !!sessionData?.session,
+                    sessionUserId,
+                    sessionError: sessionError?.message ?? null,
+                    getUserError,
+                    userId,
+                  },
+                }
+              : {}),
+          },
+          { status: 401 },
+        );
+      }
+
+      ownerId = userId;
+      t0 = Date.now();
+
+      // Rate-limit (evaluate)
+      const rl = await enforceRateLimit(
+        ownerId,
+        "evaluate",
+        { limit: 6, windowSeconds: 60, minIntervalMs: 5000 },
+        "Evaluer svar",
+      );
+
+      if (!rl.ok) {
+        const retryAfterSec = Math.max(1, Math.ceil(rl.retryAfterMs / 1000));
+        return NextResponse.json(
+          { ok: false, error: rl.message, retryAfterMs: rl.retryAfterMs },
+          { status: 429, headers: { "Retry-After": String(retryAfterSec) } },
+        );
+      }
+    } catch (e: any) {
+      console.error("[evaluate] auth crash:", e);
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  vercelEnv: process.env.VERCEL_ENV ?? null,
+                  hasCookieHeader,
+                  cookieNames,
+                  hasSbAuthCookie,
+                  hasVercelJwtCookie,
+                  hasSession: false,
+                  sessionUserId: null,
+                  sessionError: e?.message ?? null,
+                  getUserError: e?.message ?? null,
+                  userId: null,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
 
     const profileAdmin = supabaseAdminOrNull();
     if (profileAdmin) {
