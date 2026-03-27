@@ -3,16 +3,9 @@ import "server-only";
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { getCanonicalUserPlan } from "@/lib/plan/limits";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 
 export const dynamic = "force-dynamic";
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return data.user.id as string;
-  } catch {}
-  return null;
-}
 
 function fmt(iso: string | null | undefined) {
   if (!iso) return "";
@@ -38,7 +31,7 @@ export default async function TrainerEvaluationsHistoryPage({
   searchParams?: Promise<SearchParams>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { ownerId } = await getTrainerSession();
 
   const sp = (await searchParams) ?? {};
   const qp = new URLSearchParams();
