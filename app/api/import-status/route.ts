@@ -3,8 +3,8 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { requireUser } from "@/lib/auth";
 import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,15 +39,65 @@ function formatDa(iso: string) {
 
 export async function GET(req: NextRequest) {
   const requestId = crypto.randomUUID();
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
 
   let ownerId = "";
 
   try {
-    const u = await requireUser(req);
-    ownerId = u.id;
-    void u.mode;
-  } catch {
-    return NextResponse.json({ ok: false, error: "Unauthorized", requestId }, { status: 401 });
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let getUserError: string | null = null;
+    ownerId = sessionUserId ?? "";
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          requestId,
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+        requestId,
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: null,
+                sessionUserId: null,
+                sessionError: error?.message ?? null,
+                getUserError: null,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      { status: 401 },
+    );
   }
 
   let admin: any;
