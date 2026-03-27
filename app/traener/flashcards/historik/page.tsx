@@ -2,20 +2,13 @@ import "server-only";
 import Link from "next/link";
 import { getHistoryWindowForPlan } from "@/lib/plan/history";
 import { getCanonicalUserPlan } from "@/lib/plan/limits";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 const LIMIT = 50;
-
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return data.user.id as string;
-  } catch {}
-  return null;
-}
 
 function fmt(iso: string | null | undefined) {
   if (!iso) return "";
@@ -47,7 +40,7 @@ export default async function FlashcardsHistoryPage({
   searchParams?: Promise<SearchParams>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { ownerId } = await getTrainerSession();
 
   const sp = (await searchParams) ?? {};
   const qp = new URLSearchParams();

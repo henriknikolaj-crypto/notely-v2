@@ -3,8 +3,8 @@ import "server-only";
 
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { cookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -92,35 +92,10 @@ function toUrlSearchParams(obj: SP) {
   return sp;
 }
 
-function withRootPath(options?: Record<string, unknown>) {
-  return { ...(options ?? {}), path: "/" };
-}
-
 export default async function Page(props: { searchParams: Promise<SP> }) {
   const spObj = await props.searchParams;
-
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
-  if (!url || !anon) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
-
-  const cookieStore = await cookies();
-
-  const sb = createServerClient(url, anon, {
-    cookies: {
-      getAll() {
-        return cookieStore.getAll();
-      },
-      setAll(cookiesToSet) {
-        // Best-effort (kan fejle i visse Server Component contexts – så ignorerer vi)
-        try {
-          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, withRootPath(c.options));
-        } catch {}
-      },
-    },
-  });
-
-  const { data: userData } = await sb.auth.getUser();
-  const ownerId = userData?.user?.id;
+  const sb = await supabaseServerRSC();
+  const { ownerId } = await getTrainerSession();
   if (!ownerId) redirect("/auth/login");
 
   const mode = normMode(spObj.mode);
