@@ -2,7 +2,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "@/lib/auth";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -106,18 +106,62 @@ async function safeFetchTable(opts: {
 }
 
 export async function GET(req: NextRequest) {
-  // auth/dev-bypass via requireUser (samme mønster som resten)
   let sb: any;
   let ownerId = "";
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
-    const u = await requireUser(req);
-    sb = u.sb;
-    ownerId = u.id;
+    sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let getUserError: string | null = null;
+    ownerId = sessionUserId ?? "";
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
   } catch (e: any) {
-    const msg = String(e?.message ?? "");
-    const isAuth = msg.toLowerCase().includes("unauthorized");
-    if (!isAuth) console.error("[files] requireUser crash:", e);
-    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: null,
+                sessionUserId: null,
+                sessionError: e?.message ?? null,
+                getUserError: null,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      { status: 401 },
+    );
   }
 
   const sp = req.nextUrl.searchParams;

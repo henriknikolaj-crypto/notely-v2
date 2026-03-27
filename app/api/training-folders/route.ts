@@ -3,6 +3,7 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -71,8 +72,41 @@ type FolderRow = {
 
 // GET: list mapper (til Upload-siden m.m.)
 export async function GET(req: NextRequest) {
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
-    const { sb, id: ownerId } = await requireUser(req);
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let ownerId = sessionUserId;
+    let getUserError: string | null = null;
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : null;
+    }
+
+    if (!ownerId) {
+      return json(
+        {
+          ok: false,
+          error: "UNAUTHORIZED",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        401,
+      );
+    }
 
     const { data, error } = await sb
       .from("training_folders")
@@ -87,10 +121,25 @@ export async function GET(req: NextRequest) {
 
     return json({ ok: true, folders: (data ?? []) as FolderRow[] });
   } catch (err: any) {
-    const msg = String(err?.message ?? "");
-    const isAuth = msg.toLowerCase().includes("unauthorized");
-    if (!isAuth) console.error("[training-folders GET] fatal:", err);
-    return json({ ok: false, error: isAuth ? "UNAUTHORIZED" : "UNEXPECTED_ERROR" }, isAuth ? 401 : 500);
+    console.error("[training-folders GET] fatal:", err);
+    return json(
+      {
+        ok: false,
+        error: "UNEXPECTED_ERROR",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: null,
+                sessionUserId: null,
+                sessionError: err?.message ?? null,
+                getUserError: null,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      500,
+    );
   }
 }
 
