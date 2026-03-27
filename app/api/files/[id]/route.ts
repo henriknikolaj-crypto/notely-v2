@@ -2,8 +2,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
-import { getOwnerCtx } from "@/lib/auth/owner";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,9 +19,14 @@ function isUuidLike(s: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 }
 
-async function resolveOwnerId(req: NextRequest, sb: any): Promise<string | null> {
-  const owner = await getOwnerCtx(req, sb);
-  return owner?.ownerId ?? null;
+async function resolveOwnerId(req: NextRequest): Promise<string | null> {
+  const sb = supabaseServerRouteReadOnly(req);
+  const { data: sessionData } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+  if (sessionUserId) return sessionUserId;
+
+  const { data: authData } = await sb.auth.getUser();
+  return authData?.user?.id ? String(authData.user.id) : null;
 }
 
 async function readJson(req: NextRequest): Promise<any | null> {
@@ -57,12 +61,13 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "INVALID_ID", error: "Ugyldigt fil-id." }, { status: 400 });
   }
 
-  const sb = await supabaseServerRoute();
-  const ownerId = await resolveOwnerId(req, sb);
+  const ownerId = await resolveOwnerId(req);
 
   if (!ownerId) {
     return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
   }
+
+  const admin = supabaseAdminOrThrow();
 
   const body = await readJson(req);
   const hasFolderId = !!body && ("folder_id" in body || "folderId" in body);
@@ -84,7 +89,7 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
 
   // Hvis folderId != null → valider folderen findes og ejes af user (KORREKT tabel: folders)
   if (folderId !== null) {
-    const rFolder = await sb
+    const rFolder = await admin
       .from("folders")
       .select("id")
       .eq("owner_id", ownerId)
@@ -109,7 +114,7 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
   const updates = { folder_id: folderId };
 
   // 1) Canonical: files
-  const rFiles = await sb
+  const rFiles = await admin
     .from("files")
     .update(updates)
     .eq("owner_id", ownerId)
@@ -118,14 +123,14 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
     .maybeSingle();
 
   // 2) Hold doc_chunks i sync (vigtigt for folder-scope i træning)
-  const rChunks = await sb
+  const rChunks = await admin
     .from("doc_chunks")
     .update(updates)
     .eq("owner_id", ownerId)
     .eq("file_id", fileId);
 
   // 3) Legacy: training_files (best effort)
-  const rTraining = await sb
+  const rTraining = await admin
     .from("training_files")
     .update(updates)
     .eq("owner_id", ownerId)
@@ -164,11 +169,10 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "INVALID_ID", error: "Ugyldigt fil-id." }, { status: 400 });
   }
 
-  const sb = await supabaseServerRoute();
-  const ownerId = await resolveOwnerId(req, sb);
+  const ownerId = await resolveOwnerId(req);
 
   if (!ownerId) {
-    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kr?ves." }, { status: 401 });
+    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
   }
 
   let admin: any;
@@ -188,7 +192,7 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
 
   if (rFile.error) {
     console.error("/api/files/[id] DELETE file lookup fejl", rFile.error);
-    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke l?se filen." }, { status: 500 });
+    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke læse filen." }, { status: 500 });
   }
 
   if (!rFile.data?.id) {
