@@ -5,8 +5,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
-import { requireUser } from "@/lib/auth";
 import { consumeMcQuota, getMcQuotaSnapshot } from "@/lib/quota/mc";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -148,8 +148,15 @@ function supabaseAdmin() {
 }
 
 async function getOwnerId(req: NextRequest): Promise<string> {
-  const u = await requireUser(req);
-  return u.id;
+  const sb = supabaseServerRouteReadOnly(req);
+  const { data: sessionData } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+  if (sessionUserId) return sessionUserId;
+
+  const { data, error } = await sb.auth.getUser();
+  if (!error && data?.user?.id) return String(data.user.id);
+
+  throw new Error("Unauthorized");
 }
 
 function normalizePlan(raw: any) {
@@ -1210,4 +1217,3 @@ Returnér gyldig JSON:
     return NextResponse.json(out, { status });
   }
 }
-
