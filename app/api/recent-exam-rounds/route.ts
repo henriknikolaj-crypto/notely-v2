@@ -1,8 +1,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { createServerClient } from "@supabase/ssr";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,42 +53,44 @@ function sourceTypesForMode(mode: Mode) {
     : ["simulator", "skrift", "written", "exam_simulator", "skrift_simulator"];
 }
 
-function withRootPath(options?: Record<string, unknown>) {
-  return { ...(options ?? {}), path: "/" };
-}
-
 export async function GET(req: NextRequest) {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
-
-  if (!url || !anon) {
-    return NextResponse.json({ ok: false, error: "Missing Supabase env vars." }, { status: 500 });
-  }
-
   const u = new URL(req.url);
   const mode = normMode(u.searchParams.get("mode"));
   const limit = clampInt(u.searchParams.get("limit"), 1, 50, 5);
   const wantedTypes = sourceTypesForMode(mode);
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
+  const sb = supabaseServerRouteReadOnly(req);
+  const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
 
-  const cookieStore = await cookies();
-  const sb = createServerClient(url, anon, {
-    cookies: {
-      getAll() {
-        return cookieStore.getAll();
-      },
-      setAll(cookiesToSet) {
-        try {
-          for (const c of cookiesToSet) cookieStore.set(c.name, c.value, withRootPath(c.options));
-        } catch {}
-      },
-    },
-  });
-
-  const { data: userData } = await sb.auth.getUser();
-  const ownerId = userData?.user?.id;
+  let ownerId = sessionUserId;
+  let getUserError: string | null = null;
 
   if (!ownerId) {
-    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : null;
+  }
+
+  if (!ownerId) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+        ...(process.env.VERCEL_ENV === "preview"
+          ? {
+              debug: {
+                hasSession: !!sessionData?.session,
+                sessionUserId,
+                sessionError: sessionError?.message ?? null,
+                getUserError,
+                cookieNames,
+              },
+            }
+          : {}),
+      },
+      { status: 401 },
+    );
   }
 
   type Row = {
