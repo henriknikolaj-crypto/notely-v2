@@ -11,7 +11,8 @@ type Props = {
 export function formatScopeLabel(names: string[], emptyLabel = "Vælg eller skift mappe her."): string {
   const clean = names.map((x) => String(x ?? "").trim()).filter(Boolean);
   if (clean.length === 0) return emptyLabel;
-  return clean.join(", ");
+  if (clean.length === 1) return clean[0];
+  return `${clean[0]} + ${clean.length - 1}`;
 }
 
 export default function TrainingScopeCard({
