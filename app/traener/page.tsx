@@ -87,21 +87,23 @@ export default async function Page({
   }
 
   const sb = await supabaseServerRSC();
-  const { data: authData, error: authError } = await sb.auth.getUser();
-  const ownerId = authData?.user?.id ? String(authData.user.id) : null;
+  const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
 
-  if (process.env.VERCEL_ENV === "preview") {
-    console.log("[trainer-page-preview-debug]", {
-      vercelEnv: process.env.VERCEL_ENV ?? null,
-      hasUser: !!ownerId,
-      userId: ownerId,
-      scopeFolderIds,
-      folderParam,
-    });
+  let ownerId = sessionUserId;
+  let getUserError: string | null = null;
+
+  if (!ownerId) {
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : null;
   }
 
-  if (authError) {
-    console.error("TRÆNER page auth error:", authError);
+  if (sessionError) {
+    console.error("TRÆNER page session auth error:", sessionError);
+  }
+  if (getUserError) {
+    console.error("TRÆNER page getUser auth error:", getUserError);
   }
 
   let data: FolderRow[] | null = null;
@@ -162,12 +164,17 @@ export default async function Page({
     .filter((name): name is string => !!name);
 
   console.log("[trainer-page-scope-debug]", {
+    vercelEnv: process.env.VERCEL_ENV ?? null,
+    hasSession: !!sessionData?.session,
+    sessionUserId,
+    sessionError: sessionError?.message ?? null,
+    getUserError,
+    ownerId,
     scopeFolderIds,
     finalScopeFolderIds,
     activeFolderId,
     selectedScopeNames,
     folderCount: folders.length,
-    folderIds: folders.map((folder) => folder.id),
   });
 
   const scopeChanged =
