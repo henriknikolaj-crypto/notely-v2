@@ -4,11 +4,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
-import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { buildOralContext } from "@/lib/oral/context";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -78,6 +78,7 @@ function normalizePlan(raw: any) {
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
+  const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY." }, { status: 500 });
@@ -89,7 +90,40 @@ export async function POST(req: NextRequest) {
     }
     const body = parsed.value;
 
-    const { sb, id: ownerId } = await requireUser(req);
+    const sb = supabaseServerRouteReadOnly(req);
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+    let ownerId = sessionUserId;
+    let getUserError: string | null = null;
+
+    if (!ownerId) {
+      const { data: authData, error: authError } = await sb.auth.getUser();
+      getUserError = authError?.message ?? null;
+      ownerId = authData?.user?.id ? String(authData.user.id) : null;
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "unauthorized",
+          ...(process.env.VERCEL_ENV === "preview"
+            ? {
+                debug: {
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
+                  getUserError,
+                  cookieNames,
+                },
+              }
+            : {}),
+        },
+        { status: 401 },
+      );
+    }
+
     const admin = supabaseAdminOrNull();
     if (!admin) {
       return NextResponse.json({ ok: false, error: "Server config mangler." }, { status: 500 });
