@@ -4,6 +4,10 @@ import { randomUUID } from "node:crypto";
 import { createServerClient } from "@supabase/ssr";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
 
+function withRootPath(options?: Record<string, unknown>) {
+  return { ...(options ?? {}), path: "/" };
+}
+
 function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null) {
   const candidate = String(rawNext ?? rawReturnTo ?? "").trim();
   if (!candidate) return "/traener";
@@ -35,7 +39,7 @@ export async function GET(request: NextRequest) {
           for (const cookie of cookiesToSet) {
             cookiesAttemptedToSet.push(cookie.name);
             request.cookies.set(cookie.name, cookie.value);
-            redirectResponse.cookies.set(cookie.name, cookie.value, cookie.options);
+            redirectResponse.cookies.set(cookie.name, cookie.value, withRootPath(cookie.options));
           }
         },
       },
