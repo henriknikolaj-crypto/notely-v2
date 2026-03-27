@@ -3,7 +3,6 @@ import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
-import { requireUser } from "@/lib/auth";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
@@ -13,6 +12,7 @@ import {
   hasSuspiciousFlashcardChars,
   normalizeFlashcardMathText,
 } from "@/lib/text/flashcardMath";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -181,14 +181,47 @@ export async function POST(req: NextRequest) {
     const maxContextChunks = clampInt(body.maxContextChunks, 6, 40, 14);
 
     const scopeFolderIds = Array.isArray(body.scopeFolderIds) ? uniqTrimmed(body.scopeFolderIds) : [];
+    const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
 
-    // Auth/dev-bypass via requireUser
+    // Auth: session-first, read-only route client
     let sb: any;
     let ownerId = "";
     try {
-      const u = await requireUser(req);
-      sb = u.sb;
-      ownerId = u.id;
+      sb = supabaseServerRouteReadOnly(req);
+      const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+      const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+      let resolvedUserId = sessionUserId;
+      let getUserError: string | null = null;
+
+      if (!resolvedUserId) {
+        const { data: authData, error: authError } = await sb.auth.getUser();
+        getUserError = authError?.message ?? null;
+        resolvedUserId = authData?.user?.id ? String(authData.user.id) : null;
+      }
+
+      if (!resolvedUserId) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "unauthorized",
+            ...(process.env.VERCEL_ENV === "preview"
+              ? {
+                  debug: {
+                    hasSession: !!sessionData?.session,
+                    sessionUserId,
+                    sessionError: sessionError?.message ?? null,
+                    getUserError,
+                    cookieNames,
+                  },
+                }
+              : {}),
+          },
+          { status: 401 },
+        );
+      }
+
+      ownerId = resolvedUserId;
     } catch {
       return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
     }
