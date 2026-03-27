@@ -135,7 +135,7 @@ async function getOverview(req: NextRequest, sb: any, ownerId: string) {
     return NextResponse.json({ ok: false, error: "DB error" }, { status: 500 });
   }
 
-  const rows = ((data ?? []) as ExamSessionRow[]).filter((r) => !!asFolderId(r.folder_id));
+  const rows = ((data ?? []) as unknown as ExamSessionRow[]).filter((r) => !!asFolderId(r.folder_id));
   const byFolder = new Map<string, ExamSessionRow[]>();
 
   for (const row of rows) {
@@ -284,7 +284,7 @@ export async function GET(req: NextRequest) {
     }
 
     return NextResponse.json(
-      { ok: true, sessions: (data ?? []) as ExamSessionRow[] },
+      { ok: true, sessions: (data ?? []) as unknown as ExamSessionRow[] },
       { status: 200 },
     );
   } catch (err: any) {
