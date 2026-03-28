@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { createBrowserClient } from "@/lib/supabase/client";
+import { localizeAuthErrorMessage } from "../_lib/localizeAuthError";
 
 function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null, defaultTarget: string) {
   const candidate = String(rawNext ?? rawReturnTo ?? "").trim();
@@ -102,7 +103,7 @@ export default function LoginPageClient() {
         message: e?.message ?? "Login-fejl",
         name: e?.name ?? null,
       });
-      setMsg(e.message ?? "Login-fejl");
+      setMsg(localizeAuthErrorMessage(e?.message, "login"));
     } finally {
       console.info("[auth-debug] login submit:finally", { loadingWillBeFalse: true });
       setLoading(false);
@@ -143,7 +144,7 @@ export default function LoginPageClient() {
         message: e?.message ?? "Fejl",
         name: e?.name ?? null,
       });
-      setMsg(e.message ?? "Fejl");
+      setMsg(localizeAuthErrorMessage(e?.message, "magic"));
     } finally {
       console.info("[auth-debug] magic submit:finally", { loadingWillBeFalse: true });
       setLoading(false);
@@ -158,7 +159,7 @@ export default function LoginPageClient() {
       });
       if (error) throw error;
       setMsg("Hvis e-mail findes, er der sendt en reset-mail.");
-    } catch (e: any) { setMsg(e.message ?? "Fejl"); }
+    } catch (e: any) { setMsg(localizeAuthErrorMessage(e?.message, "reset")); }
     finally { setLoading(false); }
   }
 

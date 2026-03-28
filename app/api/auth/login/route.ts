@@ -2,6 +2,22 @@ import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
+function localizeLoginError(message: unknown) {
+  const raw = String(message ?? "").trim();
+  const normalized = raw.toLowerCase();
+  if (!normalized) return "Noget gik galt. Prøv igen.";
+  if (normalized.includes("invalid login credentials")) return "Forkert e-mail eller kodeord.";
+  if (normalized.includes("email not confirmed")) return "Bekræft din e-mail, før du logger ind.";
+  if (
+    normalized.includes("security purposes") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("rate limit")
+  ) {
+    return "Du har prøvet for mange gange. Vent lidt og prøv igen.";
+  }
+  return "Noget gik galt. Prøv igen.";
+}
+
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
   const vercelEnv = process.env.VERCEL_ENV ?? null;
@@ -38,7 +54,7 @@ export async function POST(req: NextRequest) {
         });
       }
       return NextResponse.json(
-        { ok: false, error: error?.message ?? "Login mislykkedes." },
+        { ok: false, error: localizeLoginError(error?.message) },
         { status: 401 },
       );
     }
@@ -77,7 +93,7 @@ export async function POST(req: NextRequest) {
       });
     }
     return NextResponse.json(
-      { ok: false, error: error?.message ?? "Login mislykkedes." },
+      { ok: false, error: localizeLoginError(error?.message) },
       { status: 500 },
     );
   }

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { createBrowserClient } from "@/lib/supabase/client";
+import { localizeAuthErrorMessage } from "../_lib/localizeAuthError";
 
 function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null, defaultTarget: string) {
   const candidate = String(rawNext ?? rawReturnTo ?? "").trim();
@@ -114,7 +115,7 @@ export default function SignupPageClient() {
         message: e?.message ?? "Kunne ikke oprette konto",
         name: e?.name ?? null,
       });
-      setMsg(e.message ?? "Kunne ikke oprette konto");
+      setMsg(localizeAuthErrorMessage(e?.message, "signup"));
     } finally {
       console.info("[auth-debug] signup submit:finally", { loadingWillBeFalse: true });
       setLoading(false);
