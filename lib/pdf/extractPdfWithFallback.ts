@@ -422,10 +422,9 @@ async function extractPdfPagesViaPdfjs(
 ): Promise<{ pageCount: number; pages: PdfPageSource[] }> {
   const mod: any = await import("pdfjs-dist/legacy/build/pdf.js");
   const pdfjs: any = mod?.default ?? mod;
-  if (pdfjs?.GlobalWorkerOptions) {
-    try {
-      pdfjs.GlobalWorkerOptions.workerSrc = require.resolve("pdfjs-dist/legacy/build/pdf.worker.js");
-    } catch {}
+  if (!(globalThis as any).pdfjsWorker?.WorkerMessageHandler) {
+    const workerMod: any = require("pdfjs-dist/legacy/build/pdf.worker.js");
+    (globalThis as any).pdfjsWorker = workerMod?.default ?? workerMod;
   }
 
   const loadingTask = pdfjs.getDocument({
