@@ -37,12 +37,6 @@ function resolveSupportEmail() {
   return "info@notely.dk";
 }
 
-function buildMailtoHref(email: string, subject: string, bodyLines: string[]) {
-  const encodedSubject = encodeURIComponent(subject);
-  const encodedBody = encodeURIComponent(bodyLines.join("\n"));
-  return `mailto:${email}?subject=${encodedSubject}&body=${encodedBody}`;
-}
-
 export default async function TrainerAccountPage() {
   const sb = await supabaseServerRSC();
   const { ownerId, email } = await getTrainerSession();
@@ -53,17 +47,7 @@ export default async function TrainerAccountPage() {
   const limits = await getPlanLimits(sb, plan);
   const accountEmail = email ?? "Ikke tilgængelig";
   const supportEmail = resolveSupportEmail();
-  const deleteAccountHref = buildMailtoHref(
-    supportEmail,
-    "Anmodning om sletning af konto",
-    [
-      "Hej Notely,",
-      "",
-      "Jeg vil gerne anmode om sletning af min konto.",
-      `Konto: ${email}`,
-      `Plan: ${planLabel(plan)}`,
-    ],
-  );
+  const deleteAccountHref = `mailto:${supportEmail}`;
   const isPaidPlan = plan === "basis" || plan === "pro";
 
   return (
