@@ -2,7 +2,7 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
@@ -57,7 +57,7 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "INVALID_ID", error: "Ugyldigt fil-id." }, { status: 400 });
   }
 
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const ownerId = await resolveOwnerId(req, sb);
 
   if (!ownerId) {
@@ -164,11 +164,11 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "INVALID_ID", error: "Ugyldigt fil-id." }, { status: 400 });
   }
 
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const ownerId = await resolveOwnerId(req, sb);
 
   if (!ownerId) {
-    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kr?ves." }, { status: 401 });
+    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
   }
 
   let admin: any;
@@ -188,7 +188,7 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
 
   if (rFile.error) {
     console.error("/api/files/[id] DELETE file lookup fejl", rFile.error);
-    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke l?se filen." }, { status: 500 });
+    return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke læse filen." }, { status: 500 });
   }
 
   if (!rFile.data?.id) {
