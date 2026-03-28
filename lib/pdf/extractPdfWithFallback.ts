@@ -1,5 +1,6 @@
 import "server-only";
 
+import { createRequire } from "node:module";
 import OpenAI from "openai";
 import { PDFDocument } from "pdf-lib";
 
@@ -100,6 +101,7 @@ type PdfPageSource = {
 
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+const require = createRequire(import.meta.url);
 
 function normalizePageText(input: string) {
   return String(input ?? "")
@@ -420,6 +422,11 @@ async function extractPdfPagesViaPdfjs(
 ): Promise<{ pageCount: number; pages: PdfPageSource[] }> {
   const mod: any = await import("pdfjs-dist/legacy/build/pdf.js");
   const pdfjs: any = mod?.default ?? mod;
+  if (pdfjs?.GlobalWorkerOptions) {
+    try {
+      pdfjs.GlobalWorkerOptions.workerSrc = require.resolve("pdfjs-dist/legacy/build/pdf.worker.js");
+    } catch {}
+  }
 
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buf),
