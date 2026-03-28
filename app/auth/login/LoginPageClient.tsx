@@ -18,6 +18,13 @@ function buildAuthSiblingHref(basePath: string, rawNext: string | null, rawRetur
   return `${basePath}?next=${encodeURIComponent(target)}`;
 }
 
+function resolveAuthRedirectBase() {
+  const configured = String(process.env.NEXT_PUBLIC_SITE_URL ?? "").trim();
+  if (/^https?:\/\//i.test(configured)) return configured.replace(/\/+$/, "");
+  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  return "http://localhost:3000";
+}
+
 export default function LoginPageClient() {
   const [supabase] = useState(() => createBrowserClient());
   const searchParams = useSearchParams();
@@ -120,6 +127,7 @@ export default function LoginPageClient() {
     setLoading(true);
     try {
       const target = resolvePostAuthPath(searchParams.get("next"), searchParams.get("returnTo"), defaultTarget);
+      const authRedirectBase = resolveAuthRedirectBase();
       const rawNext = searchParams.get("next");
       const rawReturnTo = searchParams.get("returnTo");
       console.info("[auth-debug] magic submit:start", {
@@ -127,11 +135,12 @@ export default function LoginPageClient() {
         rawNext,
         rawReturnTo,
         target,
+        authRedirectBase,
         location: typeof window !== "undefined" ? window.location.href : null,
       });
       const { error } = await supabase.auth.signInWithOtp({
         email,
-        options: { emailRedirectTo: `${location.origin}/auth/callback?next=${encodeURIComponent(target)}` }
+        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?next=${encodeURIComponent(target)}` }
       });
       console.info("[auth-debug] magic signInWithOtp:response", {
         error: error?.message ?? null,
@@ -154,8 +163,9 @@ export default function LoginPageClient() {
   async function onReset(e: React.MouseEvent) {
     e.preventDefault(); setMsg(null); setLoading(true);
     try {
+      const authRedirectBase = resolveAuthRedirectBase();
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${location.origin}/auth/reset`
+        redirectTo: `${authRedirectBase}/auth/reset`
       });
       if (error) throw error;
       setMsg("Hvis e-mail findes, er der sendt en reset-mail.");

@@ -18,6 +18,13 @@ function buildAuthSiblingHref(basePath: string, rawNext: string | null, rawRetur
   return `${basePath}?next=${encodeURIComponent(target)}`;
 }
 
+function resolveAuthRedirectBase() {
+  const configured = String(process.env.NEXT_PUBLIC_SITE_URL ?? "").trim();
+  if (/^https?:\/\//i.test(configured)) return configured.replace(/\/+$/, "");
+  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  return "http://localhost:3000";
+}
+
 export default function SignupPageClient() {
   const [supabase] = useState(() => createBrowserClient());
   const searchParams = useSearchParams();
@@ -82,6 +89,7 @@ export default function SignupPageClient() {
     setLoading(true);
     try {
       const target = resolvePostAuthPath(searchParams.get("next"), searchParams.get("returnTo"), defaultTarget);
+      const authRedirectBase = resolveAuthRedirectBase();
       const rawNext = searchParams.get("next");
       const rawReturnTo = searchParams.get("returnTo");
       console.info("[auth-debug] signup submit:start", {
@@ -89,12 +97,13 @@ export default function SignupPageClient() {
         rawNext,
         rawReturnTo,
         target,
+        authRedirectBase,
         location: typeof window !== "undefined" ? window.location.href : null,
       });
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
-        options: { emailRedirectTo: `${location.origin}/auth/callback?next=${encodeURIComponent(target)}` }
+        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?next=${encodeURIComponent(target)}` }
       });
       console.info("[auth-debug] signup signUp:response", {
         hasUser: !!data?.user,
