@@ -140,7 +140,7 @@ export default function LoginPageClient() {
       });
       const { error } = await supabase.auth.signInWithOtp({
         email,
-        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?next=${encodeURIComponent(target)}` }
+        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?flow=magic&next=${encodeURIComponent(target)}` }
       });
       console.info("[auth-debug] magic signInWithOtp:response", {
         error: error?.message ?? null,

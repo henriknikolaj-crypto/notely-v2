@@ -16,17 +16,26 @@ function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null)
   return candidate;
 }
 
+function resolveCallbackRedirectPath(flow: string | null, next: string) {
+  if (flow === "signup") {
+    return `/auth/login?next=${encodeURIComponent(next)}`;
+  }
+  return next;
+}
+
 export async function GET(request: NextRequest) {
   const requestId = randomUUID();
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
+  const flow = searchParams.get("flow");
   const rawNext = searchParams.get("next");
   const rawReturnTo = searchParams.get("returnTo");
   const next = resolvePostAuthPath(rawNext, rawReturnTo);
+  const redirectPath = resolveCallbackRedirectPath(flow, next);
   const previewDebug = process.env.VERCEL_ENV === "preview";
   const cookiesAttemptedToSet: string[] = [];
 
-  const redirectResponse = NextResponse.redirect(new URL(next, request.url), { status: 303 });
+  const redirectResponse = NextResponse.redirect(new URL(redirectPath, request.url), { status: 303 });
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -58,6 +67,7 @@ export async function GET(request: NextRequest) {
           requestId,
           hasCode: !!code,
           exchangeOk: false,
+          flow,
           cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
           redirectTarget: `${url.pathname}${url.search}`,
         });
@@ -86,8 +96,9 @@ export async function GET(request: NextRequest) {
       requestId,
       hasCode: !!code,
       exchangeOk,
+      flow,
       cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
-      redirectTarget: next,
+      redirectTarget: redirectPath,
     });
   }
   return redirectResponse;

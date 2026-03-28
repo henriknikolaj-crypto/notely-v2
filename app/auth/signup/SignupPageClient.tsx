@@ -103,7 +103,7 @@ export default function SignupPageClient() {
       const { data, error } = await supabase.auth.signUp({
         email,
         password,
-        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?next=${encodeURIComponent(target)}` }
+        options: { emailRedirectTo: `${authRedirectBase}/auth/callback?flow=signup&next=${encodeURIComponent(target)}` }
       });
       console.info("[auth-debug] signup signUp:response", {
         hasUser: !!data?.user,
