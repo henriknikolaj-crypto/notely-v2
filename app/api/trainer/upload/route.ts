@@ -524,9 +524,25 @@ export async function POST(req: NextRequest) {
       try {
         extraction = await extractPdfWithFallback(buf, { fileName: originalName });
       } catch (e) {
-        console.error("[trainer/upload] pdf extract error:", errInfo(e));
+        const extractionError = errInfo(e);
+        const pdfDebug = {
+          requestId,
+          filename: originalName,
+          contentType: mimeType || null,
+          size: typeof file.size === "number" ? file.size : buf.length,
+          errorMessage: extractionError.message ?? "Unknown error",
+          errorCode: extractionError.code ?? null,
+          stage: "pdf_extract" as const,
+        };
+        console.error("[trainer/upload] pdf extract error", pdfDebug, extractionError);
         return NextResponse.json(
-          { ok: false, code: "PDF_UNREADABLE", error: "PDF kunne ikke læses.", requestId },
+          {
+            ok: false,
+            code: "PDF_UNREADABLE",
+            error: "PDF kunne ikke læses.",
+            requestId,
+            ...(process.env.VERCEL_ENV ? { debug: pdfDebug } : {}),
+          },
           { status: 400 },
         );
       }
