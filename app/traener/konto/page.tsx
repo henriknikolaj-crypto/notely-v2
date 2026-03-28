@@ -159,6 +159,13 @@ export default async function TrainerAccountPage() {
         >
           Kontakt om sletning af konto
         </a>
+        <p className="text-xs text-zinc-500">
+          Hvis der ikke åbner en mail, skriv til{" "}
+          <a href={`mailto:${supportEmail}`} className="text-zinc-700 underline underline-offset-2 hover:text-zinc-900">
+            {supportEmail}
+          </a>
+          .
+        </p>
       </section>
     </main>
   );
