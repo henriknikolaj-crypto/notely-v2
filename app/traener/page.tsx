@@ -1,6 +1,7 @@
 ﻿// app/traener/page.tsx
 import "server-only";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { hasOwnUsableMaterial } from "@/lib/trainer/hasOwnUsableMaterial";
 import { redirect } from "next/navigation";
 import ClientTrainer from "./ux/ClientTrainer";
 
@@ -14,44 +15,6 @@ type FolderRow = {
 
 const DEMO_SCOPE_ID = "demo-samfund";
 const DEMO_SCOPE_NAME = "Samfund";
-
-async function hasOwnUsableMaterial(sb: any, ownerId: string): Promise<boolean> {
-  const { data: filesData, error: filesError } = await sb
-    .from("files")
-    .select("id")
-    .eq("owner_id", ownerId)
-    .order("created_at", { ascending: false })
-    .limit(200);
-
-  if (filesError) {
-    console.error("TRÆNER page files readiness error:", filesError);
-    return false;
-  }
-
-  const fileIds = (filesData ?? [])
-    .map((row: any) => String(row?.id ?? "").trim())
-    .filter(Boolean);
-
-  if (fileIds.length === 0) return false;
-
-  const { data: chunkData, error: chunkError } = await sb
-    .from("doc_chunks")
-    .select("id,content")
-    .eq("owner_id", ownerId)
-    .in("file_id", fileIds)
-    .not("content", "is", null)
-    .limit(20);
-
-  if (chunkError) {
-    console.error("TRÆNER page doc_chunks readiness error:", chunkError);
-    return false;
-  }
-
-  return (
-    Array.isArray(chunkData) &&
-    chunkData.some((row: any) => String(row?.content ?? "").trim().length > 0)
-  );
-}
 
 export default async function Page({
   searchParams,

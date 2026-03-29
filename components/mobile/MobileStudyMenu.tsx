@@ -30,7 +30,7 @@ const items = [
   },
 ];
 
-export default function MobileStudyMenu() {
+export default function MobileStudyMenu({ showDemoBadge = false }: { showDemoBadge?: boolean }) {
   return (
     <section className="space-y-4">
       <header className="space-y-2 border-b border-zinc-200 pb-3">
@@ -53,7 +53,7 @@ export default function MobileStudyMenu() {
                 <div className="text-base font-semibold text-zinc-900">{item.title}</div>
                 <p className="mt-1 text-sm leading-6 text-zinc-600">{item.description}</p>
               </div>
-              {"badge" in item ? (
+              {"badge" in item && (item.badge !== "Demo" || showDemoBadge) ? (
                 <span
                   className={
                     "shrink-0 rounded-full px-2 py-1 text-[11px] font-medium " +

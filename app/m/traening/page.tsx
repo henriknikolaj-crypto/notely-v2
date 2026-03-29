@@ -1,18 +1,23 @@
 import MobileStudyMenu from "@/components/mobile/MobileStudyMenu";
 import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import MobileHubHeader from "@/components/mobile/MobileHubHeader";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { hasOwnUsableMaterial } from "@/lib/trainer/hasOwnUsableMaterial";
 
 export const dynamic = "force-dynamic";
 
 export default async function MobileTrainingMenuPage() {
   let userEmail: string | null = null;
+  let showDemoBadge = false;
   try {
     const sb = await supabaseServerRSC();
-    const { data } = await sb.auth.getUser();
-    userEmail = data?.user?.email ?? null;
+    const { ownerId, email } = await getTrainerSession();
+    userEmail = email;
+    showDemoBadge = !!ownerId && !(await hasOwnUsableMaterial(sb, ownerId));
   } catch {
     userEmail = null;
+    showDemoBadge = false;
   }
 
   return (
@@ -20,7 +25,7 @@ export default async function MobileTrainingMenuPage() {
       <div className="mx-auto max-w-3xl space-y-4">
         <MobileHubHeader userEmail={userEmail} />
         <MobileBackToMenu href="/m" label="← Tilbage til hovedmenu" />
-        <MobileStudyMenu />
+        <MobileStudyMenu showDemoBadge={showDemoBadge} />
       </div>
     </main>
   );
