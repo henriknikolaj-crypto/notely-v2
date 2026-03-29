@@ -47,6 +47,13 @@ export default function LoginPageClient() {
     });
   }, [searchParams]);
 
+  useEffect(() => {
+    const errorDescription = searchParams.get("error_description");
+    const error = searchParams.get("error");
+    if (!errorDescription && !error) return;
+    setMsg(localizeAuthErrorMessage(errorDescription ?? error, "magic"));
+  }, [searchParams]);
+
   async function trackLoginCompleted(ownerId?: string | null, metadata?: Record<string, unknown>) {
     const resolvedOwnerId = String(ownerId ?? "").trim();
     if (!resolvedOwnerId) return;
