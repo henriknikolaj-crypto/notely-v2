@@ -4,7 +4,7 @@ export type AuthErrorContext = "login" | "magic" | "reset" | "signup";
 
 function defaultMessage(context: AuthErrorContext) {
   if (context === "magic") return "Vi kunne ikke sende login-linket. Prøv igen.";
-  if (context === "reset") return "Vi kunne ikke sende login-linket. Prøv igen.";
+  if (context === "reset") return "Vi kunne ikke sende nulstillingsmailen. Prøv igen.";
   if (context === "signup") return "Noget gik galt. Prøv igen.";
   return "Noget gik galt. Prøv igen.";
 }
