@@ -16,9 +16,12 @@ function resolvePostAuthPath(rawNext: string | null, rawReturnTo: string | null)
   return candidate;
 }
 
-function resolveCallbackRedirectPath(flow: string | null, next: string) {
-  if (flow === "signup") {
+function resolveCallbackRedirectPath(flow: string | null, authType: string | null, next: string) {
+  if (flow === "signup" || authType === "signup") {
     return `/auth/login?next=${encodeURIComponent(next)}`;
+  }
+  if (authType === "recovery") {
+    return "/auth/reset";
   }
   return next;
 }
@@ -28,10 +31,11 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
   const flow = searchParams.get("flow");
+  const authType = searchParams.get("type");
   const rawNext = searchParams.get("next");
   const rawReturnTo = searchParams.get("returnTo");
   const next = resolvePostAuthPath(rawNext, rawReturnTo);
-  const redirectPath = resolveCallbackRedirectPath(flow, next);
+  const redirectPath = resolveCallbackRedirectPath(flow, authType, next);
   const previewDebug = process.env.VERCEL_ENV === "preview";
   const cookiesAttemptedToSet: string[] = [];
 
@@ -68,6 +72,7 @@ export async function GET(request: NextRequest) {
           hasCode: !!code,
           exchangeOk: false,
           flow,
+          authType,
           cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
           redirectTarget: `${url.pathname}${url.search}`,
         });
@@ -97,6 +102,7 @@ export async function GET(request: NextRequest) {
       hasCode: !!code,
       exchangeOk,
       flow,
+      authType,
       cookiesAttemptedToSet: Array.from(new Set(cookiesAttemptedToSet)),
       redirectTarget: redirectPath,
     });
