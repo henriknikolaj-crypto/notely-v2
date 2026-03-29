@@ -64,8 +64,13 @@ export async function GET(request: NextRequest) {
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (error) {
       const url = new URL("/auth/login", request.url);
+      if (authType === "recovery") {
+        url.pathname = "/auth/reset";
+      }
       url.searchParams.set("error", error.message);
-      url.searchParams.set("next", next);
+      if (authType !== "recovery") {
+        url.searchParams.set("next", next);
+      }
       if (previewDebug) {
         console.info("[auth-callback-preview-debug]", {
           requestId,
