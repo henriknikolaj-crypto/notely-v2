@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import MobileHubHeader from "@/components/mobile/MobileHubHeader";
 import MobileNotesFlow from "@/components/mobile/MobileNotesFlow";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 
 export const dynamic = "force-dynamic";
@@ -16,21 +17,6 @@ type FileOption = {
   id: string;
   name: string | null;
 };
-
-async function getOwnerCtx(sb: any): Promise<{ ownerId: string | null; userEmail: string | null }> {
-  try {
-    const { data } = await sb.auth.getUser();
-    return {
-      ownerId: data?.user?.id ?? null,
-      userEmail: data?.user?.email ?? null,
-    };
-  } catch {
-    return {
-      ownerId: null,
-      userEmail: null,
-    };
-  }
-}
 
 async function listFolders(sb: any, ownerId: string): Promise<FolderOption[]> {
   const { data, error } = await sb
@@ -80,7 +66,7 @@ export default async function MobileNotesPage({
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sb = await supabaseServerRSC();
-  const { ownerId, userEmail } = await getOwnerCtx(sb);
+  const { ownerId, email: userEmail } = await getTrainerSession();
 
   if (!ownerId) {
     return <section className="p-6 text-sm text-red-600">Du skal være logget ind for at åbne Noter.</section>;

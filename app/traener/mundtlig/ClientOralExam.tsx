@@ -89,6 +89,11 @@ function getMediaRecorderCtor() {
   return (window as any).MediaRecorder ?? (window as any).webkitMediaRecorder ?? null;
 }
 
+function getAudioContextCtor() {
+  if (typeof window === "undefined") return null;
+  return window.AudioContext ?? (window as any).webkitAudioContext ?? null;
+}
+
 type MicStartIssue = {
   reason:
     | "no_window"
@@ -293,6 +298,8 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId, isPro =
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -394,6 +401,16 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId, isPro =
   useEffect(() => {
     return () => {
       try {
+        if (playbackSourceRef.current) {
+          playbackSourceRef.current.onended = null;
+          try {
+            playbackSourceRef.current.stop();
+          } catch {
+            // ignore
+          }
+          playbackSourceRef.current.disconnect();
+        }
+        playbackSourceRef.current = null;
         if (audioRef.current) {
           audioRef.current.pause();
           audioRef.current.onended = null;
@@ -405,6 +422,12 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId, isPro =
       } catch {
         // ignore
       }
+      try {
+        void playbackContextRef.current?.close();
+      } catch {
+        // ignore
+      }
+      playbackContextRef.current = null;
       if (vadFrameRef.current != null) {
         cancelAnimationFrame(vadFrameRef.current);
         vadFrameRef.current = null;
@@ -424,6 +447,16 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId, isPro =
 
   function cleanupPlayback() {
     try {
+      if (playbackSourceRef.current) {
+        playbackSourceRef.current.onended = null;
+        try {
+          playbackSourceRef.current.stop();
+        } catch {
+          // ignore
+        }
+        playbackSourceRef.current.disconnect();
+      }
+      playbackSourceRef.current = null;
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.onended = null;
@@ -435,6 +468,90 @@ export default function ClientOralExam({ scopeFolderIds, activeFolderId, isPro =
     } catch {
       // ignore
     }
+  }
+
+  async function ensurePlaybackContext() {
+    const AudioContextCtor = getAudioContextCtor();
+    if (!AudioContextCtor) return null;
+
+    let ctx = playbackContextRef.current;
+    if (!ctx || ctx.state === "closed") {
+      ctx = new AudioContextCtor();
+      playbackContextRef.current = ctx;
+    }
+
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+
+    return ctx;
+  }
+
+  async function primePlaybackContext() {
+    const ctx = await ensurePlaybackContext();
+    if (!ctx) return;
+
+    const source = ctx.createBufferSource();
+    source.buffer = ctx.createBuffer(1, 1, 22050);
+    source.connect(ctx.destination);
+    source.start(0);
+    source.disconnect();
+  }
+
+  async function playQuestionAudio(blob: Blob, nextTurnIndex: number) {
+    const ctx = await ensurePlaybackContext().catch(() => null);
+    if (ctx) {
+      try {
+        const arrayBuffer = await blob.arrayBuffer();
+        const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+
+        await new Promise<void>((resolve, reject) => {
+          const source = ctx.createBufferSource();
+          playbackSourceRef.current = source;
+          source.buffer = decoded;
+          source.connect(ctx.destination);
+          source.onended = () => {
+            if (playbackSourceRef.current === source) {
+              playbackSourceRef.current = null;
+            }
+            source.disconnect();
+            resolve();
+          };
+
+          try {
+            source.start(0);
+          } catch (error) {
+            if (playbackSourceRef.current === source) {
+              playbackSourceRef.current = null;
+            }
+            source.disconnect();
+            reject(error);
+          }
+        });
+        return;
+      } catch (error: any) {
+        oralDevLog("question_playback_web_audio_failed", {
+          nextTurnIndex,
+          error: String(error?.message ?? error ?? "unknown"),
+        });
+        cleanupPlayback();
+      }
+    }
+
+    const url = URL.createObjectURL(blob);
+    audioUrlRef.current = url;
+    const audio = new Audio(url);
+    (audio as HTMLAudioElement & { playsInline?: boolean }).playsInline = true;
+    audioRef.current = audio;
+
+    await new Promise<void>((resolve, reject) => {
+      audio.onended = () => resolve();
+      audio.onerror = () => reject(new Error("Kunne ikke afspille spørgsmålslyd."));
+      const p = audio.play();
+      if (p && typeof p.then === "function") {
+        p.catch(() => reject(new Error("Autoplay blev blokeret af browseren.")));
+      }
+    });
   }
 
   function cleanupVad() {
@@ -798,10 +915,6 @@ async function ensureMicStream() {
 
     const blob = b64ToBlob(json.audioBase64, json.mime || "audio/mpeg");
     cleanupPlayback();
-    const url = URL.createObjectURL(blob);
-    audioUrlRef.current = url;
-    const audio = new Audio(url);
-    audioRef.current = audio;
 
     setPhase("speaking");
     oralDevLog("question_playing", {
@@ -810,14 +923,7 @@ async function ensureMicStream() {
       audioBytes: blob.size,
     });
 
-    await new Promise<void>((resolve, reject) => {
-      audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error("Kunne ikke afspille spørgsmålslyd."));
-      const p = audio.play();
-      if (p && typeof p.then === "function") {
-        p.catch(() => reject(new Error("Autoplay blev blokeret af browseren.")));
-      }
-    });
+    await playQuestionAudio(blob, nextTurnIndex);
   }
 
   async function startTurn(nextTurnIndex: number, lastAnswerText?: string) {
@@ -839,6 +945,7 @@ async function ensureMicStream() {
     stopRequestedRef.current = false;
     oralDevLog("retry_current_question_started", { turnIndex, attemptCount });
     try {
+      await primePlaybackContext().catch(() => {});
       await startRecorder();
     } catch (e: any) {
       setPhase("paused");
@@ -864,6 +971,7 @@ async function ensureMicStream() {
     busyRef.current = true;
     setPhase("thinking");
     try {
+      await primePlaybackContext().catch(() => {});
       await startTurn(turnIndex + 1);
     } catch (e: any) {
       setPhase("paused");
@@ -929,6 +1037,7 @@ async function ensureMicStream() {
 
     busyRef.current = true;
     try {
+      await primePlaybackContext().catch(() => {});
       await startTurn(0);
     } catch (e: any) {
       setPhase("idle");
