@@ -10,6 +10,7 @@ const items = [
     href: "/m/traening",
     title: "Noter / træning",
     description: "Åbn den simple menu til noter og træningsflows.",
+    badge: "Demo",
   },
   {
     href: "/upload",
@@ -42,7 +43,14 @@ export default function MobileHomeMenu() {
             href={item.href}
             className="block rounded-2xl border border-zinc-200 bg-white px-4 py-4 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50"
           >
-            <div className="text-base font-semibold text-zinc-900">{item.title}</div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-base font-semibold text-zinc-900">{item.title}</div>
+              {"badge" in item ? (
+                <span className="shrink-0 rounded-full border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[11px] font-medium text-zinc-600">
+                  {item.badge}
+                </span>
+              ) : null}
+            </div>
             <p className="mt-1 text-sm leading-6 text-zinc-600">{item.description}</p>
           </Link>
         ))}

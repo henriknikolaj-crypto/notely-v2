@@ -20,6 +20,7 @@ const items = [
     href: "/traener",
     title: "Træner",
     description: "Få spørgsmål og feedback på dine egne svar.",
+    badge: "Demo",
   },
   {
     href: "/eksamen",
@@ -53,7 +54,14 @@ export default function MobileStudyMenu() {
                 <p className="mt-1 text-sm leading-6 text-zinc-600">{item.description}</p>
               </div>
               {"badge" in item ? (
-                <span className="shrink-0 rounded-full border border-zinc-300 px-2 py-1 text-[11px] font-medium text-zinc-700">
+                <span
+                  className={
+                    "shrink-0 rounded-full px-2 py-1 text-[11px] font-medium " +
+                    (item.badge === "Demo"
+                      ? "border border-zinc-200 bg-zinc-50 text-zinc-600"
+                      : "border border-zinc-300 text-zinc-700")
+                  }
+                >
                   {item.badge}
                 </span>
               ) : null}
