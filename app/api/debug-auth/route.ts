@@ -1,7 +1,12 @@
-﻿ 
 import { NextRequest, NextResponse } from "next/server";
+import { requireDevSecret } from "@/lib/dev/guard";
 
 export async function GET(req: NextRequest) {
+  const guard = requireDevSecret(req);
+  if (!guard.ok) {
+    return NextResponse.json({ ok: false, error: guard.message }, { status: guard.status });
+  }
+
   const hdr = req.headers.get("authorization") || "";
   const token = hdr.startsWith("Bearer ") ? hdr.slice(7).trim() : hdr.trim();
   const expected = process.env.IMPORT_SHARED_SECRET || "";
@@ -22,6 +27,3 @@ export async function GET(req: NextRequest) {
     match: !!token && !!expected && token === expected,
   });
 }
-
-
-

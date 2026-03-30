@@ -2,7 +2,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
@@ -38,7 +38,7 @@ async function readJson(req: NextRequest) {
 export async function POST(req: NextRequest, ctx: RouteCtx) {
   const { id } = await ctx.params;
 
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const owner = await getOwnerCtx(req, sb);
   if (!owner) {
     return NextResponse.json(

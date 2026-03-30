@@ -1,93 +1,127 @@
-// app/traener/flashcards/page.tsx
 import "server-only";
-import { redirect } from "next/navigation";
+
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
+import FlashcardsClient from "./FlashcardsClient";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore
+type SearchParams =
+  | Record<string, string | string[] | undefined>
+  | undefined;
+
+function parseScopeIds(scopeRaw: unknown): string[] {
+  if (typeof scopeRaw === "string") {
+    return scopeRaw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
   }
-  return null;
+  if (Array.isArray(scopeRaw)) {
+    return scopeRaw
+      .join(",")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
 
-type PageProps = {
-  searchParams?: Promise<Record<string, string | string[] | undefined>>;
-};
+async function getResolvedScope(sb: any, ownerId: string, folderIds: string[]) {
+  if (!folderIds.length) return { scopeFolderIds: [] as string[], names: [] as string[] };
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .in("id", folderIds);
 
-export default async function FlashcardsPage({ searchParams }: PageProps) {
-  const sp = (await searchParams) ?? {};
-
-  const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
-
-  if (!ownerId) {
-    redirect("/auth/login");
+  if (error) {
+    console.error("[flashcards/page] folders load error:", error);
+    return { scopeFolderIds: [] as string[], names: [] as string[] };
   }
 
-  // Aktiv mappe (via klik på mappe-navn)
-  const folderParam = sp.folder;
-  const activeFolderId = typeof folderParam === "string" ? folderParam : null;
+  const map = new Map<string, string>();
+  for (const r of (data ?? []) as any[]) {
+    const id = String(r.id);
+    const name = String(r.name ?? "").trim();
+    if (id && name) map.set(id, name);
+  }
 
-  // Scope: comma-separeret liste af folder-id'er fra venstre tjekbokse
-  const scopeParam = sp.scope;
-  const scopeRaw = typeof scopeParam === "string" ? scopeParam : "";
-  const scopeIds = scopeRaw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const scopeFolderIds = folderIds.filter((id) => map.has(id));
+  const names = scopeFolderIds.map((id) => map.get(id) as string);
+  return { scopeFolderIds, names };
+}
 
-  const scopeLabel = (() => {
-    if (scopeIds.length > 0) {
-      if (scopeIds.length === 1) return "Du træner flashcards på 1 valgt mappe.";
-      return `Du træner flashcards på ${scopeIds.length} valgte mapper.`;
-    }
-    if (activeFolderId) {
-      return "Flashcards bliver senere koblet direkte til den valgte mappe.";
-    }
-    return "Vælg en eller flere mapper i venstre side for at definere, hvad dine flashcards skal dække.";
-  })();
+async function listFolderOptions(sb: any, ownerId: string) {
+  const { data, error } = await sb
+    .from("folders")
+    .select("id,name")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) {
+    console.error("[flashcards/page] folder options load error:", error);
+    return [] as Array<{ id: string; name: string }>;
+  }
+
+  return ((data ?? []) as any[])
+    .map((row) => {
+      const id = String(row?.id ?? "").trim();
+      const name = String(row?.name ?? "").trim();
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean) as Array<{ id: string; name: string }>;
+}
+
+export default async function Page({
+  searchParams,
+}: {
+  searchParams?: Promise<SearchParams>;
+}) {
+  const sb = await supabaseServerRSC();
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
+
+  const sp = (await searchParams) ?? {};
+  const requestedScopeFolderIds = parseScopeIds(sp.scope);
+  const folderOptions = await listFolderOptions(sb, ownerId);
+  const resolvedScope = await getResolvedScope(sb, ownerId, requestedScopeFolderIds);
+  const scopeFolderIds = resolvedScope.scopeFolderIds;
+  const names = resolvedScope.names;
+  const hasScope = scopeFolderIds.length > 0;
 
   return (
-    <main className="max-w-3xl px-4 py-6 md:px-0 space-y-4">
-      <header className="space-y-1">
-        <h1 className="text-xl font-semibold">Flashcards</h1>
-        <p className="text-sm text-zinc-600">
-          Her kommer dine kort til hurtig repetition af begreber, formler og
-          nøglepointer – altid baseret på dit eget materiale.
+    <section className="space-y-4">
+      <header className="mb-2 border-b border-zinc-200 pb-3">
+        <h1 className="text-lg font-semibold">Flashcards</h1>
+        <p className="mt-1 text-sm text-zinc-600">
+          Træn på dit eget pensum. Generér kort til hurtig repetition af begreber,
+          formler og nøglepointer.
         </p>
       </header>
 
-      {/* Scope-summary – samme koncept som på Træner/MC */}
-      <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
-        <p className="text-xs text-zinc-600">{scopeLabel}</p>
-        <p className="mt-1 text-[11px] text-zinc-500">
-          Vi bruger de samme mapper og materialer, som du vælger i venstre side.
-        </p>
-      </section>
+      <TrainingScopeCard
+        names={names}
+        className="md:hidden"
+        emptyLabel="Vælg en mappe direkte her."
+        helpText={!hasScope ? "Flashcards er låst, indtil du har valgt en mappe." : undefined}
+      >
+        <FeatureScopePicker selectedNames={names} selectedScopeIds={scopeFolderIds} initialFolders={folderOptions} />
+      </TrainingScopeCard>
+      <TrainingScopeCard
+        names={names}
+        className="hidden md:block"
+        emptyLabel="Vælg en mappe i venstre side."
+        helpText={!hasScope ? "Flashcards er låst, indtil du har valgt en mappe." : undefined}
+      />
 
-      {/* Placeholder-indhold – selve flashcards-funktionen kommer senere */}
-      <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-        <h3 className="mb-1 text-sm font-semibold">Flashcards er på vej</h3>
-        <p className="text-sm text-zinc-600">
-          Selve flashcard-funktionen er endnu ikke aktiveret i denne version.
-          Planen er, at Notely automatisk kan foreslå kort ud fra dine mapper og
-          noter – så du kan øve begreber, definitioner og små forklaringer
-          lynhurtigt.
-        </p>
-        <p className="mt-2 text-xs text-zinc-500">
-          Du kan allerede nu forberede dig ved at uploade materiale og vælge
-          mapper til træning. Når flashcards er klar, vil de automatisk bruge det
-          samme træningsområde.
-        </p>
-      </section>
-    </main>
+      <div className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+        <FlashcardsClient scopeFolderIds={scopeFolderIds} />
+      </div>
+    </section>
   );
 }

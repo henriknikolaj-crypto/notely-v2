@@ -1,10 +1,13 @@
 // app/api/generate-mc-question/route.ts
 import "server-only";
 
+import { requireFlowModel } from "@/lib/openai/requireModel";
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "@/lib/auth";
-import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
+import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
+import { consumeMcQuota, getMcQuotaSnapshot } from "@/lib/quota/mc";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,46 +17,148 @@ type Difficulty = "easy" | "medium" | "hard";
 type GenerateMcRequest = {
   scopeFolderIds?: string[];
   difficulty?: Difficulty;
-  maxContextChunks?: number; // total chunks in context (across files)
+  maxContextChunks?: number;
+
+  avoidQuestions?: string[];
+  avoidChunkIds?: string[];
+  avoidTopics?: string[];
 };
 
 type McOptionPayload = {
-  id: string; // "a" | "b" | "c" | "d"
+  id: string; // "a"|"b"|"c"|"d"
   text: string;
   isCorrect: boolean;
 };
 
 type McCitationPayload = {
   chunkId: string;
+  fileId: string | null;
   title: string | null;
   url: string | null;
 };
 
-type GenerateMcResponse = {
+type McMeta = {
+  requestId: string;
+  usedChunkIds: string[];
+  usedFileTitle: string | null;
+};
+
+type GenerateMcOk = {
   ok: true;
   questionId: string;
   question: string;
   options: McOptionPayload[];
   explanation: string | null;
   citations: McCitationPayload[];
-  usedFileId: string | null; // rotation anchor (for variation/debug/backwards compat)
+  usedFileId: string | null;
+  meta: McMeta;
+};
+
+type GenerateMcErr = {
+  ok: false;
+  error: string;
+  requestId: string;
+  code?: string;
+  feature?: string;
+  plan?: string;
+  usedThisMonth?: number;
+  monthlyLimit?: number | null;
+  resetAt?: string;
+  debug?: any;
+};
+
+type FileRow = {
+  id: string;
+  name: string | null;
+  original_name: string | null;
+  folder_id: string | null;
+  created_at: string | null;
+};
+
+type ChunkRow = {
+  id: string;
+  file_id: string;
+  content: string | null;
+  created_at: string | null;
+  source_url?: string | null;
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-async function readJsonBody<T>(req: NextRequest) {
-  const contentType = req.headers.get("content-type") || "";
-  const raw = (await req.text()).trim();
-  if (!raw) return { ok: true as const, value: {} as T };
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
 
+async function getOwnerId(req: NextRequest): Promise<string> {
+  const sb = supabaseServerRouteReadOnly(req);
+  const { data: sessionData } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+  if (sessionUserId) return sessionUserId;
+
+  const { data, error } = await sb.auth.getUser();
+  if (!error && data?.user?.id) return String(data.user.id);
+
+  throw new Error("Unauthorized");
+}
+
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p) return "freemium";
+  if (p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
+async function getPlanAndMcLimit(admin: any, ownerId: string): Promise<{ plan: string; mcLimit: number | null }> {
+  const { data: profile } = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
+
+  const planRaw = String((profile as any)?.plan ?? "freemium").trim();
+  const planNorm = normalizePlan(planRaw);
+
+  const tryPlans = [planRaw.toLowerCase(), planNorm].filter(Boolean);
+  let limits: any[] | null = null;
+
+  for (const p of tryPlans) {
+    const r = await admin.from("plan_limits").select("feature, monthly_limit, is_unlimited").eq("plan", p);
+    if (!r.error && Array.isArray(r.data) && r.data.length > 0) {
+      limits = r.data;
+      break;
+    }
+  }
+
+  const row = (limits ?? []).find((r: any) => String(r?.feature ?? "") === "mc_generate");
+  if (!row) return { plan: planNorm, mcLimit: null }; // fail-open: undgå 500-støj
+  if ((row as any).is_unlimited === true) return { plan: planNorm, mcLimit: null };
+  const rawLimit = (row as any).monthly_limit ?? null;
+  if (rawLimit == null) return { plan: planNorm, mcLimit: null };
+  const n = Number(rawLimit);
+  return { plan: planNorm, mcLimit: Number.isFinite(n) ? Math.round(n) : null };
+}
+
+function getMonthBoundsUTC(now = new Date()) {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const start = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0));
+  const resetAt = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0));
+  return { monthStart: start.toISOString(), resetAt: resetAt.toISOString() };
+}
+
+async function readJsonBody<T>(req: NextRequest) {
   try {
-    return { ok: true as const, value: JSON.parse(raw) as T };
+    const v = (await req.json()) as T;
+    return { ok: true as const, value: (v ?? ({} as T)) };
   } catch {
-    return {
-      ok: false as const,
-      error: "Ugyldigt JSON-body.",
-      debug: { contentType, rawSnippet: raw.slice(0, 200) },
-    };
+    try {
+      const raw = (await req.text()).trim();
+      if (!raw) return { ok: true as const, value: {} as T };
+      const cleaned = raw.replace(/^\uFEFF/, "");
+      return { ok: true as const, value: JSON.parse(cleaned) as T };
+    } catch {
+      return { ok: false as const, error: "Ugyldigt JSON-body." };
+    }
   }
 }
 
@@ -61,7 +166,13 @@ function pickDifficulty(raw: any): Difficulty {
   return raw === "easy" || raw === "hard" ? raw : "medium";
 }
 
-function uniqTrimmed(ids: string[]) {
+function clampInt(raw: any, min: number, max: number, fallback: number) {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function uniqTrimmed(ids: unknown) {
+  if (!Array.isArray(ids)) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const x of ids) {
@@ -88,9 +199,13 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-async function loadLastUsedFileId(sb: any, ownerId: string, scopeKey: string): Promise<string | null> {
+function fileTitle(row: any) {
+  return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
+}
+
+async function loadLastUsedFileId(admin: any, ownerId: string, scopeKey: string): Promise<string | null> {
   try {
-    const { data } = await sb
+    const { data } = await admin
       .from("generation_state")
       .select("last_used_file_id")
       .eq("owner_id", ownerId)
@@ -105,9 +220,9 @@ async function loadLastUsedFileId(sb: any, ownerId: string, scopeKey: string): P
   }
 }
 
-async function saveLastUsedFileId(sb: any, ownerId: string, scopeKey: string, fileId: string) {
+async function saveLastUsedFileId(admin: any, ownerId: string, scopeKey: string, fileId: string) {
   try {
-    await sb.from("generation_state").upsert(
+    await admin.from("generation_state").upsert(
       {
         owner_id: ownerId,
         kind: "mc",
@@ -118,138 +233,168 @@ async function saveLastUsedFileId(sb: any, ownerId: string, scopeKey: string, fi
       { onConflict: "owner_id,kind,scope_key" },
     );
   } catch (e) {
-    // Hvis RLS/tabla mangler, så kører vi stadig (fallback-variation nedenfor).
     console.error("[generate-mc] save generation_state failed:", e);
   }
 }
 
-function fileTitle(row: any) {
-  return (row?.name as string | null) || (row?.original_name as string | null) || "Ukendt kilde";
-}
+async function countMcJobsThisMonth(admin: any, ownerId: string, monthStart: string, resetAt: string) {
+  const successStatuses = ["succeeded"];
+  const tsCols = ["queued_at", "created_at", "inserted_at"] as const;
 
-type FileRow = {
-  id: string;
-  name: string | null;
-  original_name: string | null;
-  folder_id: string | null;
-  created_at: string | null;
-};
+  for (const tsCol of tsCols) {
+    const r = await admin
+      .from("jobs")
+      .select("id", { count: "exact", head: true })
+      .eq("owner_id", ownerId)
+      .eq("kind", "mc_generate")
+      .in("status", successStatuses)
+      .gte(tsCol, monthStart)
+      .lt(tsCol, resetAt);
 
-type ChunkRow = {
-  id: string;
-  file_id: string;
-  content: string | null;
-  created_at: string | null;
-  source_url?: string | null;
-};
-
-function interleavePicked(
-  fileOrder: string[],
-  pickedByFile: Record<string, ChunkRow[]>,
-  targetTotal: number,
-) {
-  const idx = new Map<string, number>();
-  const out: ChunkRow[] = [];
-  for (const f of fileOrder) idx.set(f, 0);
-
-  while (out.length < targetTotal) {
-    let added = false;
-    for (const f of fileOrder) {
-      const list = pickedByFile[f] ?? [];
-      const i = idx.get(f) ?? 0;
-      if (i < list.length) {
-        out.push(list[i]);
-        idx.set(f, i + 1);
-        added = true;
-        if (out.length >= targetTotal) break;
-      }
-    }
-    if (!added) break;
+    if (!r.error && r.count != null) return Number(r.count ?? 0) || 0;
   }
 
-  return out;
+  return 0;
 }
 
+async function logMcJob(admin: any, ownerId: string, payload: any) {
+  try {
+    await admin.from("jobs").insert({
+      owner_id: ownerId,
+      kind: "mc_generate",
+      status: "succeeded",
+      queued_at: new Date().toISOString(),
+      payload,
+    });
+  } catch (e) {
+    console.warn("[generate-mc] jobs insert warning:", e);
+  }
+}
+
+function normalizeQuestion(s: string) {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?()"'’”“\[\]{}]/g, "")
+    .trim();
+}
+
+function stripLeadingLetterOption(t: string) {
+  return String(t ?? "").replace(/^\s*[A-Da-d]\s*[\).:\-]\s*/g, "").trim();
+}
+
+function chunksPerQuestion(difficulty: Difficulty, maxContextChunks: number) {
+  const base = difficulty === "hard" ? 3 : 2;
+  return Math.max(1, Math.min(base, maxContextChunks));
+}
+
+const SYSTEM_PROMPT = `
+Du er en dansk studieassistent.
+Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddrag.
+
+VIGTIGT:
+- Du MÅ KUN bruge den kontekst, du får (KILDE-afsnit).
+- Skriv alt på dansk.
+
+KRAV:
+- 1 spørgsmål
+- 4 svarmuligheder
+- Præcis 1 korrekt
+- Plausible distraktorer (ikke åbenlyse)
+
+Returnér gyldig JSON:
+{
+  "question": "...",
+  "options": [
+    { "text": "...", "isCorrect": true/false },
+    { "text": "...", "isCorrect": true/false },
+    { "text": "...", "isCorrect": true/false },
+    { "text": "...", "isCorrect": true/false }
+  ],
+  "explanation": "Kort forklaring"
+}
+`.trim();
+
 export async function POST(req: NextRequest) {
+  const requestId = randomUUID();
+
   try {
     if (!process.env.OPENAI_API_KEY) {
-      return NextResponse.json({ ok: false, error: "OPENAI_API_KEY mangler i .env.local." }, { status: 500 });
+      const err: GenerateMcErr = { ok: false, error: "OPENAI_API_KEY mangler i .env.local.", requestId };
+      return NextResponse.json(err, { status: 500 });
     }
 
     const parsed = await readJsonBody<GenerateMcRequest>(req);
     if (!parsed.ok) {
-      return NextResponse.json(
-        { ok: false, error: parsed.error, debug: (parsed as any).debug },
-        { status: 400 },
-      );
+      const err: GenerateMcErr = { ok: false, error: parsed.error, requestId };
+      return NextResponse.json(err, { status: 400 });
     }
 
     const body = parsed.value ?? {};
     const difficulty = pickDifficulty(body.difficulty);
+    const maxContextChunks = clampInt(body.maxContextChunks, 2, 32, 10);
 
-    const rawMax = body.maxContextChunks;
-    const maxContextChunks =
-      typeof rawMax === "number" && Number.isFinite(rawMax)
-        ? Math.min(Math.max(Math.round(rawMax), 4), 32)
-        : 10;
-
-    const scopeFolderIds = Array.isArray(body.scopeFolderIds)
-      ? uniqTrimmed(body.scopeFolderIds.filter((x): x is string => typeof x === "string" && x.trim().length > 0))
-      : [];
-
+    const scopeFolderIds = uniqTrimmed(body.scopeFolderIds);
     const scopeKey = scopeKeyFromFolderIds(scopeFolderIds);
 
-    // Auth/dev-bypass via requireUser(req)
-    let sb: any;
-    let ownerId = "";
-    try {
-      const u = await requireUser(req);
-      sb = u.sb;
-      ownerId = u.id;
-    } catch (e: any) {
-      const msg = String(e?.message ?? "");
-      const isAuth = msg.toLowerCase().includes("unauthorized");
-      if (!isAuth) console.error("[generate-mc] requireUser crash:", e);
-      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    const avoidQuestions = uniqTrimmed(body.avoidQuestions).slice(0, 64);
+    const avoidNorm = new Set(avoidQuestions.map(normalizeQuestion));
+
+    const avoidChunkIds = uniqTrimmed(body.avoidChunkIds).slice(0, 800);
+    const avoidChunkSet = new Set<string>(avoidChunkIds);
+
+    const ownerId = await getOwnerId(req);
+
+    const admin = supabaseAdmin();
+
+    const quotaSnapshot = await getMcQuotaSnapshot(admin, ownerId);
+    if (!quotaSnapshot.ok) {
+      const err: GenerateMcErr = {
+        ok: false,
+        error: quotaSnapshot.message,
+        requestId,
+        code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaSnapshot.plan,
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        resetAt: quotaSnapshot.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaSnapshot.status });
     }
 
-    const lastUsed = await loadLastUsedFileId(sb, ownerId, scopeKey);
-
-    // Topic (mappe-navn hvis muligt)
+    // topic (første mappe-navn hvis muligt)
     let topic = "pensum";
     if (scopeFolderIds.length > 0) {
-      const { data: f } = await sb
+      const { data: f } = await admin
         .from("folders")
         .select("name")
         .eq("owner_id", ownerId)
         .eq("id", scopeFolderIds[0])
         .maybeSingle();
-      if (f?.name) topic = String(f.name);
+      if ((f as any)?.name) topic = String((f as any).name);
     }
 
-    // Filer i scope (seneste N)
-    let filesQ = sb
+    // files
+    let filesQ = admin
       .from("files")
       .select("id,name,original_name,folder_id,created_at")
       .eq("owner_id", ownerId)
       .order("created_at", { ascending: false })
-      .limit(60);
+      .limit(80);
 
     if (scopeFolderIds.length > 0) filesQ = filesQ.in("folder_id", scopeFolderIds);
 
-    const { data: files, error: filesErr } = await filesQ;
-    if (filesErr) console.error("[generate-mc] files error:", filesErr);
-
+    const { data: files } = await filesQ;
     const fileRows = (files ?? []) as FileRow[];
+
     if (fileRows.length === 0) {
-      return NextResponse.json(
-        { ok: false, error: "Ingen filer fundet i scope. Upload materiale først.", debug: { scopeFolderIds } },
-        { status: 400 },
-      );
+      const err: GenerateMcErr = { ok: false, error: "Ingen filer fundet i scope. Upload materiale først.", requestId };
+      return NextResponse.json(err, { status: 400 });
     }
 
-    // Rotation: start efter lastUsed.
-    // Fallback: hvis lastUsed ikke kan læses (fx RLS/table), så randomiser start for variation.
+    // rotation
+    const lastUsed = await loadLastUsedFileId(admin, ownerId, scopeKey);
     let start = 0;
     if (lastUsed) {
       const idx = fileRows.findIndex((f) => String(f.id) === String(lastUsed));
@@ -257,147 +402,114 @@ export async function POST(req: NextRequest) {
     } else {
       start = Math.floor(Math.random() * fileRows.length);
     }
-
     const rotated = [...fileRows.slice(start), ...fileRows.slice(0, start)];
 
-    // Dette er “anchor” vi gemmer i generation_state for at sikre variation på tværs af kald
-    const rotationAnchorFileId = rotated[0]?.id ? String(rotated[0].id) : null;
+    // pick a file + chunks
+    const take = chunksPerQuestion(difficulty, maxContextChunks);
 
-    // Hvor mange filer vil vi blande?
-    const desiredFiles = Math.min(6, Math.max(2, Math.ceil(maxContextChunks / 3)), rotated.length);
-    const scanMax = Math.min(30, rotated.length);
+    let chosenFile: FileRow | null = null;
+    let chosenChunks: ChunkRow[] = [];
 
-    const pickedByFile: Record<string, ChunkRow[]> = {};
-    const usedFiles: FileRow[] = [];
-
-    const perFileTake = Math.max(1, Math.ceil(maxContextChunks / desiredFiles));
-    const perFilePool = Math.min(120, Math.max(24, perFileTake * 12));
-
-    // Scan filer indtil vi har nok “ikke-tomme”
-    for (const f of rotated.slice(0, scanMax)) {
-      if (usedFiles.length >= desiredFiles) break;
-
+    // pass 1 (undgå avoidChunkIds)
+    for (let i = 0; i < Math.min(30, rotated.length); i++) {
+      const f = rotated[i];
       const fileId = String(f.id);
 
-      const { data: pool, error: poolErr } = await sb
+      const { data: pool } = await admin
         .from("doc_chunks")
         .select("id,file_id,content,created_at,source_url")
         .eq("owner_id", ownerId)
         .eq("file_id", fileId)
         .order("created_at", { ascending: false })
-        .limit(perFilePool);
+        .limit(400);
 
-      if (poolErr) {
-        console.error("[generate-mc] doc_chunks pool error:", poolErr);
-        continue;
+      const usable = (pool ?? [])
+        .filter((r: any) => String(r?.content ?? "").trim().length > 0)
+        .filter((r: any) => !avoidChunkSet.has(String(r.id)));
+
+      if (usable.length < 1) continue;
+
+      chosenFile = f;
+      chosenChunks = shuffle(usable).slice(0, Math.min(take, usable.length));
+      break;
+    }
+
+    // pass 2 (allow reuse)
+    if (!chosenFile) {
+      for (let i = 0; i < Math.min(30, rotated.length); i++) {
+        const f = rotated[i];
+        const fileId = String(f.id);
+
+        const { data: pool } = await admin
+          .from("doc_chunks")
+          .select("id,file_id,content,created_at,source_url")
+          .eq("owner_id", ownerId)
+          .eq("file_id", fileId)
+          .order("created_at", { ascending: false })
+          .limit(400);
+
+        const usable = (pool ?? []).filter((r: any) => String(r?.content ?? "").trim().length > 0);
+        if (usable.length < 1) continue;
+
+        chosenFile = f;
+        chosenChunks = shuffle(usable).slice(0, Math.min(take, usable.length));
+        break;
       }
-
-      const poolRows = (pool ?? []) as ChunkRow[];
-      const nonEmpty = poolRows.filter((r) => (r.content ?? "").trim().length > 0);
-      if (nonEmpty.length === 0) continue;
-
-      // Random pick fra pool + stabil sort (så kontekst ikke er “helt tilfældig”)
-      const picked = shuffle(nonEmpty)
-        .slice(0, Math.min(perFileTake, nonEmpty.length))
-        .sort((a, b) => {
-          const ta = a.created_at ? Date.parse(a.created_at) : 0;
-          const tb = b.created_at ? Date.parse(b.created_at) : 0;
-          return ta - tb;
-        });
-
-      pickedByFile[fileId] = picked;
-      usedFiles.push(f);
     }
 
-    if (usedFiles.length === 0) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Ingen kontekst fundet (doc_chunks) for filerne i scope. Tjek at upload/parse er kørt.",
-          debug: { scopeFolderIds, fileCount: fileRows.length },
-        },
-        { status: 400 },
-      );
+    if (!chosenFile || chosenChunks.length === 0) {
+      const err: GenerateMcErr = {
+        ok: false,
+        error: "Ingen kontekst fundet (doc_chunks). Tjek at upload/parse er kørt.",
+        requestId,
+      };
+      return NextResponse.json(err, { status: 400 });
     }
 
-    const fileMap = new Map<string, FileRow>(usedFiles.map((f) => [String(f.id), f]));
-    const fileOrder = shuffle(usedFiles.map((f) => String(f.id)));
+    const usedFileId = String(chosenFile.id);
+    const usedFileTitle = fileTitle(chosenFile);
 
-    const interleaved = interleavePicked(fileOrder, pickedByFile, maxContextChunks);
-
-    const contextText = interleaved
-      .map((c) => {
-        const f = fileMap.get(String(c.file_id));
-        const title = f ? fileTitle(f) : "Ukendt kilde";
-        const txt = (c.content ?? "").trim();
-        return `KILDE: ${title}\n\n${txt}`;
-      })
+    const usedChunkIds = chosenChunks.map((c) => String(c.id));
+    const contextText = chosenChunks
+      .map((c) => `KILDE: ${usedFileTitle}\n\n${String(c.content ?? "").trim()}`)
       .filter(Boolean)
       .join("\n\n---\n\n")
       .slice(0, 7000);
 
-    if (!contextText.trim()) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Kontekst blev tom efter filtrering. Tjek at doc_chunks.content ikke er tomt.",
-          debug: { scopeFolderIds },
-        },
-        { status: 400 },
-      );
-    }
+    const citations: McCitationPayload[] = chosenChunks.map((c) => ({
+      chunkId: String(c.id),
+      fileId: usedFileId,
+      title: usedFileTitle,
+      url: (c as any)?.source_url ? String((c as any).source_url) : null,
+    }));
 
-    const citations: McCitationPayload[] = interleaved.map((c) => {
-      const f = fileMap.get(String(c.file_id));
-      return {
-        chunkId: c.id,
-        title: f ? fileTitle(f) : null,
-        url: (c as any)?.source_url ? String((c as any).source_url) : null,
-      };
-    });
-
-    const usedFileId = rotationAnchorFileId;
-
-    const model = process.env.OPENAI_MODEL_MC || process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-    const systemPrompt = `
-Du er en dansk studieassistent. Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddrag.
-
-VIGTIGT:
-- Du MÅ KUN bruge den kontekst, du får (som kan indeholde flere KILDE-afsnit).
-- Skriv alt på dansk.
-
-KRAV:
-- 1 spørgsmål
-- 4 svarmuligheder
-- Præcis 1 korrekt
-- Plausible distraktorer
-
-Returnér gyldig JSON:
-{
-  "question": "...",
-  "options": [
-    { "text": "...", "isCorrect": true/false },
-    ...
-  ],
-  "explanation": "Kort forklaring"
-}
-`.trim();
+    const avoidBlock =
+      avoidNorm.size > 0
+        ? `\nUNDGÅ at gentage nogen af disse spørgsmål (nøjagtigt eller næsten):\n- ${Array.from(avoidNorm)
+            .slice(0, 24)
+            .join("\n- ")}\n`
+        : "";
 
     const userPrompt = [
       `Fag/tema: ${topic}`,
       `Sværhedsgrad: ${difficulty}`,
+      `Kilde (primary): ${usedFileTitle}`,
+      avoidBlock.trim(),
       "",
       "KONTEKST (brug dette som eneste grundlag):",
       "",
       contextText,
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const model = requireFlowModel("trainer");
 
     const completion = await openai.chat.completions.create({
       model,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
     });
@@ -414,58 +526,88 @@ Returnér gyldig JSON:
       payload = {};
     }
 
-    const question = (payload.question ?? "").trim();
+    const q = String(payload.question ?? "").trim();
     const opts = Array.isArray(payload.options) ? payload.options : [];
 
-    if (!question || opts.length < 2) {
-      return NextResponse.json(
-        { ok: false, error: "Modellen returnerede ufuldstændigt output." },
-        { status: 500 },
-      );
+    if (!q || opts.length < 2) {
+      const err: GenerateMcErr = { ok: false, error: "Kunne ikke generere spørgsmål (tomt output).", requestId };
+      return NextResponse.json(err, { status: 500 });
     }
 
-    // Normalisér til 4 muligheder
+    if (avoidNorm.has(normalizeQuestion(q))) {
+      const err: GenerateMcErr = { ok: false, error: "Spørgsmålet blev en gentagelse. Prøv igen.", requestId };
+      return NextResponse.json(err, { status: 500 });
+    }
+
     const normalized = opts.slice(0, 4);
-    while (normalized.length < 4) {
-      normalized.push({ text: `Mulighed ${normalized.length + 1}`, isCorrect: false });
-    }
+    while (normalized.length < 4) normalized.push({ text: `Mulighed ${normalized.length + 1}`, isCorrect: false });
 
-    // Sikr præcis 1 korrekt (før shuffle)
     let correctIdx = normalized.findIndex((o) => !!o.isCorrect);
     if (correctIdx === -1) correctIdx = 0;
-    const fixed = normalized.map((o, i) => ({
-      text: String(o.text ?? "").trim() || `Mulighed ${i + 1}`,
-      isCorrect: i === correctIdx,
+
+    const fixed = normalized.map((o, idx) => ({
+      text: stripLeadingLetterOption(String(o.text ?? "")) || `Mulighed ${idx + 1}`,
+      isCorrect: idx === correctIdx,
     }));
 
-    // Shuffle og tildel nye ids a-d efter shuffle
     const shuffled = shuffle(fixed);
     const letters = ["a", "b", "c", "d"];
-    const options: McOptionPayload[] = shuffled.map((o, i) => ({
-      id: letters[i],
+    const options: McOptionPayload[] = shuffled.map((o, idx) => ({
+      id: letters[idx],
       text: o.text,
       isCorrect: o.isCorrect,
     }));
 
-    // Gem rotation state (hvis muligt)
-    if (usedFileId) await saveLastUsedFileId(sb, ownerId, scopeKey, usedFileId);
+    const quotaConsume = await consumeMcQuota(admin, ownerId, 1);
+    if (!quotaConsume.ok) {
+      const err: GenerateMcErr = {
+        ok: false,
+        error: quotaConsume.message,
+        requestId,
+        code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
+        feature: "mc_generate",
+        plan: quotaConsume.plan,
+        usedThisMonth: quotaConsume.used,
+        monthlyLimit: quotaConsume.limitPerMonth,
+        resetAt: quotaConsume.resetAt ?? undefined,
+      };
+      return NextResponse.json(err, { status: quotaConsume.status });
+    }
 
-    const resp: GenerateMcResponse = {
+    await saveLastUsedFileId(admin, ownerId, scopeKey, usedFileId);
+
+    await logMcJob(admin, ownerId, {
+      source: "generate-mc-question",
+      requestId,
+      scopeFolderIds,
+      scopeKey,
+      difficulty,
+      model,
+      usedFileId,
+      usedFileTitle,
+      usedChunkIds,
+      question: q,
+      citationCount: citations.length,
+      plan: quotaConsume.plan,
+      mcLimit: quotaConsume.limitPerMonth,
+    });
+
+    const out: GenerateMcOk = {
       ok: true,
       questionId: randomUUID(),
-      question,
+      question: q,
       options,
-      explanation: (payload.explanation ?? "").trim() || null,
+      explanation: String(payload.explanation ?? "").trim() || null,
       citations,
       usedFileId,
+      meta: { requestId, usedChunkIds, usedFileTitle },
     };
 
-    return NextResponse.json(resp, { status: 200 });
+    return NextResponse.json(out, { status: 200 });
   } catch (err: any) {
-    console.error("[generate-mc] route error:", err);
-    return NextResponse.json(
-      { ok: false, error: err?.message ?? "Uventet fejl i generate-mc-question." },
-      { status: 500 },
-    );
+    console.error("[generate-mc-question] route error:", err);
+    const out: GenerateMcErr = { ok: false, error: err?.message ?? "Uventet fejl i generate-mc-question.", requestId };
+    const status = out.error === "Unauthorized" ? 401 : 500;
+    return NextResponse.json(out, { status });
   }
 }

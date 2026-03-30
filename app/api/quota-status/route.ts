@@ -161,16 +161,18 @@ export async function GET(req: NextRequest) {
   // Plan limits
   const { data: planLimitRows, error: planLimitErr } = await admin
     .from("plan_limits")
-    .select("plan, feature, monthly_limit")
+    .select("plan, feature, monthly_limit, is_unlimited")
     .eq("plan", plan);
 
   if (planLimitErr) console.error("[quota-status] plan_limits error:", errInfo(planLimitErr));
 
   const planLimits = planLimitRows ?? [];
+  const importRow = planLimits.find((r: any) => r.feature === "import");
+  const evaluateRow = planLimits.find((r: any) => r.feature === "evaluate");
   const importLimit =
-    planLimits.find((r: any) => r.feature === "import")?.monthly_limit ?? null;
+    importRow?.is_unlimited ? null : (importRow?.monthly_limit ?? null);
   const evalLimit =
-    planLimits.find((r: any) => r.feature === "evaluate")?.monthly_limit ?? null;
+    evaluateRow?.is_unlimited ? null : (evaluateRow?.monthly_limit ?? null);
 
   // Import usage (jobs(kind=import))
   const importStatuses = ["succeeded"];

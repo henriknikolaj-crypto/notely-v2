@@ -1,154 +1,175 @@
-// app/traener/ui/TrainingSidebarFolders.tsx
 "use client";
 
+import Link from "next/link";
+import { useMemo } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useMemo } from "react";
-import type { ReactElement } from "react";
 
 type FolderRow = {
   id: string;
   name: string;
   parent_id: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  archived_at?: string | null;
 };
 
-type Props = {
-  folders: FolderRow[];
-};
-
-type TreeNode = FolderRow & {
-  children: TreeNode[];
-};
-
-function buildTree(rows: FolderRow[]): TreeNode[] {
-  const map = new Map<string, TreeNode>();
-  rows.forEach((r) => {
-    map.set(r.id, { ...r, children: [] });
-  });
-
-  const roots: TreeNode[] = [];
-
-  map.forEach((node) => {
-    if (node.parent_id && map.has(node.parent_id)) {
-      map.get(node.parent_id)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  });
-
-  return roots;
+function cn(...xs: Array<string | false | null | undefined>) {
+  return xs.filter(Boolean).join(" ");
 }
 
-export default function TrainingSidebarFolders({ folders }: Props) {
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
-  const router = useRouter();
+function parseScope(raw: string | null) {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
-  const tree = useMemo(() => buildTree(folders), [folders]);
+function buildUrl(pathname: string, sp: URLSearchParams, patch: Record<string, string | null | undefined>) {
+  const params = new URLSearchParams(sp.toString());
 
-  // Hvilke sider må styre scope? (Noter / Træner / MC / Flashcards)
-  const showScopeControls =
-    pathname?.startsWith("/traener/noter") ||
-    pathname?.startsWith("/traener/mc") ||
-    pathname?.startsWith("/traener/flashcards") ||
-    pathname === "/traener" ||
-    pathname?.startsWith("/traener/traener");
-
-  // Parse scope=…,… fra URL
-  const scopeFromUrl = useMemo(() => {
-    const raw = searchParams?.get("scope");
-    if (!raw) return [] as string[];
-    return raw
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-  }, [searchParams]);
-
-  const updateScopeInUrl = useCallback(
-    (nextScope: string[]) => {
-      const params = new URLSearchParams(searchParams?.toString() ?? "");
-
-      if (nextScope.length) {
-        params.set("scope", nextScope.join(","));
-      } else {
-        params.delete("scope");
-      }
-
-      const qs = params.toString();
-      const base = pathname || "/traener";
-      const url = qs ? `${base}?${qs}` : base;
-
-      router.push(url, { scroll: false });
-    },
-    [pathname, router, searchParams]
-  );
-
-  const toggleInScope = useCallback(
-    (id: string) => {
-      if (!showScopeControls) return;
-
-      const current = new Set(scopeFromUrl);
-      if (current.has(id)) {
-        current.delete(id);
-      } else {
-        current.add(id);
-      }
-      updateScopeInUrl(Array.from(current));
-    },
-    [showScopeControls, scopeFromUrl, updateScopeInUrl]
-  );
-
-  function renderNode(node: TreeNode, isChild: boolean): ReactElement {
-    const checked = scopeFromUrl.includes(node.id);
-
-    return (
-      <li key={node.id} className="mb-1">
-        <div
-          className="flex items-center gap-2 text-xs text-zinc-800"
-          style={{ paddingLeft: isChild ? 16 : 0 }}
-        >
-          {showScopeControls && (
-            <input
-              type="checkbox"
-              className="h-3.5 w-3.5 rounded border border-zinc-400 bg-white accent-zinc-800"
-              checked={checked}
-              onChange={() => toggleInScope(node.id)}
-            />
-          )}
-
-          <span className="truncate">{node.name}</span>
-        </div>
-
-        {node.children.length > 0 && (
-          <ul className="mt-0.5 list-none pl-0">
-            {node.children.map((child) => renderNode(child, true))}
-          </ul>
-        )}
-      </li>
-    );
+  for (const [k, v] of Object.entries(patch)) {
+    const vv = String(v ?? "").trim();
+    if (!vv) params.delete(k);
+    else params.set(k, vv);
   }
 
-  const selectedCount = scopeFromUrl.length;
-  const label =
-    selectedCount === 1
-      ? "1 mappe"
-      : `${selectedCount} mapper`;
+  const qs = params.toString();
+  return qs ? `${pathname}?${qs}` : pathname;
+}
+
+const DEMO_SCOPE_ID = "demo-samfund";
+const DEMO_SCOPE_NAME = "Samfund";
+
+export default function TrainingSidebarFolders({ folders }: { folders: FolderRow[] }) {
+  const pathname = usePathname() || "/traener";
+  const sp = useSearchParams();
+  const router = useRouter();
+  const isDemoRoute = pathname.startsWith("/traener/ux");
+  const isDemoMode = isDemoRoute || sp?.get("demo") === "1" || sp?.get("demo") === "true";
+  const validFolderIds = useMemo(() => new Set(folders.map((folder) => folder.id)), [folders]);
+
+  const activeFolderId = isDemoMode
+    ? DEMO_SCOPE_ID
+    : (() => {
+        const scopeValues = parseScope(sp?.get("scope") ?? "").filter((id) => validFolderIds.has(id));
+        return scopeValues[0] ?? "";
+      })();
+
+  // ✅ ESLint-friendly deps (ingen join("|") i deps)
+  const scopeRaw = isDemoMode ? DEMO_SCOPE_ID : (sp?.get("scope") ?? "");
+  const scopeIds = useMemo(() => {
+    const parsed = parseScope(scopeRaw ? scopeRaw : null);
+    return isDemoMode ? parsed : parsed.filter((id) => validFolderIds.has(id));
+  }, [isDemoMode, scopeRaw, validFolderIds]);
+  const scopeSet = useMemo(() => new Set(scopeIds), [scopeIds]);
+  const effectiveFolders = useMemo(() => {
+    if (!isDemoMode) return folders;
+    return [{ id: DEMO_SCOPE_ID, name: DEMO_SCOPE_NAME, parent_id: null, start_date: null, end_date: null, archived_at: null }];
+  }, [folders, isDemoMode]);
+
+  const { roots, childrenByParent } = useMemo(() => {
+    const byParent = new Map<string, FolderRow[]>();
+    const root: FolderRow[] = [];
+
+    for (const f of effectiveFolders ?? []) {
+      if (f.archived_at) continue;
+      if (!f.parent_id) root.push(f);
+      else {
+        const arr = byParent.get(f.parent_id) ?? [];
+        arr.push(f);
+        byParent.set(f.parent_id, arr);
+      }
+    }
+
+    const sortByName = (a: FolderRow, b: FolderRow) => String(a.name).localeCompare(String(b.name), "da");
+    root.sort(sortByName);
+    for (const [k, arr] of byParent.entries()) {
+      arr.sort(sortByName);
+      byParent.set(k, arr);
+    }
+
+    return { roots: root, childrenByParent: byParent };
+  }, [effectiveFolders]);
+
+  function toggleScope(folderId: string) {
+    if (isDemoMode) return;
+    const next = new Set(scopeSet);
+    if (next.has(folderId)) next.delete(folderId);
+    else next.add(folderId);
+
+    const nextScope = Array.from(next.values()).join(",");
+
+    const url = buildUrl(pathname, new URLSearchParams(sp?.toString() ?? ""), {
+      scope: nextScope || null,
+    });
+
+    router.push(url, { scroll: false });
+  }
+
+  function folderHref(folderId: string) {
+    return buildUrl(pathname, new URLSearchParams(sp?.toString() ?? ""), { scope: folderId, folder: null });
+  }
+
+  const baseRow = "flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs";
+  const nameCls = (isActive: boolean) =>
+    cn("truncate", isActive ? "font-semibold text-zinc-900" : "text-zinc-800");
+
+  const totalSelected = isDemoMode ? 1 : scopeIds.length;
 
   return (
-    <div className="text-xs text-zinc-800">
-      <ul className="mb-2 list-none pl-0">
-        {tree.map((node) => renderNode(node, false))}
-      </ul>
+    <div className="space-y-1 px-2">
+      {roots.map((f) => {
+        const isActive = activeFolderId === f.id;
+        const checked = scopeSet.has(f.id) || isActive;
+        const kids = childrenByParent.get(f.id) ?? [];
 
-      {showScopeControls ? (
-        <p className="mt-2 text-[11px] text-zinc-500">
-          Valgt til træning: <span className="font-medium">{label}</span>.
-        </p>
-      ) : (
-        <p className="mt-2 text-[11px] text-zinc-500">
-          Mappevalg til træning kan ændres under{" "}
-          <span className="font-medium">Træner</span>.
-        </p>
-      )}
+        return (
+          <div key={f.id} className="space-y-1">
+            <div className={cn(baseRow, isActive ? "bg-zinc-50" : "hover:bg-zinc-50")}>
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-black"
+                checked={checked}
+                disabled={isDemoMode}
+                onChange={() => toggleScope(f.id)}
+                aria-label={`Vælg ${f.name}`}
+              />
+              <Link href={folderHref(f.id)} scroll={false} className={nameCls(isActive)}>
+                {f.name}
+              </Link>
+            </div>
+
+            {kids.length ? (
+              <div className="space-y-1 pl-5">
+                {kids.map((c) => {
+                  const isActiveChild = activeFolderId === c.id;
+                  const checkedChild = scopeSet.has(c.id) || isActiveChild;
+
+                  return (
+                    <div key={c.id} className={cn(baseRow, isActiveChild ? "bg-zinc-50" : "hover:bg-zinc-50")}>
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-black"
+                        checked={checkedChild}
+                        disabled={isDemoMode}
+                        onChange={() => toggleScope(c.id)}
+                        aria-label={`Vælg ${c.name}`}
+                      />
+                      <Link href={folderHref(c.id)} scroll={false} className={nameCls(isActiveChild)}>
+                        {c.name}
+                      </Link>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+
+      <div className="pt-2 text-[11px] text-zinc-500">
+        Valgt til træning: {totalSelected} {totalSelected === 1 ? "mappe" : "mapper"}.
+      </div>
     </div>
   );
 }

@@ -2,11 +2,15 @@
 import "server-only";
 
 import Link from "next/link";
+import { unstable_noStore as noStore } from "next/cache";
 import { redirect } from "next/navigation";
+import { createClient } from "@supabase/supabase-js";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import TrainingSidebarMainNav from "./ui/TrainingSidebarMainNav";
-import TrainingSidebarFolders from "./ui/TrainingSidebarFolders";
 import TrainingSidebarStats from "./ui/TrainingSidebarStats";
+import TrainingSidebarFolderSection from "./ui/TrainingSidebarFolderSection";
 import TrainingTabs from "./ui/TrainingTabs";
 
 export const dynamic = "force-dynamic";
@@ -27,35 +31,57 @@ type LatestNoteRow = {
   created_at: string | null;
 };
 
-async function getOwnerCtx(sb: any): Promise<{ id: string; email: string | null } | null> {
-  try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) {
-      return {
-        id: String(data.user.id),
-        email: (data.user.email as string | null | undefined) ?? null,
-      };
-    }
-  } catch {
-    // ignore
-  }
-  return null;
+function normalizePlan(raw: unknown) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p) return "freemium";
+  if (p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
 }
 
-const TRAINER_NOTE_TYPES = ["feedback", "trainer", "trainer_feedback"];
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
 
 export default async function TraenerLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  noStore();
   const sb = await supabaseServerRSC();
-  const owner = await getOwnerCtx(sb);
+  const { ownerId, email: currentUserEmail } = await getTrainerSession();
 
-  if (!owner?.id) {
-    redirect("/auth/login");
+  if (!ownerId) redirect("/auth/login");
+
+  let isPro = false;
+  let planLabel: string | null = null;
+  try {
+    const admin = supabaseAdmin();
+    const { data: profileData, error: profileError } = await admin
+      .from("profiles")
+      .select("plan")
+      .eq("id", ownerId)
+      .maybeSingle();
+    if (profileError) throw profileError;
+    const planNorm = normalizePlan((profileData as any)?.plan ?? null);
+    isPro = planNorm === "pro";
+    planLabel =
+      planNorm === "pro" ? "Pro" : planNorm === "basis" ? "Basis" : planNorm === "freemium" ? "Freemium" : null;
+  } catch (e) {
+    console.error("TRÆNER layout pro lookup error:", e);
+    isPro = false;
+    planLabel = null;
   }
-  const ownerId = owner.id;
+
+  const disableLiveQuotaFetch = false;
 
   // ---- Mapper i venstre træ ----
   const { data: foldersData, error: foldersError } = await sb
@@ -78,11 +104,12 @@ export default async function TraenerLayout({
     archived_at: f.archived_at ?? null,
   }));
 
-  // ---- Seneste noter (alle typer) til sidebar (max 50) ----
+  // ---- Seneste resuméer/fokus-noter til notes-fanen (max 50) ----
   const { data: latestNotesData, error: latestNotesError } = await sb
     .from("notes")
     .select("id,title,note_type,created_at")
     .eq("owner_id", ownerId)
+    .in("note_type", ["resume", "summary", "focus"])
     .order("created_at", { ascending: false })
     .limit(50);
 
@@ -117,23 +144,7 @@ export default async function TraenerLayout({
       created_at: string | null;
     }[]) ?? [];
 
-  // ---- Counts (Træner-noter / resuméer / fokus-noter / Træner-evalueringer) ----
-
-  // Træner-noter count
-  const { count: trainerNotesCountRaw, error: trainerNotesCountError } = await sb
-    .from("notes")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", ownerId)
-    .in("note_type", TRAINER_NOTE_TYPES);
-
-  const trainerNotesCount = trainerNotesCountRaw ?? 0;
-
-  if (trainerNotesCountError) {
-    console.error(
-      "TRÆNER layout trainerNotesCount error:",
-      trainerNotesCountError
-    );
-  }
+  // ---- Counts (resuméer / fokus-noter / Træner-evalueringer) ----
 
   // Træner-evalueringer count
   const { count: evalCountRaw, error: evalCountError } = await sb
@@ -179,13 +190,11 @@ export default async function TraenerLayout({
       {/* Topbar */}
       <header className="border-b border-zinc-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-          <Link href="/traener" className="logo-script text-4xl leading-none">
+          <Link href="/traener/overblik" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
             Notely.
           </Link>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-zinc-700">
-              {owner.email ?? ""}
-            </span>
+            <span className="text-xs text-zinc-700">{currentUserEmail ?? ""}</span>
             <Link
               href="/auth/logout"
               className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50"
@@ -199,39 +208,35 @@ export default async function TraenerLayout({
       {/* 2-kolonne layout */}
       <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6 md:px-6">
         {/* VENSTRE SIDEBAR */}
-        <aside className="w-64 shrink-0">
-          <div className="space-y-3 text-sm">
-            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
-              <div className="px-2 pt-1 pb-1 font-semibold text-zinc-800">
-                Mit Notely
-              </div>
-              <TrainingSidebarMainNav />
-            </div>
+        <aside className="hidden w-64 shrink-0 md:block">
+          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
+            <div className="px-2 pb-1 pt-1 font-semibold text-zinc-800">Mit Notely</div>
 
-            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
-              <div className="px-2 pt-1 pb-1 font-semibold text-zinc-800">
-                Dine fag
-              </div>
-              <TrainingSidebarFolders folders={folders} />
-            </div>
+            <TrainingSidebarMainNav />
 
-            <div className="rounded-2xl border border-zinc-200 bg-white p-3 shadow-sm">
-              <TrainingSidebarStats
-                latestNotes={latestNotes}
-                latestEvals={latestEvals}
-                notesCount={trainerNotesCount}
-                evalCount={evalCount}
-                resumeCount={resumeCount}
-                focusCount={focusCount}
-              />
-            </div>
+            <TrainingSidebarFolderSection folders={folders} />
+
+            <TrainingSidebarStats
+              latestNotes={latestNotes}
+              latestEvals={latestEvals}
+              evalCount={evalCount}
+              resumeCount={resumeCount}
+              focusCount={focusCount}
+              planLabel={planLabel}
+              disableLiveQuotaFetch={disableLiveQuotaFetch}
+            />
           </div>
         </aside>
 
         {/* HØJRE KOLONNE */}
         <section className="min-w-0 flex-1 bg-transparent">
-          <TrainingTabs />
-          {children}
+          <div className="mx-auto w-full max-w-3xl">
+            <MobileBackToMenu />
+            <div className="hidden md:block">
+              <TrainingTabs isPro={isPro} disableLiveFetch={disableLiveQuotaFetch} />
+            </div>
+            {children}
+          </div>
         </section>
       </div>
     </main>

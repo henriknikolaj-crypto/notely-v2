@@ -47,8 +47,8 @@ export default function OverviewSidebarFolders({
             <Link
               href={
                 activeId === root.id
-                  ? "/overblik"
-                  : `/overblik?folder=${encodeURIComponent(root.id)}`
+                  ? "/traener/overblik"
+                  : `/traener/overblik?folder=${encodeURIComponent(root.id)}`
               }
               className={cn(
                 "flex items-center gap-2 rounded-lg px-2 py-1 hover:bg-zinc-50",
@@ -68,8 +68,8 @@ export default function OverviewSidebarFolders({
                       <Link
                         href={
                           isActiveChild
-                            ? "/overblik"
-                            : `/overblik?folder=${encodeURIComponent(ch.id)}`
+                            ? "/traener/overblik"
+                            : `/traener/overblik?folder=${encodeURIComponent(ch.id)}`
                         }
                         className={cn(
                           "flex items-center gap-2 rounded-md px-2 py-1 hover:bg-zinc-50",

@@ -1,9 +1,14 @@
-﻿ 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { requireDevSecret } from "@/lib/dev/guard";
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
   try {
+    const guard = requireDevSecret(req);
+    if (!guard.ok) {
+      return NextResponse.json({ ok: false, error: guard.message }, { status: guard.status });
+    }
+
     const url = new URL(req.url);
     const doReset = url.searchParams.get("reset") === "1";
 
@@ -20,14 +25,12 @@ export async function GET(req: Request) {
       await supabase.from("courses").delete().eq("owner_id", ownerId);
     }
 
-    // insert courses
     const { error: e1 } = await supabase.from("courses").insert([
       { owner_id: ownerId, title: "Seed: Studieteknik", description: "Grundlæggende studieteknik." },
       { owner_id: ownerId, title: "Seed: Notatteknik", description: "Sådan tager du bedre noter." },
     ]);
     if (e1) return NextResponse.json({ ok:false, error: e1.message }, { status:500 });
 
-    // insert notes
     const { error: e2 } = await supabase.from("notes").insert([
       { owner_id: ownerId, title: "Seed: Første note", content: "Hej verden 👋" },
       { owner_id: ownerId, title: "Seed: Anden note", content: "Mere indhold..." },
@@ -39,8 +42,3 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok:false, error: err.message ?? "Server error" }, { status:500 });
   }
 }
-
-
-
-
-

@@ -24,8 +24,15 @@ export async function GET(req: NextRequest) {
     "DEV_USER_ID",
     "DEV_BYPASS_SECRET",
     "OPENAI_MODEL",
-    "OPENAI_MODEL_QUESTION",
+    "OPENAI_MODEL_TRAINER",
+    "OPENAI_MODEL_SIMULATOR",
+    "OPENAI_MODEL_ORAL",
+    "OPENAI_MODEL_WEAKNESS",
+    "OPENAI_MODEL_NOTES",
+    "OPENAI_MODEL_GENERATE_QUESTION",
     "OPENAI_MODEL_MC",
+    "OPENAI_MODEL_FLASHCARDS",
+    "OPENAI_TRANSCRIBE_MODEL",
   ];
 
   const missing = must.filter((k) => !present(k));

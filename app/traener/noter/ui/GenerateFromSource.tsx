@@ -1,10 +1,12 @@
-﻿"use client";
+"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
+import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type FileOption = {
   id: string;
@@ -24,6 +26,28 @@ type GeneratedNote = {
   content: string | null;
   created_at?: string | null;
 };
+
+const SUMMARY_LIMIT_MSG = "Du har brugt dine gratis resuméer denne måned.";
+const FOCUS_LIMIT_MSG = "Du har brugt dine gratis fokus-noter denne måned.";
+
+function pickNotesQuota(
+  json: any,
+  mode: "resume" | "golden",
+): { used: number; limit: number | null; message: string } {
+  const bucket =
+    mode === "golden"
+      ? json?.notes_focus_generate
+      : json?.notes_summary_generate;
+  const used =
+    typeof bucket?.usedThisMonth === "number" ? bucket.usedThisMonth : 0;
+  const limit =
+    typeof bucket?.limitPerMonth === "number" ? bucket.limitPerMonth : null;
+  return {
+    used: Number.isFinite(used) ? used : 0,
+    limit,
+    message: mode === "golden" ? FOCUS_LIMIT_MSG : SUMMARY_LIMIT_MSG,
+  };
+}
 
 export default function GenerateFromSource(props: Props) {
   const { files, hasScope } = props;
@@ -52,6 +76,8 @@ export default function GenerateFromSource(props: Props) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<GeneratedNote | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [limitReached, setLimitReached] = useState(false);
+  const [limitMessage, setLimitMessage] = useState<string | null>(null);
 
   const hasFiles = uniqueFiles.length > 0;
 
@@ -67,7 +93,48 @@ export default function GenerateFromSource(props: Props) {
     }
   }, [hasFiles, uniqueFiles, selectedFileId]);
 
+  useEffect(() => {
+    if (!hasFiles) {
+      setLimitReached(false);
+      setLimitMessage(null);
+      return;
+    }
+
+    let active = true;
+
+    const precheckQuota = async (force = false) => {
+      try {
+        const json = await fetchQuotaCurrent({ force });
+        if (!active || !json?.ok) return false;
+
+        const { used, limit, message } = pickNotesQuota(json, mode);
+        if (typeof limit === "number" && limit > 0 && used >= limit) {
+          setLimitReached(true);
+          setLimitMessage(message);
+          setError(null);
+          return true;
+        }
+
+        setLimitReached(false);
+        setLimitMessage(null);
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
+    void precheckQuota();
+
+    const onQuota = () => void precheckQuota(true);
+    window.addEventListener("notely-quota-changed", onQuota);
+    return () => {
+      active = false;
+      window.removeEventListener("notely-quota-changed", onQuota);
+    };
+  }, [hasFiles, mode]);
+
   async function handleGenerate() {
+    if (limitReached) return;
     if (!selectedFileId) {
       setError("Vælg først en kilde-fil.");
       return;
@@ -79,6 +146,21 @@ export default function GenerateFromSource(props: Props) {
     if (!fileName) {
       setError("Kilde-filnavn mangler. Prøv at genindlæse siden.");
       return;
+    }
+
+    try {
+      const json = await fetchQuotaCurrent({ force: true });
+      if (json?.ok) {
+        const { used, limit, message } = pickNotesQuota(json, mode);
+        if (typeof limit === "number" && limit > 0 && used >= limit) {
+          setLimitReached(true);
+          setLimitMessage(message);
+          setError(null);
+          return;
+        }
+      }
+    } catch {
+      // ignore precheck errors and let the request decide
     }
 
     setLoading(true);
@@ -98,6 +180,19 @@ export default function GenerateFromSource(props: Props) {
       });
 
       const data = await res.json().catch(() => null);
+
+      if (res.status === 403 && (data?.code === "NOTES_SUMMARY_MONTHLY_LIMIT_REACHED" || data?.code === "NOTES_FOCUS_MONTHLY_LIMIT_REACHED")) {
+        const msg = String(data?.error ?? (mode === "golden" ? FOCUS_LIMIT_MSG : SUMMARY_LIMIT_MSG));
+        setLimitReached(true);
+        setLimitMessage(msg);
+        setError(null);
+        try {
+          window.dispatchEvent(new Event("notely-quota-changed"));
+        } catch {
+          // ignore
+        }
+        return;
+      }
 
       if (!res.ok || !data?.ok) {
         setError(
@@ -120,6 +215,11 @@ export default function GenerateFromSource(props: Props) {
       });
 
       setInfo("Noten er gemt i dine noter.");
+      try {
+        window.dispatchEvent(new Event("notely-quota-changed"));
+      } catch {
+        // ignore
+      }
       router.refresh();
     } catch (e) {
       console.error("GenerateFromSource error", e);
@@ -137,7 +237,6 @@ export default function GenerateFromSource(props: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Kontrol-boks */}
       <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
         <h2 className="mb-3 text-sm font-semibold text-neutral-900">
           Generér noter ud fra dit materiale
@@ -147,7 +246,6 @@ export default function GenerateFromSource(props: Props) {
           <p className="text-sm text-neutral-600">{noFilesMessage}</p>
         ) : (
           <div className="space-y-3 text-sm">
-            {/* Kilde-vælg */}
             <div className="space-y-1">
               <label className="text-xs font-medium uppercase tracking-wide text-neutral-500">
                 KILDE
@@ -168,7 +266,6 @@ export default function GenerateFromSource(props: Props) {
               </p>
             </div>
 
-            {/* Mode-vælg */}
             <div className="space-y-1">
               <label className="text-xs font-medium uppercase tracking-wide text-neutral-500">
                 NOTE-TYPE
@@ -207,31 +304,30 @@ export default function GenerateFromSource(props: Props) {
               </p>
             </div>
 
-            {/* Knap + status */}
             <div className="flex items-center gap-3 pt-1">
               <button
                 type="button"
                 onClick={handleGenerate}
-                disabled={loading || !hasFiles}
+                disabled={loading || !hasFiles || limitReached}
                 className={
                   "rounded-lg px-4 py-2 text-xs font-semibold shadow-sm " +
-                  (loading || !hasFiles
+                  (loading || !hasFiles || limitReached
                     ? "cursor-not-allowed border border-neutral-300 bg-neutral-200 text-neutral-500"
                     : "border border-neutral-300 bg-white text-neutral-800 hover:bg-neutral-100")
                 }
               >
                 {loading ? "Genererer og gemmer…" : "Generér & gem noter"}
               </button>
-              {error && <span className="text-xs text-red-600">{error}</span>}
+              {!limitReached && error && <span className="text-xs text-red-600">{error}</span>}
               {!error && info && (
                 <span className="text-xs text-neutral-600">{info}</span>
               )}
             </div>
+            {limitReached ? <LimitNotice className="mt-1" message={limitMessage ?? undefined} /> : null}
           </div>
         )}
       </div>
 
-      {/* Resultat-boks */}
       {note && (
         <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
           <div className="mb-2 flex items-center justify-between gap-2">
@@ -245,7 +341,7 @@ export default function GenerateFromSource(props: Props) {
             )}
           </div>
 
-          <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-[#fffef9] px-4 py-3 text-sm leading-relaxed text-neutral-900">
+          <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-relaxed text-neutral-900">
             {markdownText.trim() ? (
               <div className="prose prose-sm max-w-none break-words prose-headings:mt-3 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 prose-strong:font-semibold prose-code:before:content-[''] prose-code:after:content-['']">
                 <ReactMarkdown

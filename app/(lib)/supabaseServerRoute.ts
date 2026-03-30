@@ -4,6 +4,10 @@ import { createServerClient } from "@supabase/ssr";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
+function withRootPath(options?: Record<string, unknown>) {
+  return { ...(options ?? {}), path: "/" };
+}
+
 export async function supabaseServerRSC() {
   // Next.js 15: cookies() skal awaited
   const cookieStore = await nextCookies();
@@ -15,10 +19,10 @@ export async function supabaseServerRSC() {
       },
       set(name: string, value: string, options: any) {
         // Next sætter via .set; options er kompatible
-        cookieStore.set({ name, value, ...options });
+        cookieStore.set({ name, value, ...withRootPath(options) });
       },
       remove(name: string, options: any) {
-        cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+        cookieStore.set({ name, value: "", ...withRootPath(options), maxAge: 0 });
       },
     },
   });
@@ -27,6 +31,5 @@ export async function supabaseServerRSC() {
   const user = data?.user ?? null;
   return { supabase, user, error };
 }
-
 
 

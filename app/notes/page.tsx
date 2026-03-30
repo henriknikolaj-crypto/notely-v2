@@ -2,6 +2,8 @@
 import "server-only";
 import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { filterVisibleNotes, getNoteEntitlement } from "@/lib/notes/entitlements";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 
 export const dynamic = "force-dynamic";
 
@@ -51,6 +53,7 @@ function classifyNote(
 
   // 1) Primært efter note_type
   if (type === "resume") return "resume";
+  if (type === "summary") return "resume";
   if (type === "focus") return "focus";
   if (
     type === "feedback" ||
@@ -68,14 +71,9 @@ function classifyNote(
   return "other";
 }
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {}
-  return process.env.DEV_USER_ID ?? null;
+function isAudioGeneratedNote(note: Pick<NoteRow, "title" | "source_url">) {
+  if (String(note.source_url ?? "").startsWith("notely://audio/")) return true;
+  return (note.title ?? "").toLowerCase().includes("fra lyd");
 }
 
 export default async function NotesPage({
@@ -84,13 +82,13 @@ export default async function NotesPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { ownerId } = await getTrainerSession();
 
   if (!ownerId) {
     return (
       <main className="min-h-screen bg-[#fffef9]">
         <div className="mx-auto max-w-5xl px-4 py-8 text-sm text-red-600">
-          Mangler bruger-id (hverken login eller DEV_USER_ID sat).
+          Du skal være logget ind for at åbne Noter.
         </div>
       </main>
     );
@@ -99,19 +97,23 @@ export default async function NotesPage({
   const sp = (await searchParams) || {};
   const scopeParam = typeof sp.scope === "string" ? sp.scope : undefined;
   const scope = scopeParam ?? "all";
-  const tscopeParam = typeof sp.tscope === "string" ? sp.tscope : undefined;
-
-  // Back-link logik
-  let backHref: string | null = null;
-  let backLabel = "";
-
-  if (scope === "feedback" && tscopeParam) {
-    backHref = `/traener?scope=${encodeURIComponent(tscopeParam)}`;
-    backLabel = "← Tilbage til Træner";
-  } else if ((scope === "resume" || scope === "focus") && tscopeParam) {
-    backHref = `/traener/noter?scope=${encodeURIComponent(tscopeParam)}`;
-    backLabel = "← Tilbage til Noter";
+  const showBackToNotes = scope !== "all";
+  const trainerScopeParam = typeof sp.tscope === "string" ? sp.tscope : undefined;
+  const trainerFolderParam = typeof sp.tfolder === "string" ? sp.tfolder : undefined;
+  const topBackHref = (() => {
+    if (scope !== "resume" && scope !== "focus") return "/notes";
+    const params = new URLSearchParams();
+    if (trainerScopeParam) params.set("scope", trainerScopeParam);
+    if (trainerFolderParam) params.set("folder", trainerFolderParam);
+    const qs = params.toString();
+    return qs ? `/traener/noter?${qs}` : "/traener/noter";
+  })();
+  const listParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(sp)) {
+    if (typeof value === "string" && value.trim()) listParams.set(key, value);
   }
+  const currentListHref = listParams.toString() ? `/notes?${listParams.toString()}` : "/notes";
+  const entitlement = await getNoteEntitlement(sb, ownerId);
 
   // hent alle noter for ejer (max 200 – vi viser selv max 50 pr. view)
   const { data, error } = await sb
@@ -133,7 +135,7 @@ export default async function NotesPage({
     );
   }
 
-  const allNotes = (data ?? []) as NoteRow[];
+  const allNotes = filterVisibleNotes((data ?? []) as NoteRow[], entitlement);
 
   // filtrér efter scope
   const filteredNotes = allNotes.filter((n) => {
@@ -170,7 +172,13 @@ export default async function NotesPage({
       : "";
 
   const infoLine =
-    totalInScope === 0
+    entitlement.visibleNotesLimit != null && (scope === "resume" || scope === "focus")
+      ? "Viser seneste 5 på Freemium."
+      : scope === "resume" || scope === "focus"
+      ? totalInScope >= maxToShow
+        ? "Viser de 50 nyeste noter."
+        : `Viser ${totalInScope} noter.`
+      : totalInScope === 0
       ? ""
       : totalInScope <= maxToShow
       ? `Viser seneste ${totalInScope} noter.`
@@ -179,13 +187,13 @@ export default async function NotesPage({
   return (
     <main className="min-h-screen bg-[#fffef9]">
       <div className="mx-auto max-w-5xl px-4 py-6">
-        {backHref && (
+        {showBackToNotes && (
           <div className="mb-3">
             <Link
-              href={backHref}
+              href={topBackHref}
               className="text-xs text-zinc-600 hover:underline"
             >
-              {backLabel}
+              ← Tilbage til Noter
             </Link>
           </div>
         )}
@@ -226,14 +234,18 @@ export default async function NotesPage({
                 key={note.id}
                 className="flex h-full flex-col rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm"
               >
-                <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-400">
-                  <span>{formatDT(note.created_at)}</span>
-                  <span>ID: {note.id.slice(0, 8)}…</span>
-                </div>
+                <div className="mb-1 text-[11px] text-zinc-400">{formatDT(note.created_at)}</div>
 
-                <h2 className="mb-1 text-sm font-semibold text-zinc-900">
-                  {note.title || "Uden titel"}
-                </h2>
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <h2 className="text-sm font-semibold text-zinc-900">
+                    {note.title || "Uden titel"}
+                  </h2>
+                  {isAudioGeneratedNote(note) ? (
+                    <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-800">
+                      Skabt fra lyd
+                    </span>
+                  ) : null}
+                </div>
 
                 {note.source_title && (
                   <div className="mb-1 text-[11px] text-zinc-500">
@@ -247,7 +259,7 @@ export default async function NotesPage({
 
                 <div className="mt-auto flex items-center justify-between pt-2 text-xs">
                   <a
-                    href={`/notes/${note.id}`}
+                    href={`/notes/${note.id}?back=${encodeURIComponent(currentListHref)}`}
                     className="font-medium text-zinc-700 underline underline-offset-2 hover:text-zinc-900"
                   >
                     Åbn note

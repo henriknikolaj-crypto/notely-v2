@@ -1,37 +1,60 @@
 // app/traener/upload/ImportStatusBox.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import LimitNotice from "@/app/traener/_ui/LimitNotice";
 
 type ImportStatusResponse = {
   ok: boolean;
-  folderId: string | null;
-  quota: {
+
+  // optional (nyere API)
+  plan?: string;
+  usedThisMonth?: number;
+  monthlyLimit?: number | null;
+  resetAt?: string | null;
+
+  // optional (ældre/nestet)
+  folderId?: string | null;
+  quota?: {
     usedThisMonth: number;
-    totalAllTime: number;
     limitPerMonth: number | null;
-    monthStart: string;
-    monthEnd: string;
-    resetAt: string;
-    plan: string;
+    resetAt?: string;
+    plan?: string;
   };
-  files: {
+
+  files?: {
     total: number;
     hasFile: boolean;
-    latest: null | {
-      id: string;
-      name: string;
-      folder_id: string | null;
-      updated_at: string | null;
-    };
+    latest: { id: string; name: string; folder_id: string | null; updated_at: string | null } | null;
   };
+
+  // optional (nyere “flat” helpers)
+  filesTotal?: number;
+  latestFile?: { name?: string; uploadedAt?: string | null; updated_at?: string | null } | null;
+
   error?: string;
   details?: string;
 };
 
-function formatDa(dt: string | null | undefined) {
-  if (!dt) return "";
-  const d = new Date(dt);
+type QuotaCurrentResponse = {
+  ok: boolean;
+  plan?: string;
+  resetAt?: string | null;
+  import?: {
+    usedThisMonth?: number | null;
+    limitPerMonth?: number | null;
+  };
+  error?: string;
+};
+
+function n0(x: any) {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtDa(iso: string | null | undefined) {
+  if (!iso) return "";
+  const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   return new Intl.DateTimeFormat("da-DK", {
     year: "numeric",
@@ -42,136 +65,197 @@ function formatDa(dt: string | null | undefined) {
   }).format(d);
 }
 
-function pct(used: number, limit: number | null) {
-  if (!limit || limit <= 0) return 0;
-  const p = Math.round((used / limit) * 100);
-  return Math.max(0, Math.min(100, p));
+function prettyPlan(plan: string) {
+  const p = (plan || "freemium").toLowerCase();
+  if (p === "freemium") return "Freemium";
+  return p.charAt(0).toUpperCase() + p.slice(1);
 }
 
-export default function ImportStatusBox(props: {
-  folderId?: string | null;
-  refreshKey?: string | number;
-  refreshMs?: number;
-  className?: string;
-}) {
-  const { folderId = null, refreshKey, refreshMs = 15000, className } = props;
+async function safeJson(res: Response) {
+  const text = await res.text().catch(() => "");
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
-  const [data, setData] = useState<ImportStatusResponse | null>(null);
-  const [loading, setLoading] = useState(false);
+export default function ImportStatusBox(props: { folderId?: string | null; refreshMs?: number }) {
+  const folderId = props.folderId ?? null;
+  const refreshMs = typeof props.refreshMs === "number" ? props.refreshMs : 10_000;
+
+  const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [data, setData] = useState<ImportStatusResponse | null>(null);
 
   const url = useMemo(() => {
-    const params = new URLSearchParams();
-    if (folderId) params.set("folder_id", folderId);
-    const qs = params.toString();
+    const qs = folderId ? `folder_id=${encodeURIComponent(folderId)}` : "";
     return qs ? `/api/import-status?${qs}` : `/api/import-status`;
   }, [folderId]);
 
-  async function load() {
-    setLoading(true);
-    setErr(null);
-
+  const load = useCallback(async () => {
     try {
-      const r = await fetch(url, { cache: "no-store" });
-      const j = (await r.json()) as ImportStatusResponse;
-      if (!r.ok || !j?.ok) throw new Error(j?.error || `HTTP ${r.status}`);
-      setData(j);
-    } catch (e: any) {
-      setErr(String(e?.message ?? e));
+      setErr(null);
+
+      const [statusRes, quotaRes] = await Promise.all([
+        fetch(url, {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        }),
+        fetch("/api/quota/current", {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        }),
+      ]);
+
+      const statusJson = (await safeJson(statusRes)) as ImportStatusResponse | null;
+      const quotaJson = (await safeJson(quotaRes)) as QuotaCurrentResponse | null;
+
+      if (statusRes.status === 401 || quotaRes.status === 401) {
+        setData(null);
+        setErr("Upload-status opdateres lige nu.");
+        return;
+      }
+
+      if (!statusRes.ok || !statusJson) {
+        setData(null);
+        setErr("Upload-status opdateres lige nu.");
+        return;
+      }
+
+      if (statusJson.ok === false) {
+        setData(null);
+        setErr("Upload-status opdateres lige nu.");
+        return;
+      }
+
+      const merged: ImportStatusResponse =
+        quotaRes.ok && quotaJson?.ok
+          ? {
+              ...statusJson,
+              plan: quotaJson.plan ?? statusJson.plan,
+              resetAt: quotaJson.resetAt ?? statusJson.resetAt ?? statusJson.quota?.resetAt ?? null,
+              usedThisMonth: n0(quotaJson.import?.usedThisMonth ?? statusJson.usedThisMonth ?? statusJson.quota?.usedThisMonth ?? 0),
+              monthlyLimit:
+                (quotaJson.import?.limitPerMonth ?? statusJson.monthlyLimit ?? statusJson.quota?.limitPerMonth ?? null) as number | null,
+              quota: {
+                usedThisMonth: n0(quotaJson.import?.usedThisMonth ?? statusJson.quota?.usedThisMonth ?? 0),
+                limitPerMonth:
+                  (quotaJson.import?.limitPerMonth ?? statusJson.quota?.limitPerMonth ?? null) as number | null,
+                resetAt: quotaJson.resetAt ?? statusJson.quota?.resetAt,
+                plan: quotaJson.plan ?? statusJson.quota?.plan,
+              },
+            }
+          : statusJson;
+
+      setData(merged);
+    } catch (e) {
+      console.error("[ImportStatusBox] load error", e);
+      setData(null);
+      setErr("Upload-status opdateres lige nu.");
     } finally {
       setLoading(false);
     }
-  }
+  }, [url]);
 
   useEffect(() => {
-    let alive = true;
+    setLoading(true);
+    void load();
 
-    const safeLoad = async () => {
-      if (!alive) return;
-      await load();
-    };
-
-    void safeLoad();
-
-    const onRefresh = () => void safeLoad();
+    const onRefresh = () => void load();
     window.addEventListener("notely:import-status-refresh", onRefresh);
+    window.addEventListener("notely-quota-changed", onRefresh);
 
-    const t = setInterval(() => void safeLoad(), Math.max(5000, refreshMs));
+    const t = setInterval(() => void load(), Math.max(5000, refreshMs));
 
     return () => {
-      alive = false;
-      clearInterval(t);
       window.removeEventListener("notely:import-status-refresh", onRefresh);
+      window.removeEventListener("notely-quota-changed", onRefresh);
+      clearInterval(t);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, refreshKey, refreshMs]);
+  }, [load, refreshMs]);
 
-  const used = data?.quota?.usedThisMonth ?? 0;
-  const limit = data?.quota?.limitPerMonth ?? null;
-  const progress = pct(used, limit);
+  // ✅ robust udlæsning (nestet + flat)
+  const planRaw = (data?.quota?.plan ?? data?.plan ?? "freemium").toString();
+  const used = n0(data?.quota?.usedThisMonth ?? data?.usedThisMonth ?? (data as any)?.used ?? 0);
+  const limit =
+    (data?.quota?.limitPerMonth ?? data?.monthlyLimit ?? (data as any)?.limit ?? null) as number | null;
+  const resetAt = (data?.quota?.resetAt ?? data?.resetAt ?? null) as string | null;
 
-  const latestName = data?.files?.latest?.name ?? null;
-  const latestAt = data?.files?.latest?.updated_at ?? null;
+  const hasLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0;
+  const remaining = hasLimit ? Math.max(0, (limit as number) - used) : null;
+
+  const atOrOverLimit = hasLimit ? used >= (limit as number) : false;
+
+  const pct = useMemo(() => {
+    if (!hasLimit) return 0;
+    return Math.min(1, Math.max(0, used / (limit as number)));
+  }, [used, limit, hasLimit]);
+
+  const filesTotal = n0(data?.files?.total ?? data?.filesTotal ?? 0);
+  const latestName = data?.files?.latest?.name ?? data?.latestFile?.name ?? null;
+  const latestAt =
+    data?.files?.latest?.updated_at ?? data?.latestFile?.uploadedAt ?? data?.latestFile?.updated_at ?? null;
+
+  // ✅ info-tekst om slet (frigiver ikke sider)
+  const showDeleteWarning = true;
 
   return (
-    <section
-      className={[
-        "rounded-2xl border border-zinc-200 bg-white px-6 py-5 shadow-sm",
-        className ?? "",
-      ].join(" ")}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-sm font-semibold">Plan: {data?.quota?.plan ? String(data.quota.plan).toUpperCase().slice(0,1) + String(data.quota.plan).slice(1) : "—"}</div>
+    <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+      <div className="text-sm font-semibold text-zinc-900">Plan: {prettyPlan(planRaw)}</div>
+
+      <div className="mt-4 flex items-center justify-between">
+        <div className="text-sm font-semibold text-zinc-900">Materiale gjort klar denne måned</div>
+        <div className="text-sm font-semibold text-zinc-900">
+          {hasLimit ? `${used} / ${limit}` : `${used}`}
         </div>
-        {loading ? <div className="text-xs text-neutral-500">Opdaterer…</div> : null}
       </div>
 
-      {err ? (
-        <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-          {err}
+      <div className="mt-2 h-2 w-full rounded-full bg-zinc-100">
+        <div className="h-2 rounded-full bg-zinc-900" style={{ width: `${Math.round(pct * 100)}%` }} />
+      </div>
+
+      {/* ✅ tilbage-tæller */}
+      {hasLimit ? (
+        <div className="mt-2 text-xs text-zinc-600">Tilbage denne måned: {remaining} sider</div>
+      ) : null}
+
+      <div className="mt-1 text-xs text-zinc-500">{resetAt ? `Nulstilles: ${fmtDa(resetAt)}` : ""}</div>
+
+      {showDeleteWarning ? (
+        <div className="mt-2 text-[11px] text-zinc-500">
+          Bemærk: Hvis du sletter en fil, frigiver det ikke sider tilbage i denne måned.
+          {planRaw.toLowerCase() === "freemium" ? " Freemium: maks. 10 sider pr. PDF." : ""}
         </div>
       ) : null}
 
-      <div className="mt-4 space-y-4">
-        <div>
-          <div className="flex items-baseline justify-between gap-3">
-            <div className="text-sm font-medium">Materiale gjort klar denne måned</div>
-            <div className="text-sm tabular-nums">
-              {used}
-              {typeof limit === "number" ? ` / ${limit}` : ""}
-            </div>
-          </div>
+      {atOrOverLimit ? (
+        <LimitNotice className="mt-3">
+          Grænse nået. Du kan uploade igen efter nulstilling{resetAt ? ` (${fmtDa(resetAt)})` : ""}.
+        </LimitNotice>
+      ) : null}
 
-          {typeof limit === "number" ? (
-            <div className="mt-2 h-2 w-full rounded-full bg-neutral-100">
-              <div className="h-2 rounded-full bg-neutral-900" style={{ width: `${progress}%` }} />
-            </div>
-          ) : null}
-
-          <div className="mt-1 text-xs text-neutral-500">
-            Nulstilles: {formatDa(data?.quota?.resetAt ?? null) || "—"}
-          </div>
+      <div className="mt-4 rounded-xl bg-zinc-50 p-4">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold text-zinc-900">Uploadede filer</div>
+          <div className="text-sm font-semibold text-zinc-900">{filesTotal}</div>
         </div>
 
-        <div className="rounded-xl bg-neutral-50 p-3">
-          <div className="flex items-baseline justify-between gap-3">
-            <div className="text-sm font-medium">Filer i alt</div>
-            <div className="text-sm tabular-nums">{data?.files?.total ?? 0}</div>
-          </div>
-
-          <div className="mt-1 text-xs text-neutral-600">
-            {latestName ? (
-              <>
-                Senest: <span className="font-medium">{latestName}</span>
-                {latestAt ? <span className="text-neutral-500"> · {formatDa(latestAt)}</span> : null}
-              </>
-            ) : (
-              "Ingen filer fundet."
-            )}
-          </div>
+        <div className="mt-1 text-xs text-zinc-600">
+          {latestName ? (
+            <>
+              Senest: {latestName}
+              {latestAt ? ` · ${fmtDa(latestAt)}` : ""}
+            </>
+          ) : null}
         </div>
       </div>
-    </section>
+
+      {loading ? <div className="mt-3 text-xs text-zinc-500">Indlæser…</div> : null}
+      {err ? <div className="mt-3 text-xs text-zinc-600">{err}</div> : null}
+    </div>
   );
 }

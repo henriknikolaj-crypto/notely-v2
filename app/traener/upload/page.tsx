@@ -1,11 +1,10 @@
 ﻿// app/traener/upload/page.tsx
 import "server-only";
 
-import { redirect } from "next/navigation";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
-import UploadClient from "./UploadClient";
-import FolderManagerClient from "./FolderManagerClient";
 import ImportStatusBox from "./ImportStatusBox";
+import UploadPageClient from "./UploadPageClient";
 
 export const dynamic = "force-dynamic";
 
@@ -18,33 +17,14 @@ type FolderRow = {
   end_date?: string | null;
 };
 
-async function getOwnerCtxRsc(sb: any): Promise<
-  | { ownerId: string; mode: "auth"; email: string | null }
-  | null
-> {
-  try {
-    const { data } = await sb.auth.getUser();
-    if (data?.user?.id) return { ownerId: data.user.id as string, mode: "auth", email: data.user.email ?? null };
-  } catch {
-    // ignore
-  }
-
-  return null;
-}
-
 export default async function UploadPage({
   searchParams,
 }: {
   searchParams?: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const sb = await supabaseServerRSC();
-  const owner = await getOwnerCtxRsc(sb);
-
-  if (!owner?.ownerId) {
-    redirect("/auth/login");
-  }
-
-  const ownerId = owner.ownerId;
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
 
   const { data: foldersData, error: foldersError } = await sb
     .from("folders")
@@ -84,31 +64,19 @@ export default async function UploadPage({
   if (!initialFolderId && folders.length > 0) initialFolderId = folders[0].id;
 
   return (
-    <main className="min-h-screen bg-[#fffef9]">
-      <div className="mx-auto max-w-6xl space-y-8 px-4 py-6 md:px-6">
-        <section className="space-y-4">
-          <header className="border-b border-zinc-200 pb-3">
-            <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
-            <p className="mt-1 text-sm text-zinc-600">
-              Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
-            </p>
-          </header>
+    <section className="space-y-8">
+      <section className="space-y-4">
+        <header className="border-b border-zinc-200 pb-3">
+          <h1 className="text-lg font-semibold text-zinc-900">Upload / ret materiale</h1>
+          <p className="mt-1 text-sm text-zinc-600">
+            Upload dine pensumfiler. Når materialet er gjort klar, kan du bruge det på tværs af Notely.
+          </p>
+        </header>
 
-          <ImportStatusBox folderId={null} />
-        </section>
+        <ImportStatusBox folderId={null} />
+      </section>
 
-        <section>
-          <UploadClient
-            folders={folders.map((f) => ({ id: f.id, name: f.name }))}
-            initialFolderId={initialFolderId}
-            ownerId={ownerId}
-          />
-        </section>
-
-        <section>
-          <FolderManagerClient ownerId={ownerId} initialFolders={folders} />
-        </section>
-      </div>
-    </main>
+      <UploadPageClient ownerId={ownerId} initialFolderId={initialFolderId} initialFolders={folders} />
+    </section>
   );
 }

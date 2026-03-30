@@ -2,7 +2,8 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "@/lib/auth";
+import { createClient } from "@supabase/supabase-js";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -10,6 +11,8 @@ export const runtime = "nodejs";
 type Body = {
   questionId?: string;
   question?: string;
+  roundId?: string;
+  questionHash?: string;
   selectedOptionId?: string;
   selectedOptionText?: string;
   isCorrect?: boolean;
@@ -40,24 +43,38 @@ async function readJsonBody<T>(req: NextRequest) {
   }
 }
 
+function supabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
 export async function POST(req: NextRequest) {
   try {
-    // Auth/dev-bypass (samme mønster som andre routes)
-    let sb: any;
+    // Auth: session-first, read-only route client
     let ownerId = "";
-    let mode: "auth" | "dev" = "auth";
 
     try {
-      const u = await requireUser(req);
-      sb = u.sb;
-      ownerId = u.id;
-      mode = u.mode;
+      const sbAuth = supabaseServerRouteReadOnly(req);
+      const { data: sessionData } = await sbAuth.auth.getSession();
+      const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+
+      if (sessionUserId) {
+        ownerId = sessionUserId;
+      } else {
+        const { data, error } = await sbAuth.auth.getUser();
+        if (!error && data?.user?.id) ownerId = String(data.user.id);
+      }
     } catch (e: any) {
-      const msg = String(e?.message ?? "");
-      const isAuth = msg.toLowerCase().includes("unauthorized");
-      if (!isAuth) console.error("[mc-submit] requireUser crash:", e);
+      console.error("[mc-submit] auth crash:", e);
+    }
+
+    if (!ownerId) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
+
+    const sb = supabaseAdmin();
 
     const parsed = await readJsonBody<Body>(req);
     if (!parsed.ok) {
@@ -68,6 +85,8 @@ export async function POST(req: NextRequest) {
 
     const questionId = String(body.questionId ?? "").trim();
     const question = String(body.question ?? "").trim();
+    const roundId = String(body.roundId ?? "").trim() || null;
+    const questionHash = String(body.questionHash ?? "").trim() || null;
     const selectedOptionId = String(body.selectedOptionId ?? "").trim();
     const selectedOptionText = String(body.selectedOptionText ?? "").trim();
     const isCorrect = !!body.isCorrect;
@@ -100,8 +119,10 @@ export async function POST(req: NextRequest) {
       source_type: "mc",
       folder_id: folderId,
       meta: {
-        mode,
+        mode: "auth",
+        roundId,
         questionId,
+        questionHash,
         selectedOptionId,
         selectedOptionText,
         isCorrect,
