@@ -14,10 +14,10 @@ const inter = Inter({
   display: "swap",
 });
 
-const logo = Birthstone({
+const birthstone = Birthstone({
   subsets: ["latin"],
   weight: "400",
-  variable: "--font-logo",
+  variable: "--font-birthstone",
 });
 
 export default function RootLayout({
@@ -28,7 +28,7 @@ export default function RootLayout({
   return (
     <html lang="da">
       <body
-        className={`${inter.className} ${logo.variable} min-h-screen bg-[#fffef9] text-zinc-900 antialiased selection:bg-black selection:text-white`}
+        className={`${inter.className} ${birthstone.variable} [--font-logo:var(--font-birthstone)] min-h-screen bg-[#fffef9] text-zinc-900 antialiased selection:bg-black selection:text-white`}
       >
         {children}
         <Toaster position="top-right" richColors />

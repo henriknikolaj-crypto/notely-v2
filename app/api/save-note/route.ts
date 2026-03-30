@@ -3,6 +3,7 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
+import { assertCanCreateNote, FREEMIUM_NOTES_LIMIT_MESSAGE } from "@/lib/notes/entitlements";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -88,6 +89,8 @@ export async function POST(req: NextRequest) {
   const title = cleanStr(body.title) ?? defaultTitleFor(noteType, sourceTitle);
 
   try {
+    await assertCanCreateNote(sb, ownerId);
+
     const { data, error } = await sb
       .from("notes")
       .insert({
@@ -109,6 +112,12 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ ok: true, saved: true, note: data }, { status: 200 });
   } catch (e: any) {
+    if (String(e?.code ?? "") === "NOTES_LIMIT_REACHED") {
+      return NextResponse.json(
+        { ok: false, error: FREEMIUM_NOTES_LIMIT_MESSAGE, code: "NOTES_LIMIT_REACHED" },
+        { status: 403 },
+      );
+    }
     console.error("[save-note] handler crash:", e);
     return NextResponse.json({ ok: false, error: "SERVER_ERROR" }, { status: 500 });
   }

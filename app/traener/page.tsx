@@ -1,6 +1,20 @@
 ﻿// app/traener/page.tsx
 import "server-only";
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { hasOwnUsableMaterial } from "@/lib/trainer/hasOwnUsableMaterial";
 import { redirect } from "next/navigation";
+import ClientTrainer from "./ux/ClientTrainer";
+
+export const dynamic = "force-dynamic";
+
+type FolderRow = {
+  id: string;
+  name: string;
+  parent_id?: string | null;
+};
+
+const DEMO_SCOPE_ID = "demo-samfund";
+const DEMO_SCOPE_NAME = "Samfund";
 
 export default async function Page({
   searchParams,
@@ -8,9 +22,15 @@ export default async function Page({
   searchParams?: Promise<Record<string, string | string[]>>;
 }) {
   const sp = (await searchParams) ?? {};
+  const isDemoMode =
+    sp.demo === "1" ||
+    sp.demo === "true" ||
+    (Array.isArray(sp.demo) && (sp.demo[0] === "1" || sp.demo[0] === "true"));
   const rawScope = sp.scope ?? sp["scope"];
+  const rawFolder = sp.folder ?? sp["folder"];
 
   let scopeFolderIds: string[] = [];
+  let folderParam: string | null = null;
 
   if (typeof rawScope === "string") {
     scopeFolderIds = rawScope
@@ -23,9 +43,149 @@ export default async function Page({
       .map((s) => s.trim())
       .filter(Boolean);
   }
+  if (typeof rawFolder === "string") {
+    folderParam = rawFolder.trim() || null;
+  } else if (Array.isArray(rawFolder) && rawFolder.length > 0) {
+    folderParam = rawFolder[0]?.trim() || null;
+  }
 
-  const qs = new URLSearchParams();
-  if (scopeFolderIds.length > 0) qs.set("scope", scopeFolderIds.join(","));
+  const sb = await supabaseServerRSC();
+  const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+  const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
 
-  redirect(qs.toString() ? `/traener/noter?${qs.toString()}` : "/traener/noter");
+  let ownerId = sessionUserId;
+  let getUserError: string | null = null;
+
+  if (!ownerId) {
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : null;
+  }
+
+  if (sessionError) {
+    console.error("TRÆNER page session auth error:", sessionError);
+  }
+  if (getUserError) {
+    console.error("TRÆNER page getUser auth error:", getUserError);
+  }
+
+  let data: FolderRow[] | null = null;
+  let error: unknown = null;
+
+  if (ownerId) {
+    const foldersResult = await sb
+      .from("folders")
+      .select("id,name,parent_id")
+      .eq("owner_id", ownerId)
+      .is("archived_at", null)
+      .order("name", { ascending: true });
+
+    data = (foldersResult.data ?? null) as FolderRow[] | null;
+    error = foldersResult.error;
+  }
+
+  if (error) {
+    console.error("TRÆNER page folders error:", error);
+  }
+
+  const folders = (data ?? []) as FolderRow[];
+  const hasTrustedFolderCatalog = !error && folders.length > 0;
+  const validFolderIds = new Set(folders.map((folder) => folder.id));
+  const sanitizedScopeFolderIds = isDemoMode
+    ? [DEMO_SCOPE_ID]
+    : hasTrustedFolderCatalog
+      ? scopeFolderIds.filter((id) => validFolderIds.has(id))
+      : scopeFolderIds;
+  const fallbackFolderId = folders[0]?.id ?? null;
+  const sanitizedFolderParam =
+    isDemoMode || !folderParam
+      ? null
+      : hasTrustedFolderCatalog
+        ? validFolderIds.has(folderParam)
+          ? folderParam
+          : null
+        : folderParam;
+  const shouldFallbackScope =
+    !isDemoMode &&
+    hasTrustedFolderCatalog &&
+    scopeFolderIds.length > 0 &&
+    sanitizedScopeFolderIds.length === 0 &&
+    !!fallbackFolderId;
+  const shouldPromoteLegacyFolderToScope =
+    !isDemoMode &&
+    hasTrustedFolderCatalog &&
+    sanitizedScopeFolderIds.length === 0 &&
+    !!sanitizedFolderParam;
+  const finalScopeFolderIds = shouldFallbackScope
+    ? [fallbackFolderId as string]
+    : shouldPromoteLegacyFolderToScope
+      ? [sanitizedFolderParam as string]
+      : sanitizedScopeFolderIds;
+  const activeFolderId = isDemoMode ? DEMO_SCOPE_ID : finalScopeFolderIds[0] ?? null;
+  const selectedScopeNames = finalScopeFolderIds
+    .map((id) => folders.find((folder) => folder.id === id)?.name ?? null)
+    .filter((name): name is string => !!name);
+
+  console.log("[trainer-page-scope-debug]", {
+    vercelEnv: process.env.VERCEL_ENV ?? null,
+    hasSession: !!sessionData?.session,
+    sessionUserId,
+    sessionError: sessionError?.message ?? null,
+    getUserError,
+    ownerId,
+    scopeFolderIds,
+    finalScopeFolderIds,
+    activeFolderId,
+    selectedScopeNames,
+    folderCount: folders.length,
+  });
+
+  const scopeChanged =
+    !isDemoMode &&
+    hasTrustedFolderCatalog &&
+    (finalScopeFolderIds.length !== scopeFolderIds.length ||
+      finalScopeFolderIds.some((id, index) => id !== scopeFolderIds[index]));
+  const folderChanged = !isDemoMode && hasTrustedFolderCatalog && !!folderParam;
+
+  if (!isDemoMode && (scopeChanged || folderChanged)) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(sp)) {
+      if (key === "scope" || key === "folder") continue;
+      if (typeof value === "string" && value.trim()) params.set(key, value);
+      else if (Array.isArray(value) && value[0]?.trim()) params.set(key, value[0]);
+    }
+    if (finalScopeFolderIds.length > 0) params.set("scope", finalScopeFolderIds.join(","));
+    const qs = params.toString();
+    redirect(qs ? `/traener?${qs}` : "/traener");
+  }
+
+  const effectiveFolders = isDemoMode ? [{ id: DEMO_SCOPE_ID, name: DEMO_SCOPE_NAME }, ...folders] : folders;
+  const effectiveScopeFolderIds = finalScopeFolderIds;
+  const showFirstUseCta = !isDemoMode && !!ownerId && !(await hasOwnUsableMaterial(sb, ownerId));
+
+  return (
+    <main>
+      <header>
+        <h1 className="text-lg font-semibold text-zinc-900">Træner</h1>
+        <p className="mt-1 text-sm text-zinc-600 max-w-2xl">
+          Træn eksamenslignende spørgsmål og få feedback på dine svar – baseret på dit eget pensum og faglige kilder.
+        </p>
+        <div className="mt-3 h-px w-full bg-zinc-200" />
+      </header>
+
+      {/* Lille margin – så boksen kommer tæt op på stregen som på Noter */}
+      <section className="mt-2">
+        <ClientTrainer
+  ownerId={ownerId ?? undefined}
+  folders={effectiveFolders}
+  activeFolderId={activeFolderId}
+  scopeFolderIds={effectiveScopeFolderIds}
+  selectedScopeNames={selectedScopeNames}
+  showFirstUseCta={showFirstUseCta}
+  demoMode={isDemoMode}
+  demoScopeName={isDemoMode ? DEMO_SCOPE_NAME : null}
+/>
+      </section>
+    </main>
+  );
 }

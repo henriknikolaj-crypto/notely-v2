@@ -1,89 +1,211 @@
-// app/traener/simulator/page.tsx
 import "server-only";
+
+import Link from "next/link";
 import { redirect } from "next/navigation";
+import { unstable_noStore as noStore } from "next/cache";
+import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import ClientWrittenExam from "./ClientWrittenExam";
+import TrainingScopeCard from "../_ui/TrainingScopeCard";
+import FeatureScopePicker from "@/components/training/FeatureScopePicker";
 
 export const dynamic = "force-dynamic";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
+function cx(...xs: Array<string | false | null | undefined>) {
+  return xs.filter(Boolean).join(" ");
 }
 
-export default async function SimulatorPage({
+function pickString(sp: Record<string, string | string[] | undefined>, key: string) {
+  const v = sp[key];
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v[0] ?? "";
+  return "";
+}
+
+function buildHref(
+  basePath: string,
+  sp: Record<string, string | string[] | undefined>,
+  patch: Record<string, string>,
+) {
+  const params = new URLSearchParams();
+
+  for (const [k, v] of Object.entries(sp)) {
+    if (k === "mode") continue;
+    if (typeof v === "string" && v.trim()) params.set(k, v);
+    else if (Array.isArray(v) && v.length) params.set(k, v.join(","));
+  }
+
+  for (const [k, v] of Object.entries(patch)) params.set(k, v);
+
+  const qs = params.toString();
+  return qs ? `${basePath}?${qs}` : basePath;
+}
+
+function normalizeIds(ids: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of ids) {
+    const s = String(x ?? "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function normalizePlan(raw: any) {
+  const p = String(raw ?? "").trim().toLowerCase();
+  if (!p || p === "free") return "freemium";
+  if (p === "basic") return "basis";
+  return p;
+}
+
+async function listFolderOptions(sb: any, ownerId: string) {
+  const { data, error } = await sb
+    .from("folders")
+    .select("id, name")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null)
+    .order("name", { ascending: true });
+
+  if (error) {
+    console.error("[simulator/page] folder options load error:", error);
+    return [] as Array<{ id: string; name: string }>;
+  }
+
+  return ((data ?? []) as any[])
+    .map((row) => {
+      const id = String(row?.id ?? "").trim();
+      const name = String(row?.name ?? "").trim();
+      if (!id || !name) return null;
+      return { id, name };
+    })
+    .filter(Boolean) as Array<{ id: string; name: string }>;
+}
+
+export default async function Page({
   searchParams,
 }: {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
+  noStore();
   const sp = (await searchParams) ?? {};
 
-  // Aktiv mappe via klik på mappe-navn
-  const folderParam = sp.folder;
-  const activeFolderId =
-    typeof folderParam === "string" ? folderParam : null;
+  const modeRaw = pickString(sp, "mode").toLowerCase();
+  const isMundtlig = modeRaw === "mundtlig";
 
-  // Scope: comma-separeret liste af folder-id’er fra tjekboksene
-  const scopeParam = sp.scope;
-  const scopeRaw = typeof scopeParam === "string" ? scopeParam : "";
+  const activeFolderId = pickString(sp, "folder") || null;
+
+  const scopeRaw = pickString(sp, "scope");
   const scopeIds = scopeRaw
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const hrefSkrift = buildHref("/traener/simulator", sp, {});
+  const hrefMundtlig = buildHref("/traener/mundtlig", sp, {});
 
-  if (!ownerId) {
-    redirect("/auth/login");
+  // Hvis nogen rammer den gamle “mundtlig” variant på simulator-siden → send dem til den rigtige side
+  if (isMundtlig) {
+    redirect(hrefMundtlig);
   }
 
-  const scopeLabel = (() => {
-    if (scopeIds.length > 1)
-      return `Simulatoren vil bruge ${scopeIds.length} valgte mapper som grundlag.`;
-    if (scopeIds.length === 1)
-      return "Simulatoren vil bruge 1 valgt mappe som grundlag.";
-    if (activeFolderId)
-      return "Simulatoren vil tage udgangspunkt i den mappe du har valgt i venstre side.";
-    return "Vælg mapper i venstre side for at bestemme hvad eksamens-simulatoren skal dække.";
-  })();
+  const sb = await supabaseServerRSC();
+  const { ownerId } = await getTrainerSession();
+  if (!ownerId) return null;
+
+  // ✅ Byg “Samfund +1” label ud fra scope/folder
+  const trainingFolderIds = normalizeIds(scopeIds.length > 0 ? scopeIds : activeFolderId ? [activeFolderId] : []);
+  const folderMap = new Map<string, string>();
+
+  if (trainingFolderIds.length > 0) {
+    const fr = await sb
+      .from("folders")
+      .select("id, name")
+      .eq("owner_id", ownerId)
+      .in("id", trainingFolderIds);
+
+    if (!fr.error && Array.isArray(fr.data)) {
+      for (const f of fr.data as any[]) {
+        if (f?.id && f?.name) folderMap.set(String(f.id), String(f.name));
+      }
+    }
+  }
+
+  const resolvedTrainingFolderIds = trainingFolderIds.filter((id) => folderMap.has(id));
+  const resolvedTrainingFolderNames = resolvedTrainingFolderIds.map((id) => folderMap.get(id) as string);
+  const resolvedActiveFolderId = resolvedTrainingFolderIds[0] ?? null;
+  const folderOptions = await listFolderOptions(sb, ownerId);
+  const { data: profile } = await sb
+    .from("profiles")
+    .select("plan")
+    .eq("id", ownerId)
+    .maybeSingle();
+  const planRaw = (profile as any)?.plan ?? null;
+  const planNorm = normalizePlan(planRaw);
+  const isPro = planNorm === "pro";
+  if (process.env.NODE_ENV !== "production") {
+    console.log("[exam page]", { ownerId, planRaw, planNorm, isPro });
+  }
 
   return (
-    <main className="max-w-3xl px-4 py-6 md:px-0 space-y-4">
-      <header className="space-y-1">
-        <h1 className="text-xl font-semibold">Simulator</h1>
-        <p className="text-sm text-zinc-600">
-          Tidsbegrænsede eksamensforløb med flere spørgsmål i træk – samme
-          følelse som en rigtig prøve.
+    <main>
+      <header>
+        <h1 className="text-lg font-semibold text-zinc-900">Eksamen</h1>
+        <p className="mt-1 max-w-2xl text-sm text-zinc-600">
+          Tidsbegrænsede eksamensforløb med flere spørgsmål i træk – samme følelse som en rigtig prøve.
         </p>
+        <div className="mt-3 h-px w-full bg-zinc-200" />
       </header>
 
-      <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-        <h2 className="mb-1 text-sm font-semibold">Træningsområde</h2>
-        <p className="text-xs text-zinc-600">{scopeLabel}</p>
-        <p className="mt-1 text-[11px] text-zinc-500">
-          Vi bruger de mapper du vælger i venstre side – ligesom i Træner,
-          Multiple Choice og Flashcards.
-        </p>
-      </section>
+      <section className="mt-2 space-y-4">
+        {/* ✅ Skriftlig/Mundtlig toggle */}
+        <div className="inline-flex overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
+          <Link
+            href={hrefSkrift}
+            className={cx("px-4 py-2 text-sm text-zinc-900", "bg-zinc-200 text-zinc-900")}
+          >
+            Skriftlig
+          </Link>
 
-      <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-        <h3 className="mb-1 text-sm font-semibold">Simulatoren er på vej</h3>
-        <p className="text-sm text-zinc-600">
-          Selve eksamens-simulatoren er endnu ikke aktiveret i denne version.
-          Planen er, at du kan køre rigtige eksamenssæt med flere spørgsmål i
-          træk, tidsbegrænsning og samlet evaluering efter aflevering.
-        </p>
-        <p className="mt-2 text-sm text-zinc-600">
-          Når funktionen er klar, vil den automatisk bruge de mapper og noter
-          du allerede har valgt som dit træningsområde.
-        </p>
+          <Link
+            href={hrefMundtlig}
+            className={cx(
+              "border-l border-zinc-200 px-4 py-2 text-sm text-zinc-900",
+              "bg-white text-zinc-900 hover:bg-zinc-50",
+            )}
+          >
+            Mundtlig
+          </Link>
+        </div>
+
+        <TrainingScopeCard
+          names={resolvedTrainingFolderNames}
+          className="md:hidden"
+          emptyLabel="Vælg en mappe direkte her."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        >
+          <FeatureScopePicker
+            selectedNames={resolvedTrainingFolderNames}
+            selectedScopeIds={resolvedTrainingFolderIds}
+            initialFolders={folderOptions}
+          />
+          <div id="written-exam-training-area-slot" />
+        </TrainingScopeCard>
+        <TrainingScopeCard
+          names={resolvedTrainingFolderNames}
+          className="hidden md:block"
+          emptyLabel="Vælg en mappe i venstre side."
+          helpText="Eksamen kan først startes, når en mappe er valgt."
+        />
+
+        <ClientWrittenExam
+          scopeFolderIds={resolvedTrainingFolderIds}
+          activeFolderId={resolvedActiveFolderId}
+          trainingAreaSlotId="written-exam-training-area-slot"
+          isPro={isPro}
+        />
       </section>
     </main>
   );

@@ -1,4 +1,5 @@
-﻿@import "tailwindcss";
+﻿/* app/globals.css */
+@import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
 /* Peg på alle TS/TSX/MDX-filer */
@@ -22,6 +23,7 @@ body {
   font-weight: 400;
   letter-spacing: 0.03em;
 }
+
 /* Custom grå checkbox med hvidt flueben */
 .custom-checkbox {
   position: relative;
@@ -33,6 +35,11 @@ body {
   background-color: white;
   cursor: pointer;
   display: inline-block;
+}
+
+.custom-checkbox:focus-visible {
+  outline: 2px solid #d4d4d8; /* zinc-300-ish */
+  outline-offset: 2px;
 }
 
 .custom-checkbox:checked {
@@ -49,30 +56,18 @@ body {
   color: white; /* hvidt flueben */
   font-weight: 700;
 }
-/* Custom grå checkbox med hvidt flueben */
-.custom-checkbox {
-  position: relative;
-  width: 16px;
-  height: 16px;
-  appearance: none;
-  border: 1.5px solid #a1a1aa; /* lys grå kant */
-  border-radius: 4px;
-  background-color: white;
-  cursor: pointer;
-  display: inline-block;
+
+/* Mic: pulserende FYLD-farve (ingen scale af formen) */
+@keyframes mic-pulse-fill {
+  0%,
+  100% {
+    fill: var(--mic-pulse-dark);
+  }
+  50% {
+    fill: var(--mic-fill);
+  }
 }
 
-.custom-checkbox:checked {
-  background-color: #52525b; /* mørkere grå */
-  border-color: #52525b;
-}
-
-.custom-checkbox:checked::after {
-  content: "✓";
-  position: absolute;
-  top: -2px;
-  left: 2px;
-  font-size: 14px;
-  color: white; /* hvidt flueben */
-  font-weight: 700;
+.mic-fill-pulse-red {
+  animation: mic-pulse-fill 2.2s ease-in-out infinite;
 }

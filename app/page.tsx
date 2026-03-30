@@ -1,32 +1,55 @@
-﻿import Link from "next/link";
+import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import { redirect } from "next/navigation";
 
 export const dynamic = "force-dynamic";
 
-export default function Home() {
-  return (
-    <main className="min-h-screen bg-[#fffef9] px-4 py-10">
-      <div className="mx-auto max-w-3xl">
-        <h1 className="text-2xl font-semibold text-zinc-900">Notely</h1>
-        <p className="mt-2 text-sm text-zinc-600">
-          Vælg hvor du vil starte.
-        </p>
+function firstParam(value: string | string[] | undefined) {
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value ?? "";
+}
 
-        <div className="mt-6 flex flex-wrap gap-3">
-          <Link
-            href="/traener"
-            className="rounded-full bg-black px-5 py-2 text-sm font-semibold text-white"
-          >
-            Gå til Træner
-          </Link>
+function appendSearchParams(params: Record<string, string | string[] | undefined>) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    const values = Array.isArray(value) ? value : [value];
+    for (const entry of values) {
+      if (typeof entry === "string" && entry.length > 0) search.append(key, entry);
+    }
+  }
+  return search.toString();
+}
 
-          <Link
-            href="/traener/upload"
-            className="rounded-full border border-zinc-300 bg-white px-5 py-2 text-sm font-semibold text-zinc-900"
-          >
-            Upload / ret materiale
-          </Link>
-        </div>
-      </div>
-    </main>
-  );
+export default async function Home({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = searchParams ? await searchParams : {};
+  const code = firstParam(params.code);
+  const type = firstParam(params.type);
+  const authError = firstParam(params.error);
+  const authErrorCode = firstParam(params.error_code);
+  const authErrorDescription = firstParam(params.error_description);
+
+  if (code) {
+    const suffix = appendSearchParams(params);
+    const target = type === "recovery" ? "/auth/reset" : "/auth/callback";
+    redirect(suffix ? `${target}?${suffix}` : target);
+  }
+
+  if (authError || authErrorCode || authErrorDescription) {
+    const suffix = appendSearchParams(params);
+    const target = type === "recovery" ? "/auth/reset" : "/auth/callback";
+    const fallbackTarget = target === "/auth/reset" ? "/auth/reset" : "/auth/login";
+    redirect(suffix ? `${fallbackTarget}?${suffix}` : fallbackTarget);
+  }
+
+  try {
+    const sb = await supabaseServerRSC();
+    const { data } = await sb.auth.getUser();
+    if (data?.user?.id) redirect("/traener");
+  } catch {
+    // ignore
+  }
+  redirect("/auth/login");
 }

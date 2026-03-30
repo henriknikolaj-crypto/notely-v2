@@ -42,6 +42,12 @@ export default function ClientNotesOverview(props: {
   scope?: Scope;
 }) {
   const { notes, scope = "all" } = props;
+  const currentListHref =
+    scope === "summary"
+      ? "/notes?scope=resume"
+      : scope === "focus"
+      ? "/notes?scope=focus"
+      : "/notes";
 
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<"newest" | "oldest">("newest");
@@ -170,20 +176,14 @@ export default function ClientNotesOverview(props: {
                 {n.snippet}
               </p>
 
-              <footer className="mt-3 flex items-center justify-between text-xs">
-                <Link
-                  className="font-medium text-neutral-900 underline-offset-2 hover:underline"
-                  href={`/notes/${n.id}`}
-                >
-                  Åbn note
-                </Link>
-                <span className="text-neutral-400">
-                  ID:{" "}
-                  <span className="font-mono text-[10px]">
-                    {n.id.slice(0, 8)}…
-                  </span>
-                </span>
-              </footer>
+	              <footer className="mt-3 flex items-center justify-between text-xs">
+	                <Link
+	                  className="font-medium text-neutral-900 underline-offset-2 hover:underline"
+	                  href={`/notes/${n.id}?back=${encodeURIComponent(currentListHref)}`}
+	                >
+	                  Åbn note
+	                </Link>
+	              </footer>
             </article>
           ))}
         </div>

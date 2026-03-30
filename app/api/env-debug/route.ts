@@ -1,29 +1,16 @@
-﻿// app/api/env-debug/route.ts
+// app/api/env-debug/route.ts
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { requireDevSecret } from "@/lib/dev/guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function isDevAllowed(req: NextRequest) {
-  if (process.env.NODE_ENV === "production") return false;
-
-  const expected = String(process.env.DEV_BYPASS_SECRET ?? process.env.DEV_SECRET ?? "").trim();
-  if (!expected) return false;
-
-  const presented = String(
-    req.headers.get("x-dev-secret") ||
-      req.headers.get("x-shared-secret") ||
-      "",
-  ).trim();
-
-  return presented === expected;
-}
-
 export async function GET(req: NextRequest) {
-  if (!isDevAllowed(req)) {
-    return NextResponse.json({ ok: false, error: "Not found" }, { status: 404 });
+  const guard = requireDevSecret(req);
+  if (!guard.ok) {
+    return NextResponse.json({ ok: false, error: guard.message }, { status: guard.status });
   }
 
   return NextResponse.json({

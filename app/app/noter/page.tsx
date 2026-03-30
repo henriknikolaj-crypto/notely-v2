@@ -10,11 +10,10 @@ export default async function Home() {
   const { data } = await sb.auth.getUser();
 
   if (data?.user) {
-    redirect("/overblik");
+    redirect("/traener");
   }
 
   redirect("/auth/login");
 }
-
 
 

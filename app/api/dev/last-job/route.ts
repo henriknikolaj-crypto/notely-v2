@@ -1,32 +1,20 @@
-﻿// app/api/dev/last-job/route.ts
+// app/api/dev/last-job/route.ts
 import "server-only";
 import { NextRequest, NextResponse } from "next/server";
+import { requireDevSecret } from "@/lib/dev/guard";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export const dynamic = "force-dynamic";
 
-function isAuthorizedDev(req: NextRequest): boolean {
-  const shared = process.env.IMPORT_SHARED_SECRET;
-  const header = req.headers.get("x-shared-secret");
-
-  // 1) Hvis header matcher hemmeligheden → altid OK
-  if (shared && header && header === shared) return true;
-
-  // 2) I udvikling (next dev) tillader vi adgang uden header,
-  //    så Upload-siden kan kalde endpointet direkte.
-  if (process.env.NODE_ENV !== "production") return true;
-
-  return false;
-}
-
 export async function GET(req: NextRequest) {
-  if (!isAuthorizedDev(req)) {
+  const guard = requireDevSecret(req);
+  if (!guard.ok) {
     return NextResponse.json(
       {
         ok: false,
-        error: "Unauthorized: forkert eller manglende x-shared-secret.",
+        error: guard.message,
       },
-      { status: 401 }
+      { status: guard.status }
     );
   }
 

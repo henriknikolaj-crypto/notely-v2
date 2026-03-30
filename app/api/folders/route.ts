@@ -1,11 +1,17 @@
 ﻿import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServerRoute } from "@/lib/supabase/server-route";
+import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+function jsonUtf8(body: unknown, init?: Parameters<typeof NextResponse.json>[1]) {
+  const res = NextResponse.json(body, init);
+  res.headers.set("Content-Type", "application/json; charset=utf-8");
+  return res;
+}
 
 function normStr(v: any): string | null {
   if (v == null) return null;
@@ -21,10 +27,10 @@ function normDate(v: any): string | null {
 }
 
 export async function GET(req: NextRequest) {
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const owner = await getOwnerCtx(req, sb);
   if (!owner) {
-    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
+    return jsonUtf8({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
   }
 
   const { data, error } = await sb
@@ -36,22 +42,22 @@ export async function GET(req: NextRequest) {
 
   if (error) {
     console.error("[folders GET] db error", error);
-    return NextResponse.json({ ok: false, code: "DB_ERROR", error: "Database-fejl." }, { status: 500 });
+    return jsonUtf8({ ok: false, code: "DB_ERROR", error: "Database-fejl." }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, folders: data ?? [] }, { status: 200 });
+  return jsonUtf8({ ok: true, folders: data ?? [] }, { status: 200 });
 }
 
 export async function POST(req: NextRequest) {
-  const sb = await supabaseServerRoute();
+  const sb = supabaseServerRouteReadOnly(req);
   const owner = await getOwnerCtx(req, sb);
   if (!owner) {
-    return NextResponse.json({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
+    return jsonUtf8({ ok: false, code: "UNAUTHORIZED", error: "Login kræves." }, { status: 401 });
   }
 
   const body = (await req.json().catch(() => null)) as any;
   if (!body) {
-    return NextResponse.json({ ok: false, code: "INVALID_JSON", error: "Ugyldigt JSON-body." }, { status: 400 });
+    return jsonUtf8({ ok: false, code: "INVALID_JSON", error: "Ugyldigt JSON-body." }, { status: 400 });
   }
 
   const name = normStr(body.name);
@@ -60,7 +66,7 @@ export async function POST(req: NextRequest) {
   const end_date = body.end_date === null ? null : normDate(body.end_date);
 
   if (!name) {
-    return NextResponse.json({ ok: false, code: "INVALID_NAME", error: "Navn må ikke være tomt." }, { status: 400 });
+    return jsonUtf8({ ok: false, code: "INVALID_NAME", error: "Navn må ikke være tomt." }, { status: 400 });
   }
 
   // Max 1 nesting-level: hvis parent_id er sat, må parent ikke selv have parent_id
@@ -73,16 +79,16 @@ export async function POST(req: NextRequest) {
 
     if (pErr) {
       console.error("[folders POST] parent lookup error", pErr);
-      return NextResponse.json({ ok: false, code: "DB_ERROR", error: "Database-fejl." }, { status: 500 });
+      return jsonUtf8({ ok: false, code: "DB_ERROR", error: "Database-fejl." }, { status: 500 });
     }
     if (!parent || parent.archived_at) {
-      return NextResponse.json({ ok: false, code: "INVALID_PARENT", error: "Ugyldig parent_id." }, { status: 400 });
+      return jsonUtf8({ ok: false, code: "INVALID_PARENT", error: "Ugyldig parent_id." }, { status: 400 });
     }
     if (parent.owner_id !== owner.ownerId) {
-      return NextResponse.json({ ok: false, code: "FORBIDDEN", error: "Ingen adgang." }, { status: 403 });
+      return jsonUtf8({ ok: false, code: "FORBIDDEN", error: "Ingen adgang." }, { status: 403 });
     }
     if (parent.parent_id) {
-      return NextResponse.json(
+      return jsonUtf8(
         { ok: false, code: "NESTING_LIMIT", error: "Kun ét niveau af undermapper er tilladt." },
         { status: 409 },
       );
@@ -103,8 +109,8 @@ export async function POST(req: NextRequest) {
 
   if (error) {
     console.error("[folders POST] db error", error);
-    return NextResponse.json({ ok: false, code: "DB_INSERT_FAILED", error: "Kunne ikke oprette mappen." }, { status: 500 });
+    return jsonUtf8({ ok: false, code: "DB_INSERT_FAILED", error: "Kunne ikke oprette mappen." }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, folder: data }, { status: 200 });
+  return jsonUtf8({ ok: true, folder: data }, { status: 200 });
 }

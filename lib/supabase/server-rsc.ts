@@ -20,15 +20,9 @@ export async function supabaseServerRSC() {
       getAll() {
         return cookieStore.getAll();
       },
-      setAll(cookiesToSet) {
-        // RSC kan være read-only ift cookies, så vi ignorerer evt. write-fejl
-        try {
-          for (const { name, value, options } of cookiesToSet) {
-            cookieStore.set(name, value, options);
-          }
-        } catch {
-          // ignore
-        }
+      setAll() {
+        // cookies().set er ikke tilladt i RSC; vi setter ikke cookies her.
+        // NO-OP i Server Components for at undgå Next.js cookie-write fejl.
       },
     },
   });

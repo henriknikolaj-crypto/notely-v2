@@ -3,6 +3,13 @@ import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
+import {
+  assertCanGenerateNoteType,
+  FREEMIUM_FOCUS_MONTHLY_LIMIT_MESSAGE,
+  FREEMIUM_SUMMARY_MONTHLY_LIMIT_MESSAGE,
+} from "@/lib/notes/entitlements";
+import { ensureProfile } from "@/lib/server/ensureProfile";
+import { supabaseAdminOrNull } from "@/lib/quota/rpc";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -98,6 +105,24 @@ export async function POST(req: NextRequest) {
     if (!folder?.id) {
       return NextResponse.json({ ok: false, error: "FOLDER_NOT_FOUND" }, { status: 400 });
     }
+  }
+
+  try {
+    const profileAdmin = supabaseAdminOrNull();
+    if (profileAdmin) {
+      await ensureProfile(profileAdmin, ownerId);
+    }
+    await assertCanGenerateNoteType(sb, ownerId, note_type);
+  } catch (error: any) {
+    const code = String(error?.code ?? "");
+    if (code === "NOTES_SUMMARY_MONTHLY_LIMIT_REACHED") {
+      return NextResponse.json({ ok: false, code, error: FREEMIUM_SUMMARY_MONTHLY_LIMIT_MESSAGE }, { status: 403 });
+    }
+    if (code === "NOTES_FOCUS_MONTHLY_LIMIT_REACHED") {
+      return NextResponse.json({ ok: false, code, error: FREEMIUM_FOCUS_MONTHLY_LIMIT_MESSAGE }, { status: 403 });
+    }
+    console.error("[generate-notes] prepare error:", error);
+    return NextResponse.json({ ok: false, error: "NOTE_PREPARE_FAILED" }, { status: 500 });
   }
 
   // Gem i notes-tabellen

@@ -8,13 +8,17 @@ export default function TrainingSidebarMainNav() {
   const raw = usePathname() || "/";
   const p = raw.replace(/\/+$/, ""); // fjern trailing slash
 
+  const onOverview = p === "/traener/overblik" || p.startsWith("/traener/overblik/") || p.startsWith("/traener/mappe/");
   const onTraining =
+    p === "/traener" ||
     p.startsWith("/traener/noter") ||
     p.startsWith("/traener/mc") ||
     p.startsWith("/traener/flashcards") ||
-    p.startsWith("/traener/simulator");
+    p.startsWith("/traener/simulator") ||
+    p.startsWith("/traener/mundtlig");
+
   const onUpload = p.startsWith("/traener/upload");
-  const onAccount = p === "/konto" || p.startsWith("/konto/");
+  const onAccount = p === "/traener/konto" || p.startsWith("/traener/konto/");
 
   const base = "block rounded-lg px-3 py-2";
   const active = "bg-black text-white";
@@ -23,11 +27,19 @@ export default function TrainingSidebarMainNav() {
   return (
     <nav className="space-y-1 px-2 text-xs">
       <Link
+        href="/traener/overblik"
+        className={`${base} ${onOverview ? active : inactive}`}
+        aria-current={onOverview ? "page" : undefined}
+      >
+        Overblik
+      </Link>
+
+      <Link
         href="/traener/noter"
         className={`${base} ${onTraining ? active : inactive}`}
         aria-current={onTraining ? "page" : undefined}
       >
-        Noter
+        Noter / træning
       </Link>
 
       <Link
@@ -39,7 +51,7 @@ export default function TrainingSidebarMainNav() {
       </Link>
 
       <Link
-        href="/konto"
+        href="/traener/konto"
         className={`${base} ${onAccount ? active : inactive}`}
         aria-current={onAccount ? "page" : undefined}
       >

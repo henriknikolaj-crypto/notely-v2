@@ -1,28 +1,18 @@
-﻿// app/overblik/page.tsx
-import "server-only";
-import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import AuthStateNotice from "@/components/ui/AuthStateNotice";
+import OverblikClient from "../traener/overblik/OverblikClient";
 
 export const dynamic = "force-dynamic";
 
-async function getOwnerId(sb: any): Promise<string | null> {
-  try {
-    if (sb?.auth?.getUser) {
-      const { data } = await sb.auth.getUser();
-      if (data?.user?.id) return data.user.id as string;
-    }
-  } catch {
-    // ignore – falder tilbage til DEV_USER_ID
-  }
-  return process.env.DEV_USER_ID ?? null;
-}
-
-export default async function OverblikPage() {
+export default async function OverviewPage() {
   const sb = await supabaseServerRSC();
-  const ownerId = await getOwnerId(sb);
+  const { data } = await sb.auth.getUser().catch(() => ({ data: { user: null } }));
 
-  if (!ownerId) {
-    redirect("/auth/login");
+  if (!data?.user?.id) {
+    return (
+      <AuthStateNotice message="Overblik kræver en rigtig login-session i denne browser. I LAN-dev kan serversiden godt kende DEV_USER_ID, men klientdata til overblik henter ikke uden login-cookie." />
+    );
   }
-  redirect("/traener");
+
+  return <OverblikClient />;
 }

@@ -2,8 +2,8 @@
 import "server-only";
 
 import Link from "next/link";
-import { redirect } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
 import TrainingSidebarMainNav from "../traener/ui/TrainingSidebarMainNav";
 import TrainingSidebarFolders from "../traener/ui/TrainingSidebarFolders";
 import TrainingSidebarStats from "../traener/ui/TrainingSidebarStats";
@@ -34,21 +34,39 @@ async function getOwnerId(sb: any): Promise<string | null> {
 
 export const dynamic = "force-dynamic";
 
-export default async function OverblikLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default async function OverblikLayout({ children }: { children: React.ReactNode }) {
   const sb = await supabaseServerRSC();
+  let currentUserEmail: string | null = null;
+  try {
+    const { data } = await sb.auth.getUser();
+    currentUserEmail = data?.user?.email ?? null;
+  } catch {
+    currentUserEmail = null;
+  }
   const ownerId = await getOwnerId(sb);
 
   if (!ownerId) {
-    redirect("/auth/login");
+    return (
+      <main className="min-h-screen bg-[#fffef9]">
+        <header className="border-b border-zinc-200 bg-white">
+          <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
+            <Link href="/" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
+              Notely.
+            </Link>
+            <Link href="/auth/login" className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
+              Log ind
+            </Link>
+          </div>
+        </header>
+        <div className="mx-auto max-w-6xl p-6">
+          <h1 className="mb-2 text-2xl font-semibold">Overblik</h1>
+          <p className="text-sm text-red-600">Mangler bruger-id (hverken login eller DEV_USER_ID sat).</p>
+        </div>
+      </main>
+    );
   }
 
-  redirect("/traener");
-
-  // ---- Mapper til venstre træ ----
+  // ---- Mapper ----
   const { data: foldersData, error: foldersError } = await sb
     .from("folders")
     .select("id,name,parent_id,start_date,end_date,archived_at")
@@ -59,10 +77,7 @@ export default async function OverblikLayout({
   if (foldersError) console.error("OVERBLIK layout folders error:", foldersError);
 
   const folders = (foldersData ?? []) as FolderRow[];
-  const foldersForSidebar = folders.map((f) => ({
-    ...f,
-    parent_id: f.parent_id ?? null,
-  }));
+  const foldersForSidebar = folders.map((f) => ({ ...f, parent_id: f.parent_id ?? null }));
 
   // ---- Seneste noter ----
   const { data: latestNotesData } = await sb
@@ -83,65 +98,61 @@ export default async function OverblikLayout({
     .limit(50);
 
   const latestEvals =
-    (latestEvalsData as {
-      id: string;
-      score: number | null;
-      created_at: string | null;
-    }[]) ?? [];
+    (latestEvalsData as { id: string; score: number | null; created_at: string | null }[]) ?? [];
 
-  // ---- Counts (NB: count kan være null) ----
-  const { count: notesCountRaw } = await sb
-    .from("notes")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", ownerId);
-
+  // ---- Counts ----
   const { count: evalCountRaw } = await sb
     .from("exam_sessions")
     .select("id", { count: "exact", head: true })
     .eq("owner_id", ownerId);
 
-  const notesCount = notesCountRaw ?? 0;
   const evalCount = evalCountRaw ?? 0;
 
   return (
     <main className="min-h-screen bg-[#fffef9]">
       <header className="border-b border-zinc-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-6">
-          <Link href="/overblik" className="logo-script text-4xl leading-none">
+          <Link href="/traener/overblik" className="logo-script [font-family:var(--font-logo)] font-normal text-4xl leading-none">
             Notely.
           </Link>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-zinc-700">henriknikolaj@gmail.com</span>
-            <Link
-              href="/auth/logout"
-              className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50"
-            >
+            <span className="text-xs text-zinc-700">{currentUserEmail ?? ""}</span>
+            <Link href="/auth/logout" className="rounded-lg border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-50">
               Log ud
             </Link>
           </div>
         </div>
       </header>
 
-      <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6 md:px-6">
-        <aside className="w-64 shrink-0">
+      {/* ✅ 3 kolonner på desktop: venstre nav / content / højre “Dine fag” */}
+      <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-4 py-6 md:px-6 lg:grid-cols-[256px_minmax(0,1fr)_256px]">
+        {/* Venstre: kun “Mit Notely” */}
+        <aside className="hidden shrink-0 lg:block">
           <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
             <div className="px-2 pb-1 pt-1 font-semibold text-zinc-800">Mit Notely</div>
-
             <TrainingSidebarMainNav />
+          </div>
+        </aside>
 
-            <div className="px-2 pt-2 font-semibold text-zinc-800">Dine fag</div>
+        {/* Midt: sideindhold */}
+        <section className="min-w-0 bg-transparent">
+          <MobileBackToMenu href="/m" label="← Tilbage til hovedmenu" />
+          {children}
+        </section>
+
+        {/* Højre: “Dine fag” + stats */}
+        <aside className="hidden shrink-0 lg:block">
+          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
+            <div className="px-4 pb-1 pt-2 font-semibold text-zinc-800">Dine fag</div>
             <TrainingSidebarFolders folders={foldersForSidebar} />
 
             <TrainingSidebarStats
               latestNotes={latestNotes}
               latestEvals={latestEvals}
-              notesCount={notesCount}
               evalCount={evalCount}
             />
           </div>
         </aside>
-
-        <section className="min-w-0 flex-1 bg-transparent">{children}</section>
       </div>
     </main>
   );

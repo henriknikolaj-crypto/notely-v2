@@ -1,0 +1,17 @@
+﻿{
+    "avoidTopics":  [
+
+                    ],
+    "count":  3,
+    "avoidQuestions":  [
+
+                       ],
+    "scopeFolderIds":  [
+
+                       ],
+    "avoidChunkIds":  [
+
+                      ],
+    "difficulty":  "medium",
+    "maxContextChunks":  10
+}
