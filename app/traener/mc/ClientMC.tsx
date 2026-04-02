@@ -82,6 +82,10 @@ type Props = {
 const DEFAULT_SESSION_SIZE = 10;
 const QUOTA_MSG = "Du har nået din grænse for Multiple Choice denne måned.";
 
+type FetchSingleResult =
+  | { status: "OK"; question: MCQuestion }
+  | { status: "STOP"; question: null };
+
 function clampInt(n: number, min: number, max: number) {
   const x = Number.isFinite(n) ? Math.round(n) : min;
   return Math.min(max, Math.max(min, x));
@@ -114,6 +118,20 @@ function toApiQuestion(v: GenerateMcItemOk): MCQuestion {
 
 type BatchResult = "OK" | "NOT_FOUND" | "STOP" | "NEEDS_SINGLE";
 
+function normalizeQuestionKey(value: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?()"'’”“\[\]{}]/g, "")
+    .trim();
+}
+
+function logMcClientDebug(event: string, details: Record<string, unknown>) {
+  if (process.env.NODE_ENV !== "production") {
+    console.debug(`[mc-ui] ${event}`, details);
+  }
+}
+
 export default function ClientMC({ scopeFolderIds }: Props) {
   const effectiveScopeFolderIds = useMemo(
     () =>
@@ -123,7 +141,8 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     [scopeFolderIds],
   );
   const scopeKey = useMemo(() => JSON.stringify(effectiveScopeFolderIds), [effectiveScopeFolderIds]);
-  const batchRequestSeqRef = useRef(0);
+  const prefetchRequestSeqRef = useRef(0);
+  const roundTokenRef = useRef(0);
   const activeRequestKindRef = useRef<"batch" | "single" | null>(null);
 
   const [started, setStarted] = useState(false);
@@ -147,9 +166,8 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
   // batch queue
   const [queue, setQueue] = useState<MCQuestion[]>([]);
-  const [queuePos, setQueuePos] = useState(0);
-
-  const abortRef = useRef<AbortController | null>(null);
+  const foregroundAbortRef = useRef<AbortController | null>(null);
+  const prefetchAbortRef = useRef<AbortController | null>(null);
 
   // anti-repeat i en runde
   const recentQuestionsRef = useRef<string[]>([]);
@@ -235,39 +253,62 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     setChecked(false);
     setIsFinished(false);
     setQueue([]);
-    setQueuePos(0);
     setQuestionNumber(1);
     if (message) setLoadError(message);
   }, []);
 
+  const appendQuestionsToQueue = useCallback((incoming: MCQuestion[]) => {
+    if (incoming.length === 0) return;
+
+    setQueue((prev) => {
+      const seen = new Set<string>([
+        ...recentQuestionsRef.current.map(normalizeQuestionKey),
+        ...prev.map((item) => normalizeQuestionKey(item.question)),
+      ]);
+
+      const next = [...prev];
+      for (const item of incoming) {
+        const key = normalizeQuestionKey(item.question);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        next.push(item);
+      }
+      logMcClientDebug("queue:append", {
+        roundToken: roundTokenRef.current,
+        scopeKey,
+        addedCount: next.length - prev.length,
+        queueLengthBefore: prev.length,
+        queueLengthAfter: next.length,
+      });
+      return next;
+    });
+  }, [scopeKey]);
+
   const fetchBatch = useCallback(
-    async (count: number): Promise<BatchResult> => {
+    async (
+      count: number,
+      opts?: { roundToken?: number; avoidQuestions?: string[]; avoidChunkIds?: string[] },
+    ): Promise<BatchResult> => {
       if (effectiveScopeFolderIds.length === 0) {
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] fetchBatch:rejected-empty-scope", { count });
         }
-        resetRoundToIdle("Vælg eller skift mappe her, før du starter Multiple Choice.");
-        setLoadingNext(false);
         return "STOP";
       }
 
-      const batchRequestSeq = ++batchRequestSeqRef.current;
-      const isStale = () => batchRequestSeq !== batchRequestSeqRef.current;
-      if (process.env.NODE_ENV !== "production") {
-        console.debug("[mc-ui] fetchBatch:start", {
-          batchRequestSeq,
-          count,
-          scopeFolderIds: effectiveScopeFolderIds,
-        });
-      }
+      const batchRequestSeq = ++prefetchRequestSeqRef.current;
+      const roundToken = opts?.roundToken ?? roundTokenRef.current;
+      const isStale = () => batchRequestSeq !== prefetchRequestSeqRef.current || roundToken !== roundTokenRef.current;
+      logMcClientDebug("fetchBatch:start", {
+        batchRequestSeq,
+        count,
+        roundToken,
+        scopeKey,
+        scopeFolderIds: effectiveScopeFolderIds,
+      });
 
-      setLoadingNext(true);
-      activeRequestKindRef.current = "batch";
-      setLoadError(null);
-      setQuotaBlocked(null);
-
-      if (abortRef.current) {
-        abortRef.current.abort();
+      if (prefetchAbortRef.current) {
+        prefetchAbortRef.current.abort();
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] previous-request-aborted-by-new-request", {
             newKind: "batch",
@@ -276,11 +317,15 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         }
       }
       const ac = new AbortController();
-      abortRef.current = ac;
+      prefetchAbortRef.current = ac;
 
       try {
-        const avoidQuestions = recentQuestionsRef.current.slice(-12);
-        const avoidChunkIds = recentChunkIdsRef.current.slice(-80);
+        const avoidQuestions = Array.from(
+          new Set([...(recentQuestionsRef.current.slice(-12) ?? []), ...((opts?.avoidQuestions ?? []).slice(-12) ?? [])]),
+        ).slice(-12);
+        const avoidChunkIds = Array.from(
+          new Set([...(recentChunkIdsRef.current.slice(-80) ?? []), ...((opts?.avoidChunkIds ?? []).slice(-80) ?? [])]),
+        ).slice(-80);
 
         const payload = {
           scopeFolderIds: effectiveScopeFolderIds,
@@ -314,14 +359,10 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         batchSupportedRef.current = true;
 
         if (res.status === 429) {
-          const j = await readJsonSafe<any>(res);
-          applyQuotaBlocked(String(j?.error ?? ""));
           return "STOP";
         }
 
         if (res.status === 401) {
-          const j = await readJsonSafe<any>(res);
-          setLoadError(String(j?.error ?? "Unauthorized. Log ind igen."));
           return "STOP";
         }
 
@@ -334,8 +375,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               error: String(j?.error ?? `Kunne ikke generere MC-batch (${res.status}).`),
             });
           }
-          if (isStale()) return "STOP";
-          setLoadError(String(j?.error ?? `Kunne ikke generere MC-batch (${res.status}).`));
           return "NEEDS_SINGLE";
         }
 
@@ -349,8 +388,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           });
         }
         if (!data || (data as any).ok === false) {
-          if (isStale()) return "STOP";
-          setLoadError(String((data as any)?.error ?? "Kunne ikke generere MC-batch."));
           return "NEEDS_SINGLE";
         }
 
@@ -369,8 +406,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               rawItemsLength: items.length,
             });
           }
-          if (isStale()) return "STOP";
-          setLoadError("Batch returnerede ingen gyldige spørgsmål.");
           return "NEEDS_SINGLE";
         }
 
@@ -382,15 +417,13 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               : apiQuestionsAll.length;
 
         const apiQuestions = apiQuestionsAll.slice(0, Math.min(effective, apiQuestionsAll.length));
-        const first = apiQuestions[0] ?? null;
-
         if (isStale()) {
-          if (process.env.NODE_ENV !== "production") {
-            console.debug("[mc-ui] fetchBatch:stale-success-ignored", {
-              batchRequestSeq,
-              questionCount: apiQuestions.length,
-            });
-          }
+          logMcClientDebug("fetchBatch:stale-ignored", {
+            batchRequestSeq,
+            roundToken,
+            scopeKey,
+            questionCount: apiQuestions.length,
+          });
           return "STOP";
         }
 
@@ -398,25 +431,11 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           console.debug("[mc-ui] fetchBatch:set-state", {
             batchRequestSeq,
             questionCount: apiQuestions.length,
-            firstQuestionId: first?.id ?? null,
+            firstQuestionId: apiQuestions[0]?.id ?? null,
           });
         }
 
-        setLoadError(null);
-        setQuotaBlocked(null);
-        setIsFinished(false);
-        setSessionTotal(apiQuestions.length);
-        setQueue(apiQuestions);
-        setQueuePos(0);
-        setCurrentQuestion(first);
-        setQuestionNumber(1);
-        setSelectedId(null);
-        setChecked(false);
-        setSaveError(null);
-
-        dispatchQuotaChanged();
-        registerAntiRepeat(first);
-
+        appendQuestionsToQueue(apiQuestions);
         return "OK";
       } catch (err: any) {
         if (process.env.NODE_ENV !== "production") {
@@ -430,39 +449,35 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         if (err?.name === "AbortError") return "STOP";
         if (isStale()) return "STOP";
         console.error("generate-mc-batch error:", err);
-        setLoadError("Kunne ikke generere MC-batch. Prøver enkeltspørgsmål …");
         return "NEEDS_SINGLE";
       } finally {
-        if (!isStale()) {
-          activeRequestKindRef.current = null;
-          setLoadingNext(false);
-          setSelectedId(null);
-          setChecked(false);
-          setSaveError(null);
-        }
+        if (prefetchAbortRef.current === ac) prefetchAbortRef.current = null;
       }
     },
-    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, readJsonSafe, registerAntiRepeat, resetRoundToIdle],
+    [appendQuestionsToQueue, effectiveScopeFolderIds, readJsonSafe],
   );
 
   const fetchSingle = useCallback(
-    async (mode: "initial" | "next"): Promise<"OK" | "STOP"> => {
+    async (mode: "initial" | "next", opts?: { roundToken?: number }): Promise<FetchSingleResult> => {
       if (effectiveScopeFolderIds.length === 0) {
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] fetchSingle:rejected-empty-scope", { mode });
         }
         resetRoundToIdle("Vælg eller skift mappe her, før du starter Multiple Choice.");
         setLoadingNext(false);
-        return "STOP";
+        return { status: "STOP", question: null };
       }
+
+      const roundToken = opts?.roundToken ?? roundTokenRef.current;
+      const isStale = () => roundToken !== roundTokenRef.current;
 
       setLoadingNext(true);
       activeRequestKindRef.current = "single";
       setLoadError(null);
       setQuotaBlocked(null);
 
-      if (abortRef.current) {
-        abortRef.current.abort();
+      if (foregroundAbortRef.current) {
+        foregroundAbortRef.current.abort();
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] previous-request-aborted-by-new-request", {
             newKind: "single",
@@ -471,7 +486,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         }
       }
       const ac = new AbortController();
-      abortRef.current = ac;
+      foregroundAbortRef.current = ac;
 
       try {
         const avoidQuestions = recentQuestionsRef.current.slice(-12);
@@ -495,58 +510,90 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
         if (res.status === 429) {
           const j = await readJsonSafe<any>(res);
+          if (isStale()) return { status: "STOP", question: null };
           applyQuotaBlocked(String(j?.error ?? ""));
-          return "STOP";
+          return { status: "STOP", question: null };
         }
 
         if (res.status === 401) {
           const j = await readJsonSafe<any>(res);
+          if (isStale()) return { status: "STOP", question: null };
           setLoadError(String(j?.error ?? "Unauthorized. Log ind igen."));
-          return "STOP";
+          return { status: "STOP", question: null };
         }
 
         if (!res.ok) {
           const j = await readJsonSafe<any>(res);
           const msg =
             String(j?.error ?? j?.message ?? "").trim() || `Kunne ikke generere spørgsmål fra dit materiale (${res.status}).`;
+          if (isStale()) return { status: "STOP", question: null };
           resetRoundToIdle(msg);
-          return "STOP";
+          return { status: "STOP", question: null };
         }
 
         const data = (await readJsonSafe<GenerateMcSingleResponse>(res)) as GenerateMcSingleResponse | null;
         if (!data || (data as any).ok === false) {
           const msg = String((data as any)?.error ?? "Kunne ikke generere MC-spørgsmål.");
+          if (isStale()) return { status: "STOP", question: null };
           resetRoundToIdle(msg);
-          return "STOP";
+          return { status: "STOP", question: null };
         }
 
         const ok = data as GenerateMcSingleResponseOk;
         const apiQuestion = toApiQuestion(ok);
+        if (isStale()) {
+          logMcClientDebug("fetchSingle:stale-ignored", {
+            mode,
+            roundToken,
+            scopeKey,
+            reason: "success-after-round-change",
+          });
+          return { status: "STOP", question: null };
+        }
 
         setCurrentQuestion(apiQuestion);
+        logMcClientDebug("currentQuestion:set", {
+          mode,
+          roundToken,
+          scopeKey,
+          questionId: apiQuestion.id,
+          usedFileId: apiQuestion.usedFileId ?? null,
+        });
         dispatchQuotaChanged();
         registerAntiRepeat(apiQuestion);
 
         if (mode === "next") setQuestionNumber((prev) => prev + 1);
         else setQuestionNumber(1);
 
-        return "OK";
+        return { status: "OK", question: apiQuestion };
       } catch (err: any) {
         if (err?.name === "AbortError") {
           if (process.env.NODE_ENV !== "production") {
             console.debug("[mc-ui] fetchSingle:aborted", { scopeFolderIds: effectiveScopeFolderIds });
           }
-          return "STOP";
+          return { status: "STOP", question: null };
+        }
+        if (isStale()) {
+          logMcClientDebug("fetchSingle:stale-ignored", {
+            mode,
+            roundToken,
+            scopeKey,
+            reason: "error-after-round-change",
+          });
+          return { status: "STOP", question: null };
         }
         console.error("generate-mc-question error:", err);
         resetRoundToIdle("Kunne ikke hente nyt spørgsmål fra dit valgte materiale.");
-        return "STOP";
+        return { status: "STOP", question: null };
       } finally {
-        activeRequestKindRef.current = null;
-        setLoadingNext(false);
-        setSelectedId(null);
-        setChecked(false);
-        setSaveError(null);
+        if (!isStale()) {
+          activeRequestKindRef.current = null;
+          setLoadingNext(false);
+          setSelectedId(null);
+          setChecked(false);
+          setSaveError(null);
+        }
+        if (foregroundAbortRef.current === ac) foregroundAbortRef.current = null;
       }
     },
     [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, readJsonSafe, registerAntiRepeat, resetRoundToIdle],
@@ -557,12 +604,28 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       setStarted(false);
       setCurrentQuestion(null);
       setQueue([]);
-      setQueuePos(0);
       setIsFinished(false);
       setLoadingNext(false);
       setLoadError("Vælg eller skift mappe her, før du starter Multiple Choice.");
       return;
     }
+
+    if (foregroundAbortRef.current) {
+      foregroundAbortRef.current.abort();
+      foregroundAbortRef.current = null;
+    }
+    if (prefetchAbortRef.current) {
+      prefetchAbortRef.current.abort();
+      prefetchAbortRef.current = null;
+    }
+    prefetchRequestSeqRef.current += 1;
+    activeRequestKindRef.current = null;
+    const roundToken = ++roundTokenRef.current;
+    logMcClientDebug("round:start", {
+      roundToken,
+      scopeKey,
+      scopeFolderIds: effectiveScopeFolderIds,
+    });
 
     setStarted(true);
 
@@ -581,9 +644,9 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     recentChunkIdsRef.current = [];
 
     setQueue([]);
-    setQueuePos(0);
 
     const sz = await computeSessionSize();
+    if (roundToken !== roundTokenRef.current) return;
 
     if (sz <= 0) {
       setSessionTotal(0);
@@ -597,23 +660,33 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     const batchSupported = batchSupportedRef.current;
 
     if (batchSupported === false) {
-      await fetchSingle("initial");
+      await fetchSingle("initial", { roundToken });
       return;
     }
 
-    const r = await fetchBatch(sz);
-
-    if (r === "NOT_FOUND" || r === "NEEDS_SINGLE") {
-      await fetchSingle("initial");
+    const firstResult = await fetchSingle("initial", { roundToken });
+    if (firstResult.status !== "OK" || !firstResult.question) {
       return;
     }
-    // STOP eller OK: intet mere at gøre
+
+    if (sz <= 1) return;
+
+    void fetchBatch(sz - 1, {
+      roundToken,
+      avoidQuestions: [firstResult.question.question],
+      avoidChunkIds: Array.isArray(firstResult.question.meta?.usedChunkIds)
+        ? firstResult.question.meta.usedChunkIds.map((id) => String(id))
+        : [],
+    });
   }, [applyQuotaBlocked, computeSessionSize, effectiveScopeFolderIds, fetchBatch, fetchSingle]);
 
   // scope-skift: stop alt og tilbage til “Start”
   useEffect(() => {
-    if (abortRef.current) {
-      abortRef.current.abort();
+    const scopeChangeRoundToken = roundTokenRef.current + 1;
+
+    if (foregroundAbortRef.current) {
+      foregroundAbortRef.current.abort();
+      foregroundAbortRef.current = null;
       if (process.env.NODE_ENV !== "production") {
         console.debug("[mc-ui] request-aborted-on-scope-change", {
           activeRequestKind: activeRequestKindRef.current,
@@ -621,7 +694,18 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         });
       }
     }
-    batchRequestSeqRef.current += 1;
+    if (prefetchAbortRef.current) {
+      prefetchAbortRef.current.abort();
+      prefetchAbortRef.current = null;
+      if (process.env.NODE_ENV !== "production") {
+        console.debug("[mc-ui] request-aborted-on-scope-change", {
+          activeRequestKind: activeRequestKindRef.current,
+          scopeKey,
+        });
+      }
+    }
+    prefetchRequestSeqRef.current += 1;
+    roundTokenRef.current = scopeChangeRoundToken;
     activeRequestKindRef.current = null;
 
     setStarted(false);
@@ -640,7 +724,6 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     setLoadError(null);
 
     setQueue([]);
-    setQueuePos(0);
     recentQuestionsRef.current = [];
     recentChunkIdsRef.current = [];
 
@@ -651,6 +734,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         return;
       }
       const sz = await computeSessionSize();
+      if (scopeChangeRoundToken !== roundTokenRef.current) return;
       setSessionTotal(sz);
       if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
       else setQuotaBlocked(null);
@@ -659,15 +743,21 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
   useEffect(() => {
     return () => {
-      if (abortRef.current) {
-        abortRef.current.abort();
+      if (foregroundAbortRef.current) {
+        foregroundAbortRef.current.abort();
+        foregroundAbortRef.current = null;
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] request-aborted-on-unmount", {
             activeRequestKind: activeRequestKindRef.current,
           });
         }
       }
-      batchRequestSeqRef.current += 1;
+      if (prefetchAbortRef.current) {
+        prefetchAbortRef.current.abort();
+        prefetchAbortRef.current = null;
+      }
+      prefetchRequestSeqRef.current += 1;
+      roundTokenRef.current += 1;
       activeRequestKindRef.current = null;
     };
   }, []);
@@ -739,12 +829,18 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
     // batch-queue
     if (queue.length > 0) {
-      const nextPos = queuePos + 1;
-      const nextQ = queue[nextPos];
+      const nextQ = queue[0];
 
       if (nextQ) {
-        setQueuePos(nextPos);
+        setQueue((prev) => prev.slice(1));
         setCurrentQuestion(nextQ);
+        logMcClientDebug("currentQuestion:set", {
+          mode: "queue-next",
+          roundToken: roundTokenRef.current,
+          scopeKey,
+          questionId: nextQ.id,
+          usedFileId: nextQ.usedFileId ?? null,
+        });
         setQuestionNumber((prev) => prev + 1);
 
         setSelectedId(null);
@@ -755,16 +851,9 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         registerAntiRepeat(nextQ);
         return;
       }
-
-      const sz = await computeSessionSize();
-      if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
-
-      setIsFinished(true);
-      setCurrentQuestion(null);
-      return;
     }
 
-    await fetchSingle("next");
+    await fetchSingle("next", { roundToken: roundTokenRef.current });
   }
 
   const shownSources = useMemo(() => {
