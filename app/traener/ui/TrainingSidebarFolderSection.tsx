@@ -19,15 +19,34 @@ export default function TrainingSidebarFolderSection({ folders }: { folders: Fol
 
   useEffect(() => {
     setLiveFolders(folders);
+    if (typeof window !== "undefined") {
+      try {
+        window.sessionStorage.setItem("notely:folders", JSON.stringify(folders));
+      } catch {}
+    }
   }, [folders]);
 
   useEffect(() => {
-    function handleFoldersChanged(event: Event) {
-      const detail = (event as CustomEvent<{ folders?: FolderRow[] }>).detail;
-      if (Array.isArray(detail?.folders)) {
-        setLiveFolders(detail.folders);
+    if (typeof window === "undefined") return;
+
+    try {
+      const raw = window.sessionStorage.getItem("notely:folders");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setLiveFolders(parsed);
+        }
       }
-    }
+    } catch {}
+
+    const handleFoldersChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ folders?: FolderRow[] }>).detail;
+      if (!Array.isArray(detail?.folders)) return;
+      setLiveFolders(detail.folders);
+      try {
+        window.sessionStorage.setItem("notely:folders", JSON.stringify(detail.folders));
+      } catch {}
+    };
 
     window.addEventListener("notely-folders-changed", handleFoldersChanged);
     return () => {

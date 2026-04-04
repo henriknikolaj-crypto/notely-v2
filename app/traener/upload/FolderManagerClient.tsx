@@ -54,6 +54,13 @@ function broadcastFolders(nextFolders: Folder[]) {
   );
 }
 
+function persistFolders(nextFolders: Folder[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem("notely:folders", JSON.stringify(nextFolders));
+  } catch {}
+}
+
 export default function FolderManagerClient({ ownerId, initialFolders, onFoldersChange }: Props) {
   const router = useRouter();
   const [folders, setFolders] = useState<Folder[]>(initialFolders);
@@ -110,6 +117,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = [...folders, data.folder];
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
       broadcastFolders(nextFolders);
       setNewName("");
       setNewStart("");
@@ -170,6 +178,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.map((f) => (f.id === data.folder.id ? data.folder : f));
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
       broadcastFolders(nextFolders);
       setEdit({ mode: "none" });
       router.refresh();
@@ -221,6 +230,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
         const nextFolders = folders.filter((x) => x.id !== id);
         setFolders(nextFolders);
         onFoldersChange?.(nextFolders);
+        persistFolders(nextFolders);
         broadcastFolders(nextFolders);
         router.refresh();
         return;
@@ -234,6 +244,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.filter((x) => x.id !== id);
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
       broadcastFolders(nextFolders);
       router.refresh();
     } catch (err) {
