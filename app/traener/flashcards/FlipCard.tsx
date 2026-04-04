@@ -41,12 +41,16 @@ export function FlipCard({
 
   function renderBody(content: React.ReactNode) {
     return (
-      <div className="flex-1 flex items-start justify-center pt-[140px] px-10">
+      <div className="flex-1 px-8 pt-20 pb-24 sm:px-10 sm:pt-24">
         <div
-          className="max-w-[34ch] whitespace-pre-wrap text-center text-[15px] leading-7 text-slate-900"
+          className="mx-auto flex h-full w-full max-w-[36ch] items-start justify-center"
+        >
+          <div
+            className="w-full whitespace-pre-wrap text-center text-[15px] leading-7 text-slate-900 [text-wrap:pretty]"
           style={{ fontFamily: mathFriendlyFontStack }}
         >
-          {content}
+            {content}
+          </div>
         </div>
       </div>
     );

@@ -132,6 +132,15 @@ function logMcClientDebug(event: string, details: Record<string, unknown>) {
   }
 }
 
+function getQuotaLogDetails(json: any) {
+  const { used, limit } = pickQuota(json);
+  return {
+    usedThisMonth: used,
+    monthlyLimit: limit,
+    remainingThisMonth: typeof limit === "number" ? Math.max(0, limit - used) : null,
+  };
+}
+
 export default function ClientMC({ scopeFolderIds }: Props) {
   const effectiveScopeFolderIds = useMemo(
     () =>
@@ -144,6 +153,8 @@ export default function ClientMC({ scopeFolderIds }: Props) {
   const prefetchRequestSeqRef = useRef(0);
   const roundTokenRef = useRef(0);
   const activeRequestKindRef = useRef<"batch" | "single" | null>(null);
+  const batchInFlightRef = useRef(false);
+  const pendingQueueAdvanceRef = useRef(false);
 
   const [started, setStarted] = useState(false);
 
@@ -160,6 +171,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  const [batchInFlight, setBatchInFlight] = useState(false);
   const [loadingNext, setLoadingNext] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [quotaBlocked, setQuotaBlocked] = useState<string | null>(null);
@@ -219,21 +231,26 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     }
   }, []);
 
-  const computeSessionSize = useCallback(async () => {
+  const computeSessionSize = useCallback(async (reason = "unspecified") => {
     try {
-      const json = await fetchQuotaCurrent();
+      const json = await fetchQuotaCurrent({ force: true });
       if (!json?.ok) return DEFAULT_SESSION_SIZE;
 
       const { used, limit } = pickQuota(json);
+      logMcClientDebug("quota:current", {
+        reason,
+        scopeKey,
+        ...getQuotaLogDetails(json),
+      });
       if (typeof limit === "number" && limit > 0) {
         const remaining = Math.max(0, limit - used);
-        return clampInt(Math.min(DEFAULT_SESSION_SIZE, remaining), 0, DEFAULT_SESSION_SIZE);
+        return remaining >= DEFAULT_SESSION_SIZE ? DEFAULT_SESSION_SIZE : 0;
       }
       return DEFAULT_SESSION_SIZE;
     } catch {
       return DEFAULT_SESSION_SIZE;
     }
-  }, []);
+  }, [scopeKey]);
 
   const applyQuotaBlocked = useCallback(
     (msg?: string | null) => {
@@ -284,6 +301,48 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     });
   }, [scopeKey]);
 
+  const advanceToQueuedQuestion = useCallback(
+    (nextQ: MCQuestion, mode: "queue-next" | "queue-wait-resume") => {
+      setQueue((prev) => prev.slice(1));
+      setCurrentQuestion(nextQ);
+      logMcClientDebug("currentQuestion:set", {
+        mode,
+        roundToken: roundTokenRef.current,
+        scopeKey,
+        questionId: nextQ.id,
+        usedFileId: nextQ.usedFileId ?? null,
+      });
+      setQuestionNumber((prev) => prev + 1);
+      setSelectedId(null);
+      setChecked(false);
+      setSaveError(null);
+      setLoadError(null);
+      setLoadingNext(false);
+      registerAntiRepeat(nextQ);
+    },
+    [registerAntiRepeat, scopeKey],
+  );
+
+  useEffect(() => {
+    if (!pendingQueueAdvanceRef.current) return;
+    if (queue.length > 0) {
+      const nextQ = queue[0];
+      if (!nextQ) return;
+      pendingQueueAdvanceRef.current = false;
+      advanceToQueuedQuestion(nextQ, "queue-wait-resume");
+      return;
+    }
+    if (batchInFlight) return;
+    pendingQueueAdvanceRef.current = false;
+    setLoadingNext(false);
+    logMcClientDebug("handleNext:wait-ended-no-queue", {
+      roundToken: roundTokenRef.current,
+      scopeKey,
+      questionNumber,
+      sessionTotal,
+    });
+  }, [advanceToQueuedQuestion, batchInFlight, questionNumber, queue, scopeKey, sessionTotal]);
+
   const fetchBatch = useCallback(
     async (
       count: number,
@@ -299,12 +358,17 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       const batchRequestSeq = ++prefetchRequestSeqRef.current;
       const roundToken = opts?.roundToken ?? roundTokenRef.current;
       const isStale = () => batchRequestSeq !== prefetchRequestSeqRef.current || roundToken !== roundTokenRef.current;
+      batchInFlightRef.current = true;
+      setBatchInFlight(true);
       logMcClientDebug("fetchBatch:start", {
         batchRequestSeq,
         count,
         roundToken,
         scopeKey,
         scopeFolderIds: effectiveScopeFolderIds,
+        queueLength: queue.length,
+        questionNumber,
+        sessionTotal,
       });
 
       if (prefetchAbortRef.current) {
@@ -383,6 +447,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           console.debug("[mc-ui] fetchBatch:parsed", {
             batchRequestSeq,
             jsonOk: !!data && (data as any)?.ok === true,
+            requestId: (data as any)?.requestId ?? null,
             returnedCount: (data as any)?.returnedCount ?? null,
             itemsLength: Array.isArray((data as any)?.items) ? (data as any).items.length : null,
           });
@@ -430,12 +495,17 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] fetchBatch:set-state", {
             batchRequestSeq,
+            requestId: ok.requestId ?? null,
+            requestedCount: ok.requestedCount,
+            effectiveCount: ok.effectiveCount ?? null,
+            returnedCount: ok.returnedCount,
             questionCount: apiQuestions.length,
             firstQuestionId: apiQuestions[0]?.id ?? null,
           });
         }
 
         appendQuestionsToQueue(apiQuestions);
+        dispatchQuotaChanged();
         return "OK";
       } catch (err: any) {
         if (process.env.NODE_ENV !== "production") {
@@ -451,10 +521,12 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         console.error("generate-mc-batch error:", err);
         return "NEEDS_SINGLE";
       } finally {
+        batchInFlightRef.current = false;
+        setBatchInFlight(false);
         if (prefetchAbortRef.current === ac) prefetchAbortRef.current = null;
       }
     },
-    [appendQuestionsToQueue, effectiveScopeFolderIds, readJsonSafe],
+    [appendQuestionsToQueue, dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, sessionTotal],
   );
 
   const fetchSingle = useCallback(
@@ -475,6 +547,16 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       activeRequestKindRef.current = "single";
       setLoadError(null);
       setQuotaBlocked(null);
+      logMcClientDebug("fetchSingle:start", {
+        mode,
+        roundToken,
+        scopeKey,
+        scopeFolderIds: effectiveScopeFolderIds,
+        queueLength: queue.length,
+        batchInFlight: batchInFlightRef.current,
+        questionNumber,
+        sessionTotal,
+      });
 
       if (foregroundAbortRef.current) {
         foregroundAbortRef.current.abort();
@@ -556,8 +638,11 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           mode,
           roundToken,
           scopeKey,
+          requestId: apiQuestion.meta?.requestId ?? null,
           questionId: apiQuestion.id,
           usedFileId: apiQuestion.usedFileId ?? null,
+          queueLength: queue.length,
+          batchInFlight: batchInFlightRef.current,
         });
         dispatchQuotaChanged();
         registerAntiRepeat(apiQuestion);
@@ -596,7 +681,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         if (foregroundAbortRef.current === ac) foregroundAbortRef.current = null;
       }
     },
-    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, readJsonSafe, registerAntiRepeat, resetRoundToIdle],
+    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, registerAntiRepeat, resetRoundToIdle, scopeKey, sessionTotal],
   );
 
   const startNewRound = useCallback(async () => {
@@ -620,6 +705,9 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     }
     prefetchRequestSeqRef.current += 1;
     activeRequestKindRef.current = null;
+    batchInFlightRef.current = false;
+    pendingQueueAdvanceRef.current = false;
+    setBatchInFlight(false);
     const roundToken = ++roundTokenRef.current;
     logMcClientDebug("round:start", {
       roundToken,
@@ -645,7 +733,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
     setQueue([]);
 
-    const sz = await computeSessionSize();
+    const sz = await computeSessionSize("startNewRound");
     if (roundToken !== roundTokenRef.current) return;
 
     if (sz <= 0) {
@@ -707,6 +795,9 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     prefetchRequestSeqRef.current += 1;
     roundTokenRef.current = scopeChangeRoundToken;
     activeRequestKindRef.current = null;
+    batchInFlightRef.current = false;
+    pendingQueueAdvanceRef.current = false;
+    setBatchInFlight(false);
 
     setStarted(false);
 
@@ -733,7 +824,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         setQuotaBlocked(null);
         return;
       }
-      const sz = await computeSessionSize();
+      const sz = await computeSessionSize("scopeChange");
       if (scopeChangeRoundToken !== roundTokenRef.current) return;
       setSessionTotal(sz);
       if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
@@ -759,6 +850,8 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       prefetchRequestSeqRef.current += 1;
       roundTokenRef.current += 1;
       activeRequestKindRef.current = null;
+      batchInFlightRef.current = false;
+      pendingQueueAdvanceRef.current = false;
     };
   }, []);
 
@@ -820,7 +913,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
     // slut på runden
     if (questionNumber >= sessionTotal) {
-      const sz = await computeSessionSize();
+      const sz = await computeSessionSize("finishCheck");
       if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
       setIsFinished(true);
       setCurrentQuestion(null);
@@ -832,27 +925,34 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       const nextQ = queue[0];
 
       if (nextQ) {
-        setQueue((prev) => prev.slice(1));
-        setCurrentQuestion(nextQ);
-        logMcClientDebug("currentQuestion:set", {
-          mode: "queue-next",
-          roundToken: roundTokenRef.current,
-          scopeKey,
-          questionId: nextQ.id,
-          usedFileId: nextQ.usedFileId ?? null,
-        });
-        setQuestionNumber((prev) => prev + 1);
-
-        setSelectedId(null);
-        setChecked(false);
-        setSaveError(null);
-        setLoadError(null);
-
-        registerAntiRepeat(nextQ);
+        advanceToQueuedQuestion(nextQ, "queue-next");
         return;
       }
     }
 
+    if (batchInFlightRef.current) {
+      pendingQueueAdvanceRef.current = true;
+      setLoadingNext(true);
+      setLoadError(null);
+      logMcClientDebug("handleNext:waiting-for-batch", {
+        roundToken: roundTokenRef.current,
+        scopeKey,
+        queueLength: queue.length,
+        batchInFlight: true,
+        questionNumber,
+        sessionTotal,
+      });
+      return;
+    }
+
+    logMcClientDebug("handleNext:queue-empty-fallback-single", {
+      roundToken: roundTokenRef.current,
+      scopeKey,
+      queueLength: queue.length,
+      batchInFlight: batchInFlightRef.current,
+      questionNumber,
+      sessionTotal,
+    });
     await fetchSingle("next", { roundToken: roundTokenRef.current });
   }
 
@@ -888,7 +988,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       <div className="space-y-4">
         <div className="rounded-2xl border border-zinc-200 bg-white p-4">
           <div className="text-sm font-semibold text-zinc-900">Multiple Choice</div>
-          <div className="mt-1 text-xs text-zinc-600">Vælg eller skift mappe her. Tryk derefter “Start” for at generere en runde.</div>
+          <div className="mt-1 text-xs text-zinc-600">Vælg en mappe for at starte en runde.</div>
 
           {quotaBlocked ? <LimitNotice className="mt-3">{quotaBlocked}</LimitNotice> : null}
           {!quotaBlocked && loadError ? <div className="mt-3 text-xs text-red-600">{loadError}</div> : null}

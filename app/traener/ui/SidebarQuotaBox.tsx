@@ -44,6 +44,34 @@ function formatLine(label: string, fq?: FeatureQuota) {
   return `${label}: ${used} denne måned`;
 }
 
+function getSetUsage(usedRaw: number, limitRaw: number | null) {
+  const normalizedUsed = Math.max(0, usedRaw);
+  if (typeof limitRaw !== "number" || limitRaw <= 0) {
+    return { usedSets: Math.floor(normalizedUsed / 10), limitSets: null as number | null };
+  }
+
+  const limitSets = Math.floor(limitRaw / 10);
+  const remainingRaw = Math.max(0, limitRaw - normalizedUsed);
+  const remainingSets = Math.floor(remainingRaw / 10);
+  const usedSets = Math.max(0, limitSets - remainingSets);
+
+  return { usedSets: Math.min(usedSets, limitSets), limitSets };
+}
+
+function formatSetLine(label: string, fq?: FeatureQuota) {
+  if (!fq) return `${label}: ingen data`;
+
+  const usedRaw = fq.usedThisMonth ?? 0;
+  const limitRaw = fq.limitPerMonth;
+  const { usedSets, limitSets } = getSetUsage(usedRaw, limitRaw);
+
+  if (typeof limitSets === "number" && limitSets > 0) {
+    return `${label}: ${usedSets} af ${limitSets} sæt denne måned`;
+  }
+
+  return `${label}: ${usedSets} sæt denne måned`;
+}
+
 function normalizePlan(raw: any) {
   const p = String(raw ?? "").trim().toLowerCase();
   if (!p) return "freemium";
@@ -178,9 +206,9 @@ export default function SidebarQuotaBox({
 
         {!isPaid ? (
           <>
-            <p>{formatLine("Træner (runder)", trainerRoundQ)}</p>
-            <p>{formatLine("Multiple Choice (generering)", mcQ)}</p>
-            <p>{formatLine("Flashcards (generering)", flashGenQ)}</p>
+            <p>{formatLine("Træner (vurderinger)", trainerRoundQ)}</p>
+            <p>{formatSetLine("Multiple Choice", mcQ)}</p>
+            <p>{formatSetLine("Flashcards", flashGenQ)}</p>
             {isFreemium ? <p>{formatLine("Resuméer", summaryNotesQ)}</p> : null}
             {isFreemium ? <p>{formatLine("Fokus-noter", focusNotesQ)}</p> : null}
           </>

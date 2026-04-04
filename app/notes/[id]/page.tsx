@@ -1,6 +1,8 @@
 ﻿// app/notes/[id]/page.tsx
 import "server-only";
 import Link from "next/link";
+import FocusNoteContent from "@/app/notes/ui/FocusNoteContent";
+import ResumeNoteContent from "@/app/notes/ui/ResumeNoteContent";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { assertCanAccessVisibleNoteCategory, FREEMIUM_NOTE_LOCKED_MESSAGE } from "@/lib/notes/entitlements";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
@@ -171,19 +173,15 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
         <section
           className={
             isResume
-              ? "rounded-xl border border-zinc-200/90 bg-white px-5 py-5"
+              ? "rounded-xl border border-zinc-200/90 bg-white px-5 py-4"
               : "rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm"
           }
         >
-          <div
-            className={
-              isResume
-                ? "max-w-[68ch] whitespace-pre-wrap text-[15px] leading-7 text-zinc-800 [&_p]:mb-4 [&_p:last-child]:mb-0"
-                : "prose prose-sm max-w-none whitespace-pre-wrap"
-            }
-          >
-            {data.content}
-          </div>
+          {isResume ? (
+            <ResumeNoteContent content={data.content ?? ""} />
+          ) : (
+            <FocusNoteContent content={data.content ?? ""} />
+          )}
         </section>
       </div>
     </main>

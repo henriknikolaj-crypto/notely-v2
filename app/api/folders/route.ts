@@ -1,5 +1,6 @@
 ﻿import "server-only";
 
+import { revalidatePath } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
@@ -111,6 +112,9 @@ export async function POST(req: NextRequest) {
     console.error("[folders POST] db error", error);
     return jsonUtf8({ ok: false, code: "DB_INSERT_FAILED", error: "Kunne ikke oprette mappen." }, { status: 500 });
   }
+
+  revalidatePath("/traener", "layout");
+  revalidatePath("/traener/upload");
 
   return jsonUtf8({ ok: true, folder: data }, { status: 200 });
 }

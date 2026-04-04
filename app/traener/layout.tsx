@@ -8,6 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import MobileBackToMenu from "@/components/mobile/MobileBackToMenu";
+import DesktopSidebarShell from "./ui/DesktopSidebarShell";
 import TrainingSidebarMainNav from "./ui/TrainingSidebarMainNav";
 import TrainingSidebarStats from "./ui/TrainingSidebarStats";
 import TrainingSidebarFolderSection from "./ui/TrainingSidebarFolderSection";
@@ -205,39 +206,32 @@ export default async function TraenerLayout({
         </div>
       </header>
 
-      {/* 2-kolonne layout */}
-      <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6 md:px-6">
-        {/* VENSTRE SIDEBAR */}
-        <aside className="hidden w-64 shrink-0 md:block">
-          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 text-sm shadow-sm">
-            <div className="px-2 pb-1 pt-1 font-semibold text-zinc-800">Mit Notely</div>
+      <div className="mx-auto max-w-6xl px-4 py-6 md:px-6">
+        <DesktopSidebarShell
+          mobileTop={<MobileBackToMenu />}
+          desktopTop={<TrainingTabs isPro={isPro} disableLiveFetch={disableLiveQuotaFetch} />}
+          sidebar={
+            <>
+              <div className="px-2 pb-1 pt-1 font-semibold text-zinc-800">Mit Notely</div>
 
-            <TrainingSidebarMainNav />
+              <TrainingSidebarMainNav />
 
-            <TrainingSidebarFolderSection folders={folders} />
+              <TrainingSidebarFolderSection folders={folders} />
 
-            <TrainingSidebarStats
-              latestNotes={latestNotes}
-              latestEvals={latestEvals}
-              evalCount={evalCount}
-              resumeCount={resumeCount}
-              focusCount={focusCount}
-              planLabel={planLabel}
-              disableLiveQuotaFetch={disableLiveQuotaFetch}
-            />
-          </div>
-        </aside>
-
-        {/* HØJRE KOLONNE */}
-        <section className="min-w-0 flex-1 bg-transparent">
-          <div className="mx-auto w-full max-w-3xl">
-            <MobileBackToMenu />
-            <div className="hidden md:block">
-              <TrainingTabs isPro={isPro} disableLiveFetch={disableLiveQuotaFetch} />
-            </div>
-            {children}
-          </div>
-        </section>
+              <TrainingSidebarStats
+                latestNotes={latestNotes}
+                latestEvals={latestEvals}
+                evalCount={evalCount}
+                resumeCount={resumeCount}
+                focusCount={focusCount}
+                planLabel={planLabel}
+                disableLiveQuotaFetch={disableLiveQuotaFetch}
+              />
+            </>
+          }
+        >
+          {children}
+        </DesktopSidebarShell>
       </div>
     </main>
   );

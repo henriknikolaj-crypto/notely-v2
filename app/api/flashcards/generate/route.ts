@@ -24,6 +24,7 @@ type GenerateFlashcardsRequest = {
   difficulty?: Difficulty;
   maxContextChunks?: number;
   count?: number; // UI bruger 10
+  avoidCards?: Array<{ front?: string; back?: string }>;
 };
 
 type Citation = {
@@ -43,6 +44,16 @@ type FlashcardSessionSnapshotItem = {
   id: string;
   front: string;
   back: string;
+};
+
+type FlashcardDedupeFingerprint = {
+  frontKey: string;
+  backKey: string;
+  frontTokens: string[];
+  backTokens: string[];
+  frontSortedKey: string;
+  backSortedKey: string;
+  combinedKey: string;
 };
 
 type LimitsPayload =
@@ -166,6 +177,124 @@ function buildCardsSnapshot(cards: FlashcardPayload[]): FlashcardSessionSnapshot
     .filter((card) => card.id && card.front && card.back);
 }
 
+const FLASHCARD_GENERIC_FRONT_PREFIXES = [
+  "hvad er",
+  "hvilke",
+  "hvilken",
+  "hvilket",
+  "ifølge teksten",
+  "ifølge materialet",
+  "ifølge kilden",
+];
+
+const FLASHCARD_GENERIC_FRONT_TOKENS = new Set([
+  "hvad",
+  "hvilke",
+  "hvilken",
+  "hvilket",
+  "ifolge",
+  "teksten",
+  "materialet",
+  "kilden",
+]);
+
+function normalizeFlashcardTextForDedupe(value: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?()"'’”“\[\]{}\-_/\\]/g, "")
+    .trim();
+}
+
+function stripGenericFrontPrefixes(value: string) {
+  let normalized = normalizeFlashcardTextForDedupe(value);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const prefix of FLASHCARD_GENERIC_FRONT_PREFIXES) {
+      if (normalized.startsWith(`${prefix} `)) {
+        normalized = normalized.slice(prefix.length).trim();
+        changed = true;
+      }
+    }
+  }
+  return normalized;
+}
+
+function normalizeFlashcardToken(token: string) {
+  let normalized = normalizeFlashcardTextForDedupe(token);
+  if (normalized.length > 6 && normalized.endsWith("er")) normalized = normalized.slice(0, -2);
+  else if (normalized.length > 6 && (normalized.endsWith("en") || normalized.endsWith("et"))) normalized = normalized.slice(0, -2);
+  else if (normalized.length > 4 && normalized.endsWith("s") && !normalized.endsWith("ss")) normalized = normalized.slice(0, -1);
+  return normalized;
+}
+
+function tokenizeFlashcardText(value: string, opts?: { stripFrontPrefixes?: boolean }) {
+  const normalized = opts?.stripFrontPrefixes ? stripGenericFrontPrefixes(value) : normalizeFlashcardTextForDedupe(value);
+  return normalized
+    .split(" ")
+    .map(normalizeFlashcardToken)
+    .filter((token) => token.length >= 3)
+    .filter((token) => !FLASHCARD_GENERIC_FRONT_TOKENS.has(token));
+}
+
+function calculateTokenOverlap(tokensA: string[], tokensB: string[]) {
+  const setA = new Set(tokensA);
+  const setB = new Set(tokensB);
+  if (setA.size === 0 || setB.size === 0) return 0;
+
+  let overlap = 0;
+  for (const token of setA) {
+    if (setB.has(token)) overlap += 1;
+  }
+  return overlap / Math.min(setA.size, setB.size);
+}
+
+function buildFlashcardFingerprint(front: string, back: string): FlashcardDedupeFingerprint {
+  const frontKey = stripGenericFrontPrefixes(front);
+  const backKey = normalizeFlashcardTextForDedupe(back);
+  const frontTokens = tokenizeFlashcardText(front, { stripFrontPrefixes: true });
+  const backTokens = tokenizeFlashcardText(back);
+  const frontSortedKey = Array.from(new Set(frontTokens)).sort().join(" ");
+  const backSortedKey = Array.from(new Set(backTokens)).sort().join(" ");
+  return {
+    frontKey,
+    backKey,
+    frontTokens,
+    backTokens,
+    frontSortedKey,
+    backSortedKey,
+    combinedKey: `${frontKey}|${backKey}`,
+  };
+}
+
+function detectNearDuplicateFlashcard(
+  candidate: FlashcardDedupeFingerprint,
+  existing: FlashcardDedupeFingerprint,
+) {
+  if (candidate.combinedKey && candidate.combinedKey === existing.combinedKey) return true;
+
+  const frontOverlap = calculateTokenOverlap(candidate.frontTokens, existing.frontTokens);
+  const backOverlap = calculateTokenOverlap(candidate.backTokens, existing.backTokens);
+  const backExact = Boolean(candidate.backKey) && candidate.backKey === existing.backKey;
+  const frontSortedExact = Boolean(candidate.frontSortedKey) && candidate.frontSortedKey === existing.frontSortedKey;
+  const backSortedExact = Boolean(candidate.backSortedKey) && candidate.backSortedKey === existing.backSortedKey;
+  const frontContains =
+    Boolean(candidate.frontKey) &&
+    Boolean(existing.frontKey) &&
+    (candidate.frontKey.includes(existing.frontKey) || existing.frontKey.includes(candidate.frontKey));
+
+  if (frontSortedExact && (backExact || backSortedExact || backOverlap >= 0.55)) return true;
+  if (frontOverlap >= 0.92) return true;
+  if (frontOverlap >= 0.7 && (backExact || backSortedExact)) return true;
+  if (frontOverlap >= 0.78 && (backExact || backOverlap >= 0.72)) return true;
+  if (frontOverlap >= 0.85 && backOverlap >= 0.45) return true;
+  if (frontContains && (backExact || backOverlap >= 0.65)) return true;
+  if (backExact && frontOverlap >= 0.62) return true;
+  return false;
+}
+
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -181,6 +310,14 @@ export async function POST(req: NextRequest) {
     const maxContextChunks = clampInt(body.maxContextChunks, 6, 40, 14);
 
     const scopeFolderIds = Array.isArray(body.scopeFolderIds) ? uniqTrimmed(body.scopeFolderIds) : [];
+    const avoidCards = Array.isArray(body.avoidCards)
+      ? body.avoidCards
+          .map((card) => ({
+            front: String(card?.front ?? "").trim(),
+            back: String(card?.back ?? "").trim(),
+          }))
+          .filter((card) => card.front && card.back)
+      : [];
     const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
 
     // Auth: session-first, read-only route client
@@ -297,15 +434,68 @@ export async function POST(req: NextRequest) {
           code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
           limits,
           resetAt: quotaSnapshot.resetAt,
+          ...(process.env.NODE_ENV !== "production"
+            ? {
+                debug: {
+                  path: "/api/flashcards/generate",
+                  phase: "quota_snapshot",
+                  feature: "flashcards_generate",
+                  plan: planKey,
+                  requested,
+                  usedThisMonth: quotaSnapshot.used,
+                  monthlyLimit: quotaSnapshot.limitPerMonth,
+                },
+              }
+            : {}),
         },
         { status: quotaSnapshot.status },
       );
     }
 
-    const effectiveRequested =
+    const remainingThisMonth =
       typeof quotaSnapshot.limitPerMonth === "number"
-        ? Math.max(1, Math.min(requested, Math.max(0, quotaSnapshot.limitPerMonth - quotaSnapshot.used)))
-        : requested;
+        ? Math.max(0, quotaSnapshot.limitPerMonth - quotaSnapshot.used)
+        : null;
+
+    if (typeof remainingThisMonth === "number" && remainingThisMonth < requested) {
+      const limits: LimitsPayload =
+        typeof quotaSnapshot.limitPerMonth === "number"
+          ? {
+              plan: planKey,
+              feature: "flashcards_generate",
+              usedThisMonth: quotaSnapshot.used,
+              monthlyLimit: quotaSnapshot.limitPerMonth,
+              remainingThisMonth,
+            }
+          : null;
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Du har nået din flashcards-grænse for denne måned.",
+          code: "QUOTA_EXCEEDED",
+          limits,
+          resetAt: quotaSnapshot.resetAt,
+          ...(process.env.NODE_ENV !== "production"
+            ? {
+                debug: {
+                  path: "/api/flashcards/generate",
+                  phase: "quota_snapshot_exhausted",
+                  feature: "flashcards_generate",
+                  plan: planKey,
+                  requested,
+                  usedThisMonth: quotaSnapshot.used,
+                  monthlyLimit: quotaSnapshot.limitPerMonth,
+                  remainingThisMonth,
+                },
+              }
+            : {}),
+        },
+        { status: 429 },
+      );
+    }
+
+    const effectiveRequested = requested;
 
     // filer i scope
     let filesQ = sb
@@ -475,8 +665,11 @@ Returnér gyldig JSON:
 
     const rawCards = Array.isArray(payload?.cards) ? payload.cards : [];
     const outCards: FlashcardPayload[] = [];
+    const seenFingerprints = avoidCards.map((card) => buildFlashcardFingerprint(card.front, card.back));
 
     for (const c of rawCards) {
+      if (outCards.length >= effectiveRequested) break;
+
       const front = String(c?.front ?? "").trim();
       const back = String(c?.back ?? "").trim();
       let sourceIndex = Number(c?.sourceIndex);
@@ -490,6 +683,12 @@ Returnér gyldig JSON:
 
       const cleanFront = normalizeFlashcardMathText(front.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
       const cleanBack = normalizeFlashcardMathText(back.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
+      const candidateFingerprint = buildFlashcardFingerprint(cleanFront, cleanBack);
+      const isNearDuplicate = seenFingerprints.some((existing) =>
+        detectNearDuplicateFlashcard(candidateFingerprint, existing),
+      );
+      if (isNearDuplicate) continue;
+      seenFingerprints.push(candidateFingerprint);
 
       outCards.push({
         id: randomUUID(),
@@ -559,6 +758,21 @@ Returnér gyldig JSON:
           code: quotaConsume.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
           limits,
           resetAt: quotaConsume.resetAt,
+          ...(process.env.NODE_ENV !== "production"
+            ? {
+                debug: {
+                  path: "/api/flashcards/generate",
+                  phase: "quota_consume",
+                  feature: "flashcards_generate",
+                  plan: planKey,
+                  requested,
+                  effectiveRequested,
+                  returned: outCards.length,
+                  usedThisMonth: quotaConsume.used,
+                  monthlyLimit: quotaConsume.limitPerMonth,
+                },
+              }
+            : {}),
         },
         { status: quotaConsume.status },
       );

@@ -19,6 +19,14 @@ import { supabaseServerRoute } from "@/lib/supabase/server-route";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
+function nowMs() {
+  return Date.now();
+}
+
+function approxTokensFromChars(chars: number) {
+  return chars > 0 ? Math.max(1, Math.ceil(chars / 4)) : 0;
+}
+
 const MAX_TRAINER_EVALS_PER_OWNER = 50;
 const TRAINER_EVALS_PER_ROUND = 2;
 
@@ -376,11 +384,32 @@ async function pruneTrainerHistory(sb: any, ownerId: string) {
 }
 
 export async function POST(req: NextRequest) {
+  const requestId = crypto.randomUUID();
+  const requestStartedAt = nowMs();
   // til jobs-log i outer catch
   let sb: any = null;
   let ownerId = "";
   let jobId: string | null = null;
-  let t0 = Date.now();
+  let t0 = nowMs();
+  let responseStatus = 500;
+  let responseError: string | null = null;
+  let outcome: "ok" | "error" = "error";
+  let flowForDiagnostics: NotelyFlow = "trainer";
+  let modelForDiagnostics: string | null = null;
+  let scopeFolderIdsForDiagnostics: string[] = [];
+  const metrics = {
+    authSessionMs: 0,
+    ensureProfileMs: 0,
+    retrievalMs: 0,
+    promptBuildMs: 0,
+    openAiMs: 0,
+    parsingMs: 0,
+    dbSaveMs: 0,
+    jobPersistMs: 0,
+    trackEventMs: 0,
+    contextChunkCount: 0,
+    contextChars: 0,
+  };
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   const hasCookieHeader = cookieNames.length > 0;
   const hasSbAuthCookie = cookieNames.some((name) => name.includes("auth-token"));
@@ -388,20 +417,28 @@ export async function POST(req: NextRequest) {
     (name) => name.toLowerCase().includes("vercel") && name.toLowerCase().includes("jwt"),
   );
 
+  const respond = <T extends Record<string, unknown>>(body: T, status: number, headers?: HeadersInit) => {
+    responseStatus = status;
+    outcome = status < 400 ? "ok" : "error";
+    responseError = typeof body.error === "string" ? body.error : null;
+    const payload = body.requestId ? body : { ...body, requestId };
+    return NextResponse.json(payload, { status, headers });
+  };
+
   try {
     const parsed = await readJsonBody<Partial<EvalRequest>>(req);
-    if (!parsed.ok) return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
+    if (!parsed.ok) return respond({ ok: false, error: parsed.error }, 400);
 
     const body = parsed.value ?? {};
     const question = String((body as any).question ?? (body as any).prompt ?? "").trim();
     const answer = String(body.answer ?? "").trim();
 
     if (!question || !answer) {
-      return NextResponse.json({ ok: false, error: "Mangler question eller answer" }, { status: 400 });
+      return respond({ ok: false, error: "Mangler question eller answer" }, 400);
     }
 
     if (!process.env.OPENAI_API_KEY) {
-      return NextResponse.json({ ok: false, error: "Missing OPENAI_API_KEY (required)" }, { status: 500 });
+      return respond({ ok: false, error: "Missing OPENAI_API_KEY (required)" }, 500);
     }
 
     // Folder/note/scope normaliseres tidligt (bruges både i jobs + exam_sessions)
@@ -413,19 +450,22 @@ export async function POST(req: NextRequest) {
           .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
           .map((x) => x.trim())
       : [];
+    scopeFolderIdsForDiagnostics = scopeFolderIds;
 
     const sessionFolderIds = scopeFolderIds.length > 0 ? scopeFolderIds : folderId ? [folderId] : [];
     const sessionFolderId = sessionFolderIds.length === 1 ? sessionFolderIds[0] : null;
     const sessionFolderIdsMeta = sessionFolderIds.length > 1 ? sessionFolderIds : undefined;
 
     const flow: NotelyFlow = pickFlow(body);
-const roundId = pickRoundId(body);
+    flowForDiagnostics = flow;
+    const roundId = pickRoundId(body);
 
-const includeBackgroundClient = !!body.includeBackground;
-const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
+    const includeBackgroundClient = !!body.includeBackground;
+    const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
 
     // Auth: session først, getUser kun som fallback
     let mode: "auth" | "dev" = "auth";
+    const authStartedAt = nowMs();
     try {
       sb = await supabaseServerRoute();
       const { data: sessionData, error: sessionError } = await sb.auth.getSession();
@@ -441,7 +481,7 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
       }
 
       if (!userId) {
-        return NextResponse.json(
+        return respond(
           {
             ok: false,
             error: "Unauthorized",
@@ -462,12 +502,12 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
                 }
               : {}),
           },
-          { status: 401 },
+          401,
         );
       }
 
       ownerId = userId;
-      t0 = Date.now();
+      t0 = nowMs();
 
       // Rate-limit (evaluate)
       const rl = await enforceRateLimit(
@@ -479,14 +519,15 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
 
       if (!rl.ok) {
         const retryAfterSec = Math.max(1, Math.ceil(rl.retryAfterMs / 1000));
-        return NextResponse.json(
+        return respond(
           { ok: false, error: rl.message, retryAfterMs: rl.retryAfterMs },
-          { status: 429, headers: { "Retry-After": String(retryAfterSec) } },
+          429,
+          { "Retry-After": String(retryAfterSec) },
         );
       }
     } catch (e: any) {
       console.error("[evaluate] auth crash:", e);
-      return NextResponse.json(
+      return respond(
         {
           ok: false,
           error: "Unauthorized",
@@ -507,16 +548,21 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
               }
             : {}),
         },
-        { status: 401 },
+        401,
       );
+    } finally {
+      metrics.authSessionMs += nowMs() - authStartedAt;
     }
 
     const profileAdmin = supabaseAdminOrNull();
     if (profileAdmin) {
+      const ensureProfileStartedAt = nowMs();
       try {
         await ensureProfile(profileAdmin, ownerId);
       } catch (profileError) {
         console.warn("[evaluate] ensureProfile warning:", profileError);
+      } finally {
+        metrics.ensureProfileMs += nowMs() - ensureProfileStartedAt;
       }
     } else {
       console.warn("[evaluate] ensureProfile skipped: missing service-role client");
@@ -529,25 +575,26 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
           ? resolveModelForFeature("weakness")
           : resolveModelForFeature(flow);
     } catch (e: any) {
-      return NextResponse.json({ ok: false, error: e?.message ?? "Missing model env" }, { status: 500 });
+      return respond({ ok: false, error: e?.message ?? "Missing model env" }, 500);
     }
+    modelForDiagnostics = model;
 
     // ✅ Trainer-runde gating (2 evals pr. runde) + ingen evaluate-quota for trainer
     let trainerRoundMeta: any = null;
     let shouldConsumeTrainerRound = false;
     if (flow === "trainer") {
       if (!roundId) {
-        return NextResponse.json(
+        return respond(
           { ok: false, error: "Tryk “Generér nyt spørgsmål” først for at starte en runde." },
-          { status: 400 },
+          400,
         );
       }
 
       const rr = await loadTrainerRound(sb, ownerId, roundId);
       if (!rr) {
-        return NextResponse.json(
+        return respond(
           { ok: false, error: "Ugyldig runde. Generér et nyt spørgsmål for at starte en ny runde." },
-          { status: 400 },
+          400,
         );
       }
 
@@ -556,9 +603,9 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
       const maxEvals = n0(trainerRoundMeta?.max_evals) > 0 ? n0(trainerRoundMeta?.max_evals) : TRAINER_EVALS_PER_ROUND;
 
       if (evalsUsed >= maxEvals) {
-        return NextResponse.json(
+        return respond(
           { ok: false, error: "Denne runde er brugt op. Generér et nyt spørgsmål for at starte en ny runde." },
-          { status: 402 },
+          402,
         );
       }
 
@@ -566,9 +613,9 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
       if (shouldConsumeTrainerRound) {
         const quotaAdmin = supabaseAdminOrNull();
         if (!quotaAdmin) {
-          return NextResponse.json(
+          return respond(
             { ok: false, error: "Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (kræves til quota)." },
-            { status: 500 },
+            500,
           );
         }
 
@@ -584,7 +631,7 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
           if (quotaConsume.status === 503) {
             console.error("[evaluate] quota_try_consume error:", quotaConsume.raw);
           }
-          return NextResponse.json(
+          return respond(
             {
               ok: false,
               error: quotaConsume.message,
@@ -594,7 +641,7 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
               monthlyLimit: quotaConsume.limitPerMonth,
               resetAt: quotaConsume.resetAt,
             },
-            { status: quotaConsume.status },
+            quotaConsume.status,
           );
         }
       }
@@ -604,7 +651,7 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
       const quota = await ensureQuotaAndDecrement(ownerId, "evaluate", cost);
       if (!quota.ok) {
         console.warn("[/api/evaluate] quota exceeded:", quota.message);
-        return NextResponse.json({ ok: false, error: quota.message, feature: "evaluate" }, { status: quota.status });
+        return respond({ ok: false, error: quota.message, feature: "evaluate" }, quota.status);
       }
     }
 
@@ -648,12 +695,16 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
     let citations: Citation[] = [];
 
     if (includeBackground) {
+      const retrievalStartedAt = nowMs();
       const ctx = await buildContextForEvaluation({ sb, ownerId, body, maxChars: 8000 });
       contextText = ctx.contextText;
       usedFileId = ctx.usedFileId;
       usedFolderId = ctx.usedFolderId;
       contextChunkCount = ctx.chunkCount;
       citations = ctx.citations;
+      metrics.retrievalMs += nowMs() - retrievalStartedAt;
+      metrics.contextChunkCount = contextChunkCount;
+      metrics.contextChars = contextText.length;
 
       if (jobId) {
         try {
@@ -684,6 +735,7 @@ const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
+    const promptBuildStartedAt = nowMs();
     const systemPrompt = `
 Du er dansk eksamenscensor.
 
@@ -715,7 +767,9 @@ Ingen tekst uden for JSON-objektet.
 `.trim();
 
     const userPayload = { question, answer, context: contextText };
+    metrics.promptBuildMs += nowMs() - promptBuildStartedAt;
 
+    const openAiStartedAt = nowMs();
     const { completion } = await createChatCompletion(openai, {
       feature: flow === "trainer" || flow === "simulator" ? "weakness" : flow,
       purpose: "json",
@@ -728,7 +782,9 @@ Ingen tekst uden for JSON-objektet.
         ],
       },
     });
+    metrics.openAiMs += nowMs() - openAiStartedAt;
 
+    const parseStartedAt = nowMs();
     const raw = completion.choices[0]?.message?.content ?? "{}";
 
     let parsedEval: EvalJson = {};
@@ -774,8 +830,10 @@ Ingen tekst uden for JSON-objektet.
       improvements,
       nextSteps,
     });
+    metrics.parsingMs += nowMs() - parseStartedAt;
 
     // ✅ bump evals_used på runden (LLM-kald er gennemført)
+    const dbSaveStartedAt = nowMs();
     if (flow === "trainer" && roundId) {
       const baseMeta = trainerRoundMeta ?? {};
       await bumpTrainerRoundEval(sb, ownerId, roundId, baseMeta);
@@ -818,9 +876,11 @@ Ingen tekst uden for JSON-objektet.
     if (!insertError && flow === "trainer") {
       void pruneTrainerHistory(sb, ownerId);
     }
+    metrics.dbSaveMs += nowMs() - dbSaveStartedAt;
 
     // ✅ jobs-log: succeeded
     if (jobId) {
+      const jobPersistStartedAt = nowMs();
       try {
         const tokensUsed = (completion as any)?.usage?.total_tokens ?? null;
         await sb
@@ -828,7 +888,7 @@ Ingen tekst uden for JSON-objektet.
           .update({
             status: "succeeded",
             finished_at: new Date().toISOString(),
-            latency_ms: Math.max(0, Date.now() - t0),
+            latency_ms: Math.max(0, nowMs() - t0),
             tokens_used: typeof tokensUsed === "number" ? tokensUsed : null,
             feedbackscore: score,
             result: { score, round_id: flow === "trainer" ? roundId : null },
@@ -838,10 +898,13 @@ Ingen tekst uden for JSON-objektet.
           .eq("id", jobId);
       } catch (e) {
         console.error("[evaluate] jobs update (succeeded) error:", e);
+      } finally {
+        metrics.jobPersistMs += nowMs() - jobPersistStartedAt;
       }
     }
 
     if (flow === "trainer") {
+      const trackEventStartedAt = nowMs();
       await trackProductEvent({
         ownerId,
         eventName: "trainer_answer_evaluated",
@@ -853,28 +916,31 @@ Ingen tekst uden for JSON-objektet.
           feature: "trainer",
         },
       });
+      metrics.trackEventMs += nowMs() - trackEventStartedAt;
     }
 
-    return NextResponse.json(
+    return respond(
       {
         ok: true,
+        requestId,
         score,
         feedback: feedbackText,
         usedFileId,
         citations,
       },
-      { status: 200 },
+      200,
     );
   } catch (err: any) {
     // ✅ jobs-log: failed
     if (sb && ownerId && jobId) {
+      const jobPersistStartedAt = nowMs();
       try {
         await sb
           .from("jobs")
           .update({
             status: "failed",
             finished_at: new Date().toISOString(),
-            latency_ms: Math.max(0, Date.now() - t0),
+            latency_ms: Math.max(0, nowMs() - t0),
             error_message: String(err?.message ?? "failed"),
             updated_at: new Date().toISOString(),
           })
@@ -882,10 +948,40 @@ Ingen tekst uden for JSON-objektet.
           .eq("id", jobId);
       } catch {
         // ignore
+      } finally {
+        metrics.jobPersistMs += nowMs() - jobPersistStartedAt;
       }
     }
 
+    responseError = err?.message ?? "Intern fejl i evalueringen";
     console.error("EVALUATE /api/evaluate error:", err);
-    return NextResponse.json({ ok: false, error: err?.message ?? "Intern fejl i evalueringen" }, { status: 500 });
+    return respond({ ok: false, error: err?.message ?? "Intern fejl i evalueringen" }, 500);
+  } finally {
+    const totalRequestMs = nowMs() - requestStartedAt;
+    console.info("[evaluate] diagnostics", {
+      requestId,
+      outcome,
+      status: responseStatus,
+      flow: flowForDiagnostics,
+      scopeFolderIds: scopeFolderIdsForDiagnostics,
+      model: modelForDiagnostics,
+      contextChunkCount: metrics.contextChunkCount,
+      contextChars: metrics.contextChars,
+      contextTokensApprox: approxTokensFromChars(metrics.contextChars),
+      stageTimingsMs: {
+        authSession: metrics.authSessionMs,
+        ensureProfile: metrics.ensureProfileMs,
+        retrieval: metrics.retrievalMs,
+        promptBuild: metrics.promptBuildMs,
+        model: metrics.openAiMs,
+        parsingAndPostProcessing: metrics.parsingMs,
+        dbSave: metrics.dbSaveMs,
+        jobPersist: metrics.jobPersistMs,
+        trackEvent: metrics.trackEventMs,
+        total: totalRequestMs,
+      },
+      totalRequestMs,
+      error: responseError,
+    });
   }
 }

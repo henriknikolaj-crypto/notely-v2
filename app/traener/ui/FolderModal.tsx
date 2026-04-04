@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type Folder = {
   id: string;
@@ -20,6 +21,7 @@ export default function FolderModal(props: {
   parentId?: string | null; // ved "create" undermappe
   roots: Folder[]; // kandidater til parent (root)
 }) {
+  const router = useRouter();
   const isEdit = props.mode === "edit";
 
   const [name, setName] = useState("");
@@ -106,7 +108,8 @@ export default function FolderModal(props: {
         if (!res.ok) throw new Error(j?.error || "Kunne ikke oprette mappe");
       }
 
-      props.onClose(); // parent refresher selv
+      router.refresh();
+      props.onClose();
     } catch (e: any) {
       setErr(e?.message || "Ukendt fejl");
     } finally {
