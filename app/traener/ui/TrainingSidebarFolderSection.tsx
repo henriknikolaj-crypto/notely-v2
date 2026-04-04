@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import TrainingSidebarFolders from "./TrainingSidebarFolders";
 
@@ -14,6 +15,26 @@ type FolderRow = {
 
 export default function TrainingSidebarFolderSection({ folders }: { folders: FolderRow[] }) {
   const pathname = usePathname() || "";
+  const [liveFolders, setLiveFolders] = useState<FolderRow[]>(folders);
+
+  useEffect(() => {
+    setLiveFolders(folders);
+  }, [folders]);
+
+  useEffect(() => {
+    function handleFoldersChanged(event: Event) {
+      const detail = (event as CustomEvent<{ folders?: FolderRow[] }>).detail;
+      if (Array.isArray(detail?.folders)) {
+        setLiveFolders(detail.folders);
+      }
+    }
+
+    window.addEventListener("notely-folders-changed", handleFoldersChanged);
+    return () => {
+      window.removeEventListener("notely-folders-changed", handleFoldersChanged);
+    };
+  }, []);
+
   const hideOnThisRoute =
     pathname.startsWith("/traener/konto") ||
     pathname === "/traener/overblik" ||
@@ -24,7 +45,7 @@ export default function TrainingSidebarFolderSection({ folders }: { folders: Fol
   return (
     <>
       <div className="px-4 pt-2 font-semibold text-zinc-800">Dine fag</div>
-      <TrainingSidebarFolders folders={folders} />
+      <TrainingSidebarFolders folders={liveFolders} />
     </>
   );
 }

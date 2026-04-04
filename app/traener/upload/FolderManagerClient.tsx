@@ -45,6 +45,15 @@ async function safeJson(res: Response): Promise<any | null> {
   }
 }
 
+function broadcastFolders(nextFolders: Folder[]) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent("notely-folders-changed", {
+      detail: { folders: nextFolders },
+    }),
+  );
+}
+
 export default function FolderManagerClient({ ownerId, initialFolders, onFoldersChange }: Props) {
   const router = useRouter();
   const [folders, setFolders] = useState<Folder[]>(initialFolders);
@@ -101,6 +110,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = [...folders, data.folder];
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      broadcastFolders(nextFolders);
       setNewName("");
       setNewStart("");
       setNewEnd("");
@@ -160,6 +170,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.map((f) => (f.id === data.folder.id ? data.folder : f));
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      broadcastFolders(nextFolders);
       setEdit({ mode: "none" });
       router.refresh();
     } catch (err) {
@@ -210,6 +221,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
         const nextFolders = folders.filter((x) => x.id !== id);
         setFolders(nextFolders);
         onFoldersChange?.(nextFolders);
+        broadcastFolders(nextFolders);
         router.refresh();
         return;
       }
@@ -222,6 +234,7 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.filter((x) => x.id !== id);
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      broadcastFolders(nextFolders);
       router.refresh();
     } catch (err) {
       console.error("delete folder error", err);
