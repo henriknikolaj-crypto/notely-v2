@@ -73,6 +73,14 @@ function preserveDanishText(value: string) {
   return String(value ?? "").normalize("NFC");
 }
 
+function nowClientMs() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+function clientWaitMs(startedAt: number) {
+  return Math.max(0, Math.round(nowClientMs() - startedAt));
+}
+
 async function trackClientEvent(eventName: string, metadata?: Record<string, unknown>) {
   const payload = JSON.stringify({ eventName, metadata: metadata ?? {} });
   try {
@@ -474,6 +482,7 @@ export default function ClientTrainer({
         return;
       }
 
+      const startedAt = nowClientMs();
       const res = await fetch("/api/generate-question", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -486,6 +495,18 @@ export default function ClientTrainer({
       });
 
       const data = await res.json().catch(() => null);
+      const requestId =
+        typeof (data as any)?.requestId === "string"
+          ? String((data as any).requestId)
+          : typeof (data as any)?.meta?.requestId === "string"
+            ? String((data as any).meta.requestId)
+            : null;
+      console.info("[client-trainer] generate-question", {
+        requestId,
+        status: res.status,
+        ok: res.ok,
+        clientWaitMs: clientWaitMs(startedAt),
+      });
 
       // ✅ quota / limit
       if (res.status === 402 || res.status === 429) {
@@ -522,6 +543,11 @@ export default function ClientTrainer({
 
       dispatchQuotaChanged();
     } catch (err: any) {
+      console.warn("[client-trainer] generate-question", {
+        requestId: null,
+        ok: false,
+        error: err?.message ?? "Fejl ved generering af spørgsmål.",
+      });
       setErrorMsg(err?.message || "Fejl ved generering af spørgsmål.");
     } finally {
       setLoadingQuestion(false);
@@ -562,6 +588,7 @@ export default function ClientTrainer({
         return;
       }
 
+      const startedAt = nowClientMs();
       const res = await fetch("/api/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -581,6 +608,18 @@ export default function ClientTrainer({
       });
 
       const data = await res.json().catch(() => null);
+      const requestId =
+        typeof (data as any)?.requestId === "string"
+          ? String((data as any).requestId)
+          : typeof (data as any)?.meta?.requestId === "string"
+            ? String((data as any).meta.requestId)
+            : null;
+      console.info("[client-trainer] evaluate", {
+        requestId,
+        status: res.status,
+        ok: res.ok,
+        clientWaitMs: clientWaitMs(startedAt),
+      });
 
       // ✅ hvis runden er brugt op (server-guard), så disable “Prøv igen”
       if (res.status === 402) {
@@ -611,6 +650,11 @@ export default function ClientTrainer({
       // ✅ efter første eval: knappen skal næste gang stå “Prøv igen”
       setEvalAttemptsUsed((n) => Math.min(EVAL_ATTEMPTS_MAX, n + 1));
     } catch (err: any) {
+      console.warn("[client-trainer] evaluate", {
+        requestId: null,
+        ok: false,
+        error: err?.message ?? "Fejl ved evaluering.",
+      });
       setErrorMsg(err?.message || "Fejl ved evaluering.");
     } finally {
       setLoadingEval(false);

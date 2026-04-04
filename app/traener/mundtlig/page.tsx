@@ -214,6 +214,22 @@ export default async function Page({
           helpText="Eksamen kan først startes, når en mappe er valgt."
         />
 
+        <section className="rounded-2xl border border-zinc-200 bg-zinc-50/80 px-4 py-3 shadow-sm">
+          <div className="flex items-start gap-3">
+            <span className="inline-flex shrink-0 rounded-full border border-zinc-200 bg-white px-2 py-0.5 text-[11px] font-semibold tracking-wide text-zinc-600">
+              Beta
+            </span>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-zinc-900">Mundtlig er i beta.</p>
+              <p className="mt-1 text-sm leading-6 text-zinc-600">
+                Vi arbejder på at gøre oplevelsen mere naturlig og tættere på en rigtig mundtlig eksamen.
+                Allerede nu kan du øve dine svar, træne din mundtlige formidling og blive mødt af opfølgende
+                spørgsmål baseret på det, du siger.
+              </p>
+            </div>
+          </div>
+        </section>
+
         <ClientOralExam scopeFolderIds={resolvedTrainingFolderIds} activeFolderId={resolvedActiveFolderId} isPro={isPro} />
       </section>
     </main>

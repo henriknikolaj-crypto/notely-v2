@@ -69,6 +69,7 @@ type GenerateMcItem = GenerateMcItemOk | GenerateMcItemErr;
 type GenerateMcBatchOk = {
   ok: true;
   batchId: string;
+  requestId: string;
   requestedCount: number;
   effectiveCount: number;
   returnedCount: number;
@@ -129,8 +130,21 @@ type ScoredChunkRow = ChunkRow & {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MC_BATCH_CONCURRENCY = 3;
-const MC_BATCH_CONTEXT_CHAR_LIMIT = 4500;
+const MC_BATCH_CONTEXT_CHAR_LIMIT = 4000;
 const MC_OPENAI_CALL_TIMEOUT_MS = 85_000;
+const MC_OPENAI_MAX_COMPLETION_TOKENS = 1200;
+const MC_SCOPE_DOC_CHUNK_COUNT_MAX_FILES = 12;
+
+function isOpenAiOutputLimitError(err: any) {
+  const status = Number(err?.status ?? 0);
+  const message = String(err?.message ?? "").toLowerCase();
+  return (
+    status === 400 &&
+    (message.includes("could not finish the message") ||
+      message.includes("max_tokens") ||
+      message.includes("output limit"))
+  );
+}
 
 function nowMs() {
   return Date.now();
@@ -321,15 +335,19 @@ async function countMcJobsThisMonth(admin: any, ownerId: string, monthStart: str
   return { used: 0, debug: { tsCol: null, successStatuses } };
 }
 
-async function logMcJob(admin: any, ownerId: string, payload: any) {
+async function logMcJobs(admin: any, ownerId: string, payloads: any[]) {
+  if (payloads.length === 0) return;
   try {
-    await admin.from("jobs").insert({
-      owner_id: ownerId,
-      kind: "mc_generate",
-      status: "succeeded",
-      queued_at: new Date().toISOString(),
-      payload,
-    });
+    const queuedAt = new Date().toISOString();
+    await admin.from("jobs").insert(
+      payloads.map((payload) => ({
+        owner_id: ownerId,
+        kind: "mc_generate",
+        status: "succeeded",
+        queued_at: queuedAt,
+        payload,
+      })),
+    );
   } catch (e) {
     console.warn("[generate-mc-batch] jobs insert warning:", e);
   }
@@ -475,7 +493,8 @@ export async function POST(req: NextRequest) {
 
   const metrics = {
     fileCountInScope: 0,
-    docChunksInScope: 0,
+    docChunksInScope: null as number | null,
+    docChunkCountMode: "skipped" as "exact" | "skipped",
     pickedChunkCount: 0,
     totalCharactersInPickedChunks: 0,
     openAiCallCount: 0,
@@ -485,6 +504,13 @@ export async function POST(req: NextRequest) {
     totalRetrievalMs: 0,
     totalPromptBuildMs: 0,
     totalNormalizationMs: 0,
+    topicLookupMs: 0,
+    filesLookupMs: 0,
+    scopeChunkCountMs: 0,
+    saveLastUsedMs: 0,
+    jobPersistMs: 0,
+    timeToFirstAcceptedMs: null as number | null,
+    invalidModelOutputCount: 0,
     sequentialOpenAiCalls: false,
     retryOpenAiCalls: 0,
     usedFileIds: [] as string[],
@@ -557,10 +583,21 @@ export async function POST(req: NextRequest) {
 
     const admin = supabaseAdmin();
     const quotaSnapshot = await getMcQuotaSnapshot(admin, ownerId);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-batch] quota-snapshot", {
+        requestId,
+        ownerId,
+        feature: "mc_generate",
+        requestedCount,
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        remainingThisMonth: quotaSnapshot.remainingThisMonth,
+      });
+    }
     if (!quotaSnapshot.ok) {
       const err: GenerateMcBatchErr = {
         ok: false,
-        error: quotaSnapshot.message,
+        error: "Du har ikke nok Multiple Choice tilbage denne måned til at starte et nyt sæt.",
         requestId,
         code: quotaSnapshot.status === 429 ? "QUOTA_EXCEEDED" : "QUOTA_CHECK_FAILED",
         feature: "mc_generate",
@@ -572,11 +609,34 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(err, { status: quotaSnapshot.status });
     }
 
-    const effectiveCount =
-      quotaSnapshot.remainingThisMonth == null ? requestedCount : Math.min(requestedCount, quotaSnapshot.remainingThisMonth);
+    if (
+      typeof quotaSnapshot.remainingThisMonth === "number" &&
+      quotaSnapshot.remainingThisMonth < requestedCount
+    ) {
+      const err: GenerateMcBatchErr = {
+        ok: false,
+        error: "Du har ikke nok Multiple Choice tilbage denne måned til at starte et nyt sæt.",
+        requestId,
+        code: "QUOTA_EXCEEDED",
+        feature: "mc_generate",
+        plan: quotaSnapshot.plan,
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        resetAt: quotaSnapshot.resetAt ?? undefined,
+        debug: {
+          requestedCount,
+          remainingThisMonth: quotaSnapshot.remainingThisMonth,
+          reason: "partial-batch-blocked",
+        },
+      };
+      return NextResponse.json(err, { status: 429 });
+    }
+
+    const effectiveCount = requestedCount;
 
     // Topic (første mappe-navn hvis muligt)
     let topic = "pensum";
+    const topicStartedAt = nowMs();
     if (scopeFolderIds.length > 0) {
       const { data: f } = await admin
         .from("folders")
@@ -586,8 +646,10 @@ export async function POST(req: NextRequest) {
         .maybeSingle();
       if ((f as any)?.name) topic = String((f as any).name);
     }
+    metrics.topicLookupMs = nowMs() - topicStartedAt;
 
     // Filer i scope
+    const filesStartedAt = nowMs();
     let filesQ = admin
       .from("files")
       .select("id,name,original_name,folder_id,created_at,extraction_quality,extraction_meta")
@@ -599,6 +661,7 @@ export async function POST(req: NextRequest) {
 
     const { data: files, error: filesErr } = await filesQ;
     if (filesErr) console.error("[generate-mc-batch] files error:", filesErr);
+    metrics.filesLookupMs = nowMs() - filesStartedAt;
 
     const fileRows = (files ?? []) as FileRow[];
     const fileById = new Map(fileRows.map((row) => [String(row.id), row]));
@@ -614,16 +677,19 @@ export async function POST(req: NextRequest) {
     }
 
     {
-      const scopeFileIds = fileRows.map((f) => String(f.id)).filter(Boolean).slice(0, 80);
-      if (scopeFileIds.length > 0) {
+      const scopeFileIds = fileRows.map((f) => String(f.id)).filter(Boolean).slice(0, MC_SCOPE_DOC_CHUNK_COUNT_MAX_FILES);
+      if (scopeFileIds.length > 0 && fileRows.length <= MC_SCOPE_DOC_CHUNK_COUNT_MAX_FILES) {
         const countStartedAt = nowMs();
         const { count } = await admin
           .from("doc_chunks")
           .select("id", { count: "exact", head: true })
           .eq("owner_id", ownerId)
           .in("file_id", scopeFileIds);
-        metrics.totalRetrievalMs += nowMs() - countStartedAt;
+        const countElapsedMs = nowMs() - countStartedAt;
+        metrics.scopeChunkCountMs = countElapsedMs;
+        metrics.totalRetrievalMs += countElapsedMs;
         metrics.docChunksInScope = n0(count);
+        metrics.docChunkCountMode = "exact";
       }
     }
 
@@ -767,6 +833,7 @@ Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddr
 VIGTIGT:
 - Du MÅ KUN bruge den kontekst, du får (KILDE-afsnit).
 - Skriv alt på dansk.
+- Returnér kun ét kompakt JSON-objekt. Ingen markdown, ingen kodeblok, ingen ekstra tekst.
 
 KRAV:
 - 1 spørgsmål
@@ -775,6 +842,10 @@ KRAV:
 - Plausible distraktorer (ikke åbenlyse)
 - Spørgsmålet skal være specifikt og må ikke være en ren gentagelse af samme faktasæt.
 - Undgå at gøre "samme korrekt-svar" til løsning igen og igen.
+- "question" skal være kort: maks 1 sætning og helst under 160 tegn.
+- Hver "options[].text" skal være kort: helst under 10 ord.
+- "explanation" skal være meget kort: maks 1 kort sætning og helst under 160 tegn.
+- Brug ingen ekstra felter.
 
 Returnér gyldig JSON:
 {
@@ -887,10 +958,12 @@ Returnér gyldig JSON:
           openAiAbort.abort("route_openai_timeout");
         }, MC_OPENAI_CALL_TIMEOUT_MS);
         let completion;
+        let openAiError: any = null;
         try {
           completion = await openai.chat.completions.create(
             {
               model,
+              max_completion_tokens: MC_OPENAI_MAX_COMPLETION_TOKENS,
               response_format: { type: "json_object" },
               messages: [
                 { role: "system", content: systemPrompt },
@@ -900,20 +973,7 @@ Returnér gyldig JSON:
             { signal: openAiAbort.signal },
           );
         } catch (err: any) {
-          const abortReason = String(openAiAbort.signal.reason ?? "").trim();
-          if (openAiAbort.signal.aborted || err?.name === "AbortError" || String(err?.message ?? "").includes("aborted")) {
-            const source = abortReason || "unknown_abort_source";
-            metrics.abortSource = source;
-            console.info("[generate-mc-batch] openai-call-aborted", {
-              requestId,
-              source,
-              batchIndex: planned.batchIndex,
-              attempt,
-              elapsedMs: nowMs() - openAiStartedAt,
-            });
-            throw new Error(`MC OpenAI call aborted by ${source}`);
-          }
-          throw err;
+          openAiError = err;
         } finally {
           clearTimeout(timeoutHandle);
         }
@@ -924,17 +984,60 @@ Returnér gyldig JSON:
         metrics.totalOpenAiMs += openAiDurationMs;
         if (attempt > 0) metrics.retryOpenAiCalls += 1;
 
+        if (openAiError) {
+          const abortReason = String(openAiAbort.signal.reason ?? "").trim();
+          if (
+            openAiAbort.signal.aborted ||
+            openAiError?.name === "AbortError" ||
+            String(openAiError?.message ?? "").includes("aborted")
+          ) {
+            const source = abortReason || "unknown_abort_source";
+            metrics.abortSource = source;
+            console.info("[generate-mc-batch] openai-call-aborted", {
+              requestId,
+              source,
+              batchIndex: planned.batchIndex,
+              attempt,
+              elapsedMs: openAiDurationMs,
+            });
+            throw new Error(`MC OpenAI call aborted by ${source}`);
+          }
+
+          if (isOpenAiOutputLimitError(openAiError)) {
+            metrics.invalidModelOutputCount += 1;
+            console.warn("[generate-mc-batch] invalid-model-output", {
+              requestId,
+              batchIndex: planned.batchIndex,
+              attempt,
+              model,
+              finishReason: "sdk_output_limit_error",
+              parseOk: false,
+              rawLength: 0,
+              questionLength: 0,
+              optionsLength: 0,
+              errorStatus: openAiError?.status ?? null,
+              errorMessage: String(openAiError?.message ?? ""),
+            });
+            continue;
+          }
+
+          throw openAiError;
+        }
+
         const normalizationStartedAt = nowMs();
-        const raw = completion.choices[0]?.message?.content ?? "{}";
+        const raw = completion?.choices?.[0]?.message?.content ?? "{}";
+        const finishReason = completion?.choices?.[0]?.finish_reason ?? null;
 
         type LlmOption = { text?: string; isCorrect?: boolean };
         type LlmPayload = { question?: string; options?: LlmOption[]; explanation?: string };
 
         let payload: LlmPayload = {};
+        let parseOk = true;
         try {
           payload = JSON.parse(raw) as LlmPayload;
         } catch {
           payload = {};
+          parseOk = false;
         }
 
         const q = String(payload.question ?? "").trim();
@@ -942,6 +1045,18 @@ Returnér gyldig JSON:
         const normQ = normalizeQuestion(q);
 
         if (!q || opts.length < 2) {
+          metrics.invalidModelOutputCount += 1;
+          console.warn("[generate-mc-batch] invalid-model-output", {
+            requestId,
+            batchIndex: planned.batchIndex,
+            attempt,
+            model,
+            finishReason,
+            parseOk,
+            rawLength: raw.length,
+            questionLength: q.length,
+            optionsLength: opts.length,
+          });
           metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
           continue;
         }
@@ -1028,6 +1143,7 @@ Returnér gyldig JSON:
 
         avoidNorm.add(normQ);
         if (normA) recentCorrectAnswers.add(normA);
+        if (metrics.timeToFirstAcceptedMs == null) metrics.timeToFirstAcceptedMs = nowMs() - requestStartedAt;
 
         if (items.length >= effectiveCount) break;
       }
@@ -1042,7 +1158,9 @@ Returnér gyldig JSON:
     }
 
     if (lastUsedFileIdInBatch) {
+      const saveStartedAt = nowMs();
       await saveLastUsedFileId(admin, ownerId, scopeKey, lastUsedFileIdInBatch);
+      metrics.saveLastUsedMs += nowMs() - saveStartedAt;
     }
 
     if (items.length === 0) {
@@ -1054,6 +1172,7 @@ Returnér gyldig JSON:
         scopeFolderIds,
         fileCountInScope: metrics.fileCountInScope,
         docChunksInScope: metrics.docChunksInScope,
+        docChunkCountMode: metrics.docChunkCountMode,
         pickedChunkCount: metrics.pickedChunkCount,
         uniquePickedChunkCount,
         totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
@@ -1065,12 +1184,26 @@ Returnér gyldig JSON:
         downweightedChunkReasonCounts: metrics.downweightedChunkReasonCounts,
         abortSource: metrics.abortSource,
         openAiCallCount: metrics.openAiCallCount,
+        invalidModelOutputCount: metrics.invalidModelOutputCount,
         openAiCallDurationsMs: metrics.openAiCallDurationsMs,
         openAiCallCharacters: metrics.openAiCallCharacters,
         totalOpenAiMs: metrics.totalOpenAiMs,
         totalRetrievalMs: metrics.totalRetrievalMs,
         totalPromptBuildMs: metrics.totalPromptBuildMs,
         totalNormalizationMs: metrics.totalNormalizationMs,
+        stageTimingsMs: {
+          topicLookup: metrics.topicLookupMs,
+          filesLookup: metrics.filesLookupMs,
+          scopeChunkCount: metrics.scopeChunkCountMs,
+          retrieval: metrics.totalRetrievalMs,
+          promptBuild: metrics.totalPromptBuildMs,
+          model: metrics.totalOpenAiMs,
+          parsingAndPostProcessing: metrics.totalNormalizationMs,
+          saveLastUsed: metrics.saveLastUsedMs,
+          jobPersist: metrics.jobPersistMs,
+          timeToFirstAccepted: metrics.timeToFirstAcceptedMs,
+          total: totalRequestMs,
+        },
         totalRequestMs,
         sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
         retryOpenAiCalls: metrics.retryOpenAiCalls,
@@ -1086,6 +1219,22 @@ Returnér gyldig JSON:
     }
 
     const quotaConsume = await consumeMcQuota(admin, ownerId, items.length);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-batch] quota-consume", {
+        requestId,
+        ownerId,
+        feature: "mc_generate",
+        requestedCount,
+        effectiveCount,
+        returnedCount: items.length,
+        consumedAmount: items.length,
+        usedBefore: quotaSnapshot.used,
+        usedAfter: quotaConsume.used,
+        monthlyLimit: quotaConsume.limitPerMonth,
+        remainingBefore: quotaSnapshot.remainingThisMonth,
+        remainingAfter: quotaConsume.remainingThisMonth,
+      });
+    }
     if (!quotaConsume.ok) {
       const err: GenerateMcBatchErr = {
         ok: false,
@@ -1101,8 +1250,11 @@ Returnér gyldig JSON:
       return NextResponse.json(err, { status: quotaConsume.status });
     }
 
-    for (const [batchIndex, item] of items.entries()) {
-      await logMcJob(admin, ownerId, {
+    const jobPersistStartedAt = nowMs();
+    await logMcJobs(
+      admin,
+      ownerId,
+      items.map((item, batchIndex) => ({
         source: "generate-mc-batch",
         requestId,
         scopeFolderIds,
@@ -1121,12 +1273,23 @@ Returnér gyldig JSON:
         batchEffectiveCount: effectiveCount,
         plan: quotaConsume.plan,
         mcLimit: quotaConsume.limitPerMonth,
+      })),
+    );
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-batch] jobs-persisted", {
+        requestId,
+        ownerId,
+        jobRowsInserted: items.length,
+        requestedCount,
+        effectiveCount,
       });
     }
+    metrics.jobPersistMs += nowMs() - jobPersistStartedAt;
 
     const resp: GenerateMcBatchOk = {
       ok: true,
       batchId: randomUUID(),
+      requestId,
       requestedCount,
       effectiveCount,
       returnedCount: items.length,
@@ -1141,6 +1304,7 @@ Returnér gyldig JSON:
       scopeFolderIds,
       fileCountInScope: metrics.fileCountInScope,
       docChunksInScope: metrics.docChunksInScope,
+      docChunkCountMode: metrics.docChunkCountMode,
       pickedChunkCount: metrics.pickedChunkCount,
       uniquePickedChunkCount,
       totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
@@ -1154,12 +1318,26 @@ Returnér gyldig JSON:
       maxInFlightOpenAi: metrics.maxInFlightOpenAi,
       abortSource: metrics.abortSource,
       openAiCallCount: metrics.openAiCallCount,
+      invalidModelOutputCount: metrics.invalidModelOutputCount,
       openAiCallDurationsMs: metrics.openAiCallDurationsMs,
       openAiCallCharacters: metrics.openAiCallCharacters,
       totalOpenAiMs: metrics.totalOpenAiMs,
       totalRetrievalMs: metrics.totalRetrievalMs,
       totalPromptBuildMs: metrics.totalPromptBuildMs,
       totalNormalizationMs: metrics.totalNormalizationMs,
+      stageTimingsMs: {
+        topicLookup: metrics.topicLookupMs,
+        filesLookup: metrics.filesLookupMs,
+        scopeChunkCount: metrics.scopeChunkCountMs,
+        retrieval: metrics.totalRetrievalMs,
+        promptBuild: metrics.totalPromptBuildMs,
+        model: metrics.totalOpenAiMs,
+        parsingAndPostProcessing: metrics.totalNormalizationMs,
+        saveLastUsed: metrics.saveLastUsedMs,
+        jobPersist: metrics.jobPersistMs,
+        timeToFirstAccepted: metrics.timeToFirstAcceptedMs,
+        total: totalRequestMs,
+      },
       totalRequestMs,
       sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
       retryOpenAiCalls: metrics.retryOpenAiCalls,
@@ -1190,6 +1368,7 @@ Returnér gyldig JSON:
       totalRequestMs: nowMs() - requestStartedAt,
       fileCountInScope: metrics.fileCountInScope,
       docChunksInScope: metrics.docChunksInScope,
+      docChunkCountMode: metrics.docChunkCountMode,
       pickedChunkCount: metrics.pickedChunkCount,
       uniquePickedChunkCount: new Set(metrics.usedChunkIds).size,
       totalCharactersInPickedChunks: metrics.totalCharactersInPickedChunks,
@@ -1203,11 +1382,25 @@ Returnér gyldig JSON:
       maxInFlightOpenAi: metrics.maxInFlightOpenAi,
       abortSource: metrics.abortSource,
       openAiCallCount: metrics.openAiCallCount,
+      invalidModelOutputCount: metrics.invalidModelOutputCount,
       openAiCallDurationsMs: metrics.openAiCallDurationsMs,
       totalOpenAiMs: metrics.totalOpenAiMs,
       totalRetrievalMs: metrics.totalRetrievalMs,
       totalPromptBuildMs: metrics.totalPromptBuildMs,
       totalNormalizationMs: metrics.totalNormalizationMs,
+      stageTimingsMs: {
+        topicLookup: metrics.topicLookupMs,
+        filesLookup: metrics.filesLookupMs,
+        scopeChunkCount: metrics.scopeChunkCountMs,
+        retrieval: metrics.totalRetrievalMs,
+        promptBuild: metrics.totalPromptBuildMs,
+        model: metrics.totalOpenAiMs,
+        parsingAndPostProcessing: metrics.totalNormalizationMs,
+        saveLastUsed: metrics.saveLastUsedMs,
+        jobPersist: metrics.jobPersistMs,
+        timeToFirstAccepted: metrics.timeToFirstAcceptedMs,
+        total: nowMs() - requestStartedAt,
+      },
       sequentialOpenAiCalls: metrics.sequentialOpenAiCalls,
       retryOpenAiCalls: metrics.retryOpenAiCalls,
       usedFileIds: Array.from(new Set(metrics.usedFileIds)),
@@ -1217,3 +1410,4 @@ Returnér gyldig JSON:
     return NextResponse.json(out, { status });
   }
 }
+

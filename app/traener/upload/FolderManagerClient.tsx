@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type Folder = {
   id: string;
@@ -44,7 +45,24 @@ async function safeJson(res: Response): Promise<any | null> {
   }
 }
 
+function broadcastFolders(nextFolders: Folder[]) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent("notely-folders-changed", {
+      detail: { folders: nextFolders },
+    }),
+  );
+}
+
+function persistFolders(nextFolders: Folder[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem("notely:folders", JSON.stringify(nextFolders));
+  } catch {}
+}
+
 export default function FolderManagerClient({ ownerId, initialFolders, onFoldersChange }: Props) {
+  const router = useRouter();
   const [folders, setFolders] = useState<Folder[]>(initialFolders);
 
   useEffect(() => {
@@ -99,9 +117,12 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = [...folders, data.folder];
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
+      broadcastFolders(nextFolders);
       setNewName("");
       setNewStart("");
       setNewEnd("");
+      router.refresh();
     } catch (err) {
       console.error("create folder error", err);
       setCreateError("Kunne ikke oprette mappen. Prøv igen.");
@@ -157,7 +178,10 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.map((f) => (f.id === data.folder.id ? data.folder : f));
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
+      broadcastFolders(nextFolders);
       setEdit({ mode: "none" });
+      router.refresh();
     } catch (err) {
       console.error("edit folder error", err);
       setEditError("Kunne ikke gemme ændringerne. Prøv igen.");
@@ -206,6 +230,9 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
         const nextFolders = folders.filter((x) => x.id !== id);
         setFolders(nextFolders);
         onFoldersChange?.(nextFolders);
+        persistFolders(nextFolders);
+        broadcastFolders(nextFolders);
+        router.refresh();
         return;
       }
 
@@ -217,6 +244,9 @@ export default function FolderManagerClient({ ownerId, initialFolders, onFolders
       const nextFolders = folders.filter((x) => x.id !== id);
       setFolders(nextFolders);
       onFoldersChange?.(nextFolders);
+      persistFolders(nextFolders);
+      broadcastFolders(nextFolders);
+      router.refresh();
     } catch (err) {
       console.error("delete folder error", err);
       setDeleteError("Kunne ikke slette mappen. Prøv igen.");

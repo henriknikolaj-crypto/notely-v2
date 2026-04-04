@@ -140,8 +140,7 @@ export default async function Page({
       <TrainingScopeCard
         names={scopeNames}
         className="md:hidden"
-        emptyLabel="Vælg en mappe direkte her."
-        helpText={!hasScope ? "Noter er låst, indtil du har valgt en mappe." : undefined}
+        emptyLabel="Vælg en mappe her."
       >
         <FeatureScopePicker selectedNames={scopeNames} selectedScopeIds={scopeFolderIds} initialFolders={folderOptions} />
       </TrainingScopeCard>
@@ -150,7 +149,6 @@ export default async function Page({
         names={scopeNames}
         className="hidden md:block"
         emptyLabel="Vælg en mappe i venstre side."
-        helpText={!hasScope ? "Noter er låst, indtil du har valgt en mappe." : undefined}
       />
 
       <GenerateFromSource

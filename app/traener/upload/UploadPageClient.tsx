@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import UploadClient from "./UploadClient";
 import FolderManagerClient from "./FolderManagerClient";
 
@@ -21,6 +21,10 @@ type Props = {
 
 export default function UploadPageClient({ ownerId, initialFolderId, initialFolders }: Props) {
   const [folders, setFolders] = useState<FolderRow[]>(initialFolders);
+
+  useEffect(() => {
+    setFolders(initialFolders);
+  }, [initialFolders]);
 
   return (
     <>

@@ -1,7 +1,7 @@
 // app/api/generate-mc-question/route.ts
 import "server-only";
 
-import { requireFlowModel } from "@/lib/openai/requireModel";
+import { resolveModelForFeature } from "@/lib/openai/model";
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
@@ -84,6 +84,19 @@ type ChunkRow = {
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MC_SINGLE_CONTEXT_CHAR_LIMIT = 4000;
+const MC_SINGLE_MAX_COMPLETION_TOKENS = 1600;
+
+function isOpenAiOutputLimitError(err: any) {
+  const status = Number(err?.status ?? 0);
+  const message = String(err?.message ?? "").toLowerCase();
+  return (
+    status === 400 &&
+    (message.includes("could not finish the message") ||
+      message.includes("max_tokens") ||
+      message.includes("output limit"))
+  );
+}
 
 function supabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -295,12 +308,18 @@ Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddr
 VIGTIGT:
 - Du MÅ KUN bruge den kontekst, du får (KILDE-afsnit).
 - Skriv alt på dansk.
+- Returnér kun ét kompakt JSON-objekt. Ingen markdown, ingen kodeblok, ingen ekstra tekst.
+- Hold hele JSON-svaret så kort som muligt.
 
 KRAV:
 - 1 spørgsmål
 - 4 svarmuligheder
 - Præcis 1 korrekt
 - Plausible distraktorer (ikke åbenlyse)
+- "question" skal være kort: maks 1 sætning og helst under 160 tegn.
+- Hver "options[].text" skal være kort: helst under 10 ord.
+- "explanation" skal være meget kort: maks 1 kort sætning og helst under 160 tegn.
+- Brug ingen ekstra felter.
 
 Returnér gyldig JSON:
 {
@@ -317,6 +336,15 @@ Returnér gyldig JSON:
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
+  const requestStartedAt = Date.now();
+  const timings = {
+    topicLookupMs: 0,
+    filesLookupMs: 0,
+    retrievalMs: 0,
+    promptBuildMs: 0,
+    modelMs: 0,
+    parsingAndPostProcessingMs: 0,
+  };
 
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -348,6 +376,16 @@ export async function POST(req: NextRequest) {
     const admin = supabaseAdmin();
 
     const quotaSnapshot = await getMcQuotaSnapshot(admin, ownerId);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-question] quota-snapshot", {
+        requestId,
+        ownerId,
+        feature: "mc_generate",
+        usedThisMonth: quotaSnapshot.used,
+        monthlyLimit: quotaSnapshot.limitPerMonth,
+        remainingThisMonth: quotaSnapshot.remainingThisMonth,
+      });
+    }
     if (!quotaSnapshot.ok) {
       const err: GenerateMcErr = {
         ok: false,
@@ -365,6 +403,7 @@ export async function POST(req: NextRequest) {
 
     // topic (første mappe-navn hvis muligt)
     let topic = "pensum";
+    const topicStartedAt = Date.now();
     if (scopeFolderIds.length > 0) {
       const { data: f } = await admin
         .from("folders")
@@ -374,8 +413,10 @@ export async function POST(req: NextRequest) {
         .maybeSingle();
       if ((f as any)?.name) topic = String((f as any).name);
     }
+    timings.topicLookupMs = Date.now() - topicStartedAt;
 
     // files
+    const filesStartedAt = Date.now();
     let filesQ = admin
       .from("files")
       .select("id,name,original_name,folder_id,created_at")
@@ -386,6 +427,7 @@ export async function POST(req: NextRequest) {
     if (scopeFolderIds.length > 0) filesQ = filesQ.in("folder_id", scopeFolderIds);
 
     const { data: files } = await filesQ;
+    timings.filesLookupMs = Date.now() - filesStartedAt;
     const fileRows = (files ?? []) as FileRow[];
 
     if (fileRows.length === 0) {
@@ -415,6 +457,7 @@ export async function POST(req: NextRequest) {
       const f = rotated[i];
       const fileId = String(f.id);
 
+      const poolStartedAt = Date.now();
       const { data: pool } = await admin
         .from("doc_chunks")
         .select("id,file_id,content,created_at,source_url")
@@ -422,6 +465,7 @@ export async function POST(req: NextRequest) {
         .eq("file_id", fileId)
         .order("created_at", { ascending: false })
         .limit(400);
+      timings.retrievalMs += Date.now() - poolStartedAt;
 
       const usable = (pool ?? [])
         .filter((r: any) => String(r?.content ?? "").trim().length > 0)
@@ -440,6 +484,7 @@ export async function POST(req: NextRequest) {
         const f = rotated[i];
         const fileId = String(f.id);
 
+        const poolStartedAt = Date.now();
         const { data: pool } = await admin
           .from("doc_chunks")
           .select("id,file_id,content,created_at,source_url")
@@ -447,6 +492,7 @@ export async function POST(req: NextRequest) {
           .eq("file_id", fileId)
           .order("created_at", { ascending: false })
           .limit(400);
+        timings.retrievalMs += Date.now() - poolStartedAt;
 
         const usable = (pool ?? []).filter((r: any) => String(r?.content ?? "").trim().length > 0);
         if (usable.length < 1) continue;
@@ -470,11 +516,12 @@ export async function POST(req: NextRequest) {
     const usedFileTitle = fileTitle(chosenFile);
 
     const usedChunkIds = chosenChunks.map((c) => String(c.id));
+    const promptStartedAt = Date.now();
     const contextText = chosenChunks
       .map((c) => `KILDE: ${usedFileTitle}\n\n${String(c.content ?? "").trim()}`)
       .filter(Boolean)
       .join("\n\n---\n\n")
-      .slice(0, 7000);
+      .slice(0, MC_SINGLE_CONTEXT_CHAR_LIMIT);
 
     const citations: McCitationPayload[] = chosenChunks.map((c) => ({
       chunkId: String(c.id),
@@ -502,34 +549,72 @@ export async function POST(req: NextRequest) {
     ]
       .filter(Boolean)
       .join("\n");
+    timings.promptBuildMs = Date.now() - promptStartedAt;
 
-    const model = requireFlowModel("trainer");
+    const model = resolveModelForFeature("mc");
 
-    const completion = await openai.chat.completions.create({
-      model,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-    });
+    const modelStartedAt = Date.now();
+    let completion;
+    try {
+      completion = await openai.chat.completions.create({
+        model,
+        max_completion_tokens: MC_SINGLE_MAX_COMPLETION_TOKENS,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+      });
+    } catch (err: any) {
+      timings.modelMs = Date.now() - modelStartedAt;
+      if (isOpenAiOutputLimitError(err)) {
+        console.warn("[generate-mc-question] invalid-model-output", {
+          requestId,
+          model,
+          finishReason: "sdk_output_limit_error",
+          parseOk: false,
+          rawLength: 0,
+          questionLength: 0,
+          optionsLength: 0,
+          errorStatus: err?.status ?? null,
+          errorMessage: String(err?.message ?? ""),
+        });
+        const out: GenerateMcErr = { ok: false, error: "Kunne ikke generere spørgsmål (tomt output).", requestId };
+        return NextResponse.json(out, { status: 500 });
+      }
+      throw err;
+    }
+    timings.modelMs = Date.now() - modelStartedAt;
 
+    const parseStartedAt = Date.now();
     const raw = completion.choices[0]?.message?.content ?? "{}";
+    const finishReason = completion.choices[0]?.finish_reason ?? null;
 
     type LlmOption = { text?: string; isCorrect?: boolean };
     type LlmPayload = { question?: string; options?: LlmOption[]; explanation?: string };
 
     let payload: LlmPayload = {};
+    let parseOk = true;
     try {
       payload = JSON.parse(raw) as LlmPayload;
     } catch {
       payload = {};
+      parseOk = false;
     }
 
     const q = String(payload.question ?? "").trim();
     const opts = Array.isArray(payload.options) ? payload.options : [];
 
     if (!q || opts.length < 2) {
+      console.warn("[generate-mc-question] invalid-model-output", {
+        requestId,
+        model,
+        finishReason,
+        parseOk,
+        rawLength: raw.length,
+        questionLength: q.length,
+        optionsLength: opts.length,
+      });
       const err: GenerateMcErr = { ok: false, error: "Kunne ikke generere spørgsmål (tomt output).", requestId };
       return NextResponse.json(err, { status: 500 });
     }
@@ -559,6 +644,19 @@ export async function POST(req: NextRequest) {
     }));
 
     const quotaConsume = await consumeMcQuota(admin, ownerId, 1);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-question] quota-consume", {
+        requestId,
+        ownerId,
+        feature: "mc_generate",
+        consumedAmount: 1,
+        usedBefore: quotaSnapshot.used,
+        usedAfter: quotaConsume.used,
+        monthlyLimit: quotaConsume.limitPerMonth,
+        remainingBefore: quotaSnapshot.remainingThisMonth,
+        remainingAfter: quotaConsume.remainingThisMonth,
+      });
+    }
     if (!quotaConsume.ok) {
       const err: GenerateMcErr = {
         ok: false,
@@ -591,6 +689,13 @@ export async function POST(req: NextRequest) {
       plan: quotaConsume.plan,
       mcLimit: quotaConsume.limitPerMonth,
     });
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-mc-question] jobs-persisted", {
+        requestId,
+        ownerId,
+        jobRowsInserted: 1,
+      });
+    }
 
     const out: GenerateMcOk = {
       ok: true,
@@ -603,9 +708,39 @@ export async function POST(req: NextRequest) {
       meta: { requestId, usedChunkIds, usedFileTitle },
     };
 
+    timings.parsingAndPostProcessingMs = Date.now() - parseStartedAt;
+    console.info("[generate-mc-question] timings", {
+      requestId,
+      scopeFolderIds,
+      model,
+      usedFileId,
+      usedChunkIds,
+      stageTimingsMs: {
+        topicLookup: timings.topicLookupMs,
+        filesLookup: timings.filesLookupMs,
+        retrieval: timings.retrievalMs,
+        promptBuild: timings.promptBuildMs,
+        model: timings.modelMs,
+        parsingAndPostProcessing: timings.parsingAndPostProcessingMs,
+        total: Date.now() - requestStartedAt,
+      },
+    });
+
     return NextResponse.json(out, { status: 200 });
   } catch (err: any) {
     console.error("[generate-mc-question] route error:", err);
+    console.info("[generate-mc-question] timings", {
+      requestId,
+      stageTimingsMs: {
+        topicLookup: timings.topicLookupMs,
+        filesLookup: timings.filesLookupMs,
+        retrieval: timings.retrievalMs,
+        promptBuild: timings.promptBuildMs,
+        model: timings.modelMs,
+        parsingAndPostProcessing: timings.parsingAndPostProcessingMs,
+        total: Date.now() - requestStartedAt,
+      },
+    });
     const out: GenerateMcErr = { ok: false, error: err?.message ?? "Uventet fejl i generate-mc-question.", requestId };
     const status = out.error === "Unauthorized" ? 401 : 500;
     return NextResponse.json(out, { status });

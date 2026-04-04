@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 type FolderRow = {
@@ -24,6 +24,12 @@ function parseScope(raw: string | null) {
     .filter(Boolean);
 }
 
+function readLiveSearchParams(sp: ReturnType<typeof useSearchParams>, pendingSearch: string | null) {
+  if (pendingSearch != null) return new URLSearchParams(pendingSearch);
+  if (typeof window !== "undefined") return new URLSearchParams(window.location.search);
+  return new URLSearchParams(sp?.toString() ?? "");
+}
+
 function buildUrl(pathname: string, sp: URLSearchParams, patch: Record<string, string | null | undefined>) {
   const params = new URLSearchParams(sp.toString());
 
@@ -44,6 +50,7 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
   const pathname = usePathname() || "/traener";
   const sp = useSearchParams();
   const router = useRouter();
+  const pendingSearchRef = useRef<string | null>(null);
   const isDemoRoute = pathname.startsWith("/traener/ux");
   const isDemoMode = isDemoRoute || sp?.get("demo") === "1" || sp?.get("demo") === "true";
   const validFolderIds = useMemo(() => new Set(folders.map((folder) => folder.id)), [folders]);
@@ -62,6 +69,11 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
     return isDemoMode ? parsed : parsed.filter((id) => validFolderIds.has(id));
   }, [isDemoMode, scopeRaw, validFolderIds]);
   const scopeSet = useMemo(() => new Set(scopeIds), [scopeIds]);
+  const searchParamsKey = sp?.toString() ?? "";
+
+  useEffect(() => {
+    pendingSearchRef.current = null;
+  }, [searchParamsKey]);
   const effectiveFolders = useMemo(() => {
     if (!isDemoMode) return folders;
     return [{ id: DEMO_SCOPE_ID, name: DEMO_SCOPE_NAME, parent_id: null, start_date: null, end_date: null, archived_at: null }];
@@ -93,15 +105,17 @@ export default function TrainingSidebarFolders({ folders }: { folders: FolderRow
 
   function toggleScope(folderId: string) {
     if (isDemoMode) return;
-    const next = new Set(scopeSet);
+    const liveSearchParams = readLiveSearchParams(sp, pendingSearchRef.current);
+    const next = new Set(parseScope(liveSearchParams.get("scope")));
     if (next.has(folderId)) next.delete(folderId);
     else next.add(folderId);
 
     const nextScope = Array.from(next.values()).join(",");
 
-    const url = buildUrl(pathname, new URLSearchParams(sp?.toString() ?? ""), {
+    const url = buildUrl(pathname, liveSearchParams, {
       scope: nextScope || null,
     });
+    pendingSearchRef.current = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
 
     router.push(url, { scroll: false });
   }

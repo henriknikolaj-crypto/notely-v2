@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
@@ -31,6 +31,19 @@ function toggleScopeHref(pathname: string, searchParams: URLSearchParams, select
   return qs ? `${pathname}?${qs}` : pathname;
 }
 
+function readLiveSearchParams(searchParams: ReturnType<typeof useSearchParams>, pendingSearch: string | null) {
+  if (pendingSearch != null) return new URLSearchParams(pendingSearch);
+  if (typeof window !== "undefined") return new URLSearchParams(window.location.search);
+  return new URLSearchParams(searchParams?.toString() ?? "");
+}
+
+function parseScopeIdsFromParams(searchParams: URLSearchParams) {
+  return (searchParams.get("scope") ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
 export default function FeatureScopePicker({
   selectedNames,
   selectedScopeIds = [],
@@ -40,6 +53,7 @@ export default function FeatureScopePicker({
   const pathname = usePathname() || "/";
   const searchParams = useSearchParams();
   const router = useRouter();
+  const pendingSearchRef = useRef<string | null>(null);
 
   const [open, setOpen] = useState(false);
   const loading = false;
@@ -54,6 +68,11 @@ export default function FeatureScopePicker({
   }, [selectedNames]);
 
   const selectedSet = useMemo(() => new Set(selectedScopeIds), [selectedScopeIds]);
+  const searchParamsKey = searchParams?.toString() ?? "";
+
+  useEffect(() => {
+    pendingSearchRef.current = null;
+  }, [searchParamsKey]);
 
   return (
     <div className="mt-3 space-y-3">
@@ -105,7 +124,11 @@ export default function FeatureScopePicker({
                   key={folder.id}
                   type="button"
                   onClick={() => {
-                    router.push(toggleScopeHref(pathname, new URLSearchParams(searchParams.toString()), selectedScopeIds, folder.id), {
+                    const liveSearchParams = readLiveSearchParams(searchParams, pendingSearchRef.current);
+                    const liveSelectedScopeIds = parseScopeIdsFromParams(liveSearchParams);
+                    const nextHref = toggleScopeHref(pathname, liveSearchParams, liveSelectedScopeIds, folder.id);
+                    pendingSearchRef.current = nextHref.includes("?") ? nextHref.slice(nextHref.indexOf("?") + 1) : "";
+                    router.push(nextHref, {
                       scroll: false,
                     });
                   }}

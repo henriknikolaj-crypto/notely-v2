@@ -1,6 +1,7 @@
 // app/api/folders/[id]/route.ts
 import "server-only";
 
+import { revalidatePath } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
@@ -77,6 +78,9 @@ export async function PATCH(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "DB_UPDATE_FAILED", error: "Kunne ikke gemme ændringer." }, { status: 500 });
   }
   if (!updated) return NextResponse.json({ ok: false, code: "NOT_FOUND", error: "Folderen findes ikke." }, { status: 404 });
+
+  revalidatePath("/traener", "layout");
+  revalidatePath("/traener/upload");
 
   return NextResponse.json({ ok: true, folder: updated }, { status: 200 });
 }
@@ -207,6 +211,9 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     console.error("[folders/:id DELETE] archive error", archErr);
     return NextResponse.json({ ok: false, code: "DB_UPDATE_FAILED", error: "Kunne ikke slette mappen." }, { status: 500 });
   }
+
+  revalidatePath("/traener", "layout");
+  revalidatePath("/traener/upload");
 
   return NextResponse.json({ ok: true, mode: force ? "purge" : "safe", meta: { filesCount, childFoldersCount } }, { status: 200 });
 }

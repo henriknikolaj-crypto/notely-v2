@@ -24,6 +24,32 @@ function formatUsage(feature: FeatureQuota | undefined, fallbackUnlimited = fals
   return limit == null ? "Ubegrænset" : `${used} / ${limit}`;
 }
 
+function getSetUsage(usedRaw: number, limitRaw: number | null) {
+  const normalizedUsed = Math.max(0, usedRaw);
+  if (typeof limitRaw !== "number" || limitRaw <= 0) {
+    return { usedSets: Math.floor(normalizedUsed / 10), limitSets: null as number | null };
+  }
+
+  const limitSets = Math.floor(limitRaw / 10);
+  const remainingRaw = Math.max(0, limitRaw - normalizedUsed);
+  const remainingSets = Math.floor(remainingRaw / 10);
+  const usedSets = Math.max(0, limitSets - remainingSets);
+
+  return { usedSets: Math.min(usedSets, limitSets), limitSets };
+}
+
+function formatSetUsage(feature: FeatureQuota | undefined, fallbackUnlimited = false) {
+  if (fallbackUnlimited) return "Ubegrænset";
+
+  const usedRaw = typeof feature?.usedThisMonth === "number" ? feature.usedThisMonth : 0;
+  const limitRaw = typeof feature?.limitPerMonth === "number" ? feature.limitPerMonth : null;
+  const { usedSets, limitSets } = getSetUsage(usedRaw, limitRaw);
+
+  if (limitSets == null) return `${usedSets} sæt`;
+
+  return `${usedSets} / ${limitSets} sæt`;
+}
+
 function normalizeQuotaError(err: unknown) {
   const msg = String((err as any)?.message ?? err ?? "").trim().toLowerCase();
   if (!msg) return "Forbrug opdateres snart.";
@@ -69,8 +95,8 @@ export default function KontoUsageSection({
   const rows = [
     { label: "Upload", value: formatUsage(data?.import, false) },
     { label: "Træner", value: formatUsage(data?.trainer_round, isPaid) },
-    { label: "Multiple Choice", value: formatUsage(data?.mc_generate, isPaid) },
-    { label: "Flashcards", value: formatUsage(data?.flashcards_generate, isPaid) },
+    { label: "Multiple Choice", value: formatSetUsage(data?.mc_generate, isPaid) },
+    { label: "Flashcards", value: formatSetUsage(data?.flashcards_generate, isPaid) },
   ];
 
   return (

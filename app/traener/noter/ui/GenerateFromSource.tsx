@@ -2,10 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeSanitize from "rehype-sanitize";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import FocusNoteContent from "@/app/notes/ui/FocusNoteContent";
+import ResumeNoteContent from "@/app/notes/ui/ResumeNoteContent";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type FileOption = {
@@ -230,7 +229,7 @@ export default function GenerateFromSource(props: Props) {
   }
 
   const noFilesMessage = !hasScope
-    ? "Vælg mindst ét fag / en mappe i venstre side for at se dine filer her."
+    ? "Vælg en mappe for at se filer og generere noter."
     : "Der er ingen filer i de valgte mapper endnu. Upload materiale først, og kom så tilbage hertil for at lave resumé eller fokus-noter.";
 
   const markdownText = note?.content ?? "";
@@ -343,26 +342,11 @@ export default function GenerateFromSource(props: Props) {
 
           <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-relaxed text-neutral-900">
             {markdownText.trim() ? (
-              <div className="prose prose-sm max-w-none break-words prose-headings:mt-3 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 prose-strong:font-semibold prose-code:before:content-[''] prose-code:after:content-['']">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeSanitize]}
-                  components={{
-                    pre: ({ children }) => (
-                      <pre className="overflow-auto rounded-lg border border-neutral-200 bg-white px-3 py-2 text-[12px] leading-relaxed">
-                        {children}
-                      </pre>
-                    ),
-                    code: ({ children }) => (
-                      <code className="rounded bg-white px-1 py-0.5 text-[12px]">
-                        {children}
-                      </code>
-                    ),
-                  }}
-                >
-                  {markdownText}
-                </ReactMarkdown>
-              </div>
+              mode === "golden" ? (
+                <FocusNoteContent content={markdownText} />
+              ) : (
+                <ResumeNoteContent content={markdownText} />
+              )
             ) : (
               <span className="text-xs text-neutral-500">
                 (Ingen indhold returneret fra API’et.)
