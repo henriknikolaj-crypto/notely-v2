@@ -9,8 +9,12 @@ import { createClient } from "@supabase/supabase-js";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
+import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
+import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
+import { parseQuestionListOutput, type QuestionOutputDiagnostics } from "@/lib/learning/question-output";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
+import { compactWeakPointTargetsForPrompt, truncateContextForQuestionPrompt, type WeakPointTarget } from "@/lib/trainer/generate-question";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -60,6 +64,8 @@ type ExamGenerateOk = {
     biasApplied: boolean;
     focusTargets: Array<{ key: string; label: string }>;
     weakSessionCount: number;
+    structuredFocusSessionCount?: number;
+    legacyFocusSessionCount?: number;
   };
 };
 
@@ -87,10 +93,12 @@ type ChunkRow = {
   source_url?: string | null;
 };
 
-type WeakPointTarget = {
-  key: string;
-  label: string;
-  action?: string;
+type ExamGenerationStrategyKey = "weakest_primary" | "weakest_simplified" | "normal_fallback" | "normal";
+
+type ExamGenerationAttemptDiagnostic = QuestionOutputDiagnostics & {
+  strategy: ExamGenerationStrategyKey;
+  attempt: number;
+  rejectReason: "content_missing" | "filtered_out";
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -167,49 +175,6 @@ function normalizeQuestion(s: string) {
     .trim();
 }
 
-function normalizeWeakPointTarget(raw: unknown): WeakPointTarget | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const obj = raw as Record<string, unknown>;
-  const keyRaw = String(obj.key ?? "").trim();
-  const labelRaw = String(obj.label ?? "").trim();
-  const actionRaw = String(obj.action ?? "").trim();
-
-  const key = keyRaw || labelRaw.toLowerCase().replace(/\s+/g, "_").slice(0, 80);
-  const label = labelRaw || keyRaw.replace(/_/g, " ");
-  if (!key || !label) return null;
-
-  const out: WeakPointTarget = { key, label };
-  if (actionRaw) out.action = actionRaw;
-  return out;
-}
-
-function deriveFocusTargetsFromWeakSessions(rows: Array<{ metadata: any }>): WeakPointTarget[] {
-  const acc = new Map<string, { target: WeakPointTarget; weight: number }>();
-
-  for (let i = 0; i < rows.length; i++) {
-    const weight = i < 10 ? 2 : 1;
-    const metadata = rows[i]?.metadata as Record<string, unknown> | null;
-    const weakRaw = metadata?.weak_points;
-    if (!Array.isArray(weakRaw)) continue;
-
-    for (const item of weakRaw) {
-      const normalized = normalizeWeakPointTarget(item);
-      if (!normalized) continue;
-      const existing = acc.get(normalized.key);
-      if (existing) {
-        existing.weight += weight;
-      } else {
-        acc.set(normalized.key, { target: normalized, weight });
-      }
-    }
-  }
-
-  return Array.from(acc.values())
-    .sort((a, b) => b.weight - a.weight)
-    .slice(0, 2)
-    .map((x) => x.target);
-}
-
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
 
@@ -249,6 +214,9 @@ export async function POST(req: NextRequest) {
     }
     let focusTargets: WeakPointTarget[] = [];
     let weakSessionCount = 0;
+    let structuredFocusSessionCount = 0;
+    let legacyFocusSessionCount = 0;
+    let finalPromptFocusTargets: WeakPointTarget[] = [];
 
     // Auth: session-first, read-only route client
     let ownerId = "";
@@ -333,17 +301,23 @@ export async function POST(req: NextRequest) {
     if (effectiveFocusMode === "weakest" && focusScopeFolderId) {
       const { data: weakRows } = await admin
         .from("exam_sessions")
-        .select("created_at,metadata")
+        .select("created_at,metadata,meta,source_type,score")
         .eq("owner_id", ownerId)
         .eq("folder_id", focusScopeFolderId)
-        .in("source_type", ["trainer", "simulator"])
-        .not("metadata->weak_points", "is", null)
+        .in("source_type", ["trainer", "simulator", "oral"])
         .order("created_at", { ascending: false })
-        .limit(25);
+        .limit(40);
 
-      const weakRowsArr = (weakRows ?? []) as Array<{ metadata: any }>;
-      weakSessionCount = weakRowsArr.length;
-      focusTargets = deriveFocusTargetsFromWeakSessions(weakRowsArr);
+      const weakRowsArr = (weakRows ?? []) as LearningFocusSessionRow[];
+      const derivedFocus = deriveFocusTargetsFromLearningSignals(weakRowsArr, 2);
+      weakSessionCount = derivedFocus.contributing_session_count;
+      structuredFocusSessionCount = derivedFocus.structured_session_count;
+      legacyFocusSessionCount = derivedFocus.legacy_session_count;
+      focusTargets = derivedFocus.targets.map((target) => ({
+        key: target.key,
+        label: target.label,
+        ...(target.suggested_action ? { action: target.suggested_action } : {}),
+      }));
       if (focusTargets.length === 0) {
         effectiveFocusMode = "normal";
       }
@@ -406,7 +380,17 @@ export async function POST(req: NextRequest) {
       const nonEmpty = poolRows.filter((r) => (r.content ?? "").trim().length > 0);
       if (nonEmpty.length === 0) continue;
 
-      const take = shuffle(nonEmpty).slice(0, Math.min(perFile, nonEmpty.length));
+      const queryForRanking = [
+        difficulty,
+        ...focusTargets.flatMap((target) => [target.label, target.action ?? ""]).filter(Boolean),
+      ].join(" ");
+      const take =
+        effectiveFocusMode === "weakest" && focusTargets.length > 0
+          ? rankChunksForPrompt(nonEmpty, queryForRanking)
+              .slice(0, Math.min(Math.max(perFile * 2, perFile), nonEmpty.length))
+              .map((item) => item.chunk)
+              .slice(0, Math.min(perFile, nonEmpty.length))
+          : shuffle(nonEmpty).slice(0, Math.min(perFile, nonEmpty.length));
       if (take.length === 0) continue;
 
       usedFileIds.push(fileId);
@@ -431,8 +415,8 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const contextText = parts.join("\n").slice(0, 16000).trim();
-    if (!contextText) {
+    const baseContextText = parts.join("\n").slice(0, 16000).trim();
+    if (!baseContextText) {
       const err: ExamGenerateErr = {
         ok: false,
         error: "Ingen kontekst fundet (doc_chunks). Tjek at upload/parse er kørt.",
@@ -448,16 +432,7 @@ export async function POST(req: NextRequest) {
       avoidQuestions.length > 0
         ? `\nUNDGÅ at gentage nogen af disse spørgsmål (nøjagtigt eller næsten):\n- ${avoidQuestions.join("\n- ")}\n`
         : "";
-    const focusBiasBlock =
-      effectiveFocusMode === "weakest" && focusTargets.length > 0
-        ? [
-            `Fokusér især på: ${focusTargets.map((t) => t.label).join(", ")}. Spørgsmålene skal træne disse områder.`,
-            ...focusTargets
-              .map((t) => (t.action ? `Hint - ${t.label}: ${t.action}` : ""))
-              .filter(Boolean),
-          ].join("\n")
-        : "";
-    const biasApplied = effectiveFocusMode === "weakest" && focusTargets.length > 0;
+    let finalBiasApplied = false;
 
     const systemPrompt = `
 Du skriver skriftlige eksamensspørgsmål på dansk.
@@ -473,72 +448,158 @@ FORMAT:
 {"questions":[{"id":"q1","prompt":"..."},{"id":"q2","prompt":"..."}, ...]}
 `.trim();
 
-    const userPrompt = [
-      `Antal spørgsmål: ${count}`,
-      `Sværhedsgrad: ${difficulty}`,
-      focusBiasBlock,
-      avoidBlock.trim(),
-      "",
-      "KONTEKST (brug dette som eneste grundlag):",
-      "",
-      contextText,
-      "",
-      "Lav nu spørgsmålene.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-
     let outQuestions: ExamQuestion[] = [];
+    const generationAttemptDiagnostics: ExamGenerationAttemptDiagnostic[] = [];
+    const weakestBiasAvailable = effectiveFocusMode === "weakest" && focusTargets.length > 0;
+    const generationStrategies: Array<{
+      key: ExamGenerationStrategyKey;
+      focusMode: FocusMode;
+      focusTargets: WeakPointTarget[];
+      contextText: string;
+      attempts: number;
+    }> = weakestBiasAvailable
+      ? [
+          {
+            key: "weakest_primary",
+            focusMode: "weakest",
+            focusTargets,
+            contextText: truncateContextForQuestionPrompt(baseContextText, 13000),
+            attempts: 2,
+          },
+          {
+            key: "weakest_simplified",
+            focusMode: "weakest",
+            focusTargets: compactWeakPointTargetsForPrompt(focusTargets, 1),
+            contextText: truncateContextForQuestionPrompt(baseContextText, 9000),
+            attempts: 1,
+          },
+          {
+            key: "normal_fallback",
+            focusMode: "normal",
+            focusTargets: [],
+            contextText: truncateContextForQuestionPrompt(baseContextText, 13000),
+            attempts: 1,
+          },
+        ]
+      : [
+          {
+            key: "normal",
+            focusMode: effectiveFocusMode,
+            focusTargets,
+            contextText: truncateContextForQuestionPrompt(baseContextText, 14000),
+            attempts: 2,
+          },
+        ];
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const { completion } = await createChatCompletion(openai, {
-        feature: "simulator",
-        purpose: "json",
-        modelOverride: model,
-        payload: {
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          temperature: 0.9,
-          top_p: 0.95,
-        },
-      });
+    generationLoop: for (const strategy of generationStrategies) {
+      const strategyFocusBiasBlock =
+        strategy.focusMode === "weakest" && strategy.focusTargets.length > 0
+          ? [
+              `Fokusér især på: ${strategy.focusTargets.map((t) => t.label).join(", ")}. Spørgsmålene skal træne disse områder.`,
+              ...strategy.focusTargets
+                .map((t) => (t.action ? `Hint - ${t.label}: ${t.action}` : ""))
+                .filter(Boolean),
+            ].join("\n")
+          : "";
+      const strategyBiasApplied = strategy.focusMode === "weakest" && strategy.focusTargets.length > 0;
+      const strategyUserPrompt = [
+        `Antal spørgsmål: ${count}`,
+        `Sværhedsgrad: ${difficulty}`,
+        strategyFocusBiasBlock,
+        avoidBlock.trim(),
+        "",
+        "KONTEKST (brug dette som eneste grundlag):",
+        "",
+        strategy.contextText,
+        "",
+        "Lav nu spørgsmålene.",
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      const raw = completion.choices[0]?.message?.content ?? "{}";
-      let payload: any = {};
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        payload = {};
-      }
+      for (let attempt = 0; attempt < strategy.attempts; attempt += 1) {
+        const { completion } = await createChatCompletion(openai, {
+          feature: "simulator",
+          purpose: "json",
+          modelOverride: model,
+          payload: {
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: strategyUserPrompt },
+            ],
+            temperature: 0.9,
+            top_p: 0.95,
+          },
+        });
 
-      const arr = Array.isArray(payload?.questions) ? payload.questions : [];
-      const cleaned: ExamQuestion[] = [];
+        const raw = completion.choices[0]?.message?.content ?? "";
+        const finishReason = completion.choices[0]?.finish_reason ?? null;
+        const parsedOutput = parseQuestionListOutput(raw, finishReason);
+        const cleaned: ExamQuestion[] = [];
 
-      for (const q of arr) {
-        const prompt = String(q?.prompt ?? "").trim();
-        if (!prompt) continue;
+        for (const promptValue of parsedOutput.questions) {
+          const prompt = String(promptValue ?? "").trim();
+          if (!prompt) continue;
 
-        const norm = normalizeQuestion(prompt);
-        if (avoidNorm.has(norm)) continue;
+          const norm = normalizeQuestion(prompt);
+          if (avoidNorm.has(norm)) continue;
+          if (cleaned.some((x) => normalizeQuestion(x.prompt) === norm)) continue;
 
-        // undgå duplicates i samme response
-        if (cleaned.some((x) => normalizeQuestion(x.prompt) === norm)) continue;
+          cleaned.push({ id: "tmp", prompt });
+          if (cleaned.length >= count) break;
+        }
 
-        cleaned.push({ id: "tmp", prompt });
-        if (cleaned.length >= count) break;
-      }
+        if (cleaned.length > 0) {
+          outQuestions = cleaned;
+          effectiveFocusMode = strategy.focusMode;
+          finalPromptFocusTargets = strategy.focusTargets;
+          finalBiasApplied = strategyBiasApplied;
+          break generationLoop;
+        }
 
-      if (cleaned.length > 0) {
-        outQuestions = cleaned;
-        break;
+        const rejectReason: ExamGenerationAttemptDiagnostic["rejectReason"] =
+          parsedOutput.questions.length > 0 ? "filtered_out" : "content_missing";
+        const diagnostic: ExamGenerationAttemptDiagnostic = {
+          ...parsedOutput.diagnostics,
+          strategy: strategy.key,
+          attempt: attempt + 1,
+          rejectReason,
+        };
+        generationAttemptDiagnostics.push(diagnostic);
+        if (process.env.NODE_ENV !== "production") {
+          console.warn("[exam/generate] invalid-model-output", {
+            requestId,
+            model,
+            strategy: strategy.key,
+            attempt: attempt + 1,
+            finishReason,
+            rawLength: diagnostic.rawLength,
+            rawPreview: diagnostic.rawPreview,
+            parseOk: diagnostic.parseOk,
+            extractedFrom: diagnostic.extractedFrom,
+            contentMissing: diagnostic.contentMissing,
+            questionCount: diagnostic.questionCount,
+            rejectReason,
+          });
+        }
       }
     }
 
     if (outQuestions.length === 0) {
-      const err: ExamGenerateErr = { ok: false, error: "Modellen returnerede tomt/ufuldstændigt output.", requestId };
+      const err: ExamGenerateErr = {
+        ok: false,
+        error: "Modellen returnerede tomt/ufuldstændigt output.",
+        requestId,
+        ...(process.env.NODE_ENV !== "production"
+          ? {
+              debug: {
+                focusMode: effectiveFocusMode,
+                attempts: generationAttemptDiagnostics.slice(-4),
+              },
+            }
+          : {}),
+      };
       return NextResponse.json(err, { status: 500 });
     }
 
@@ -561,9 +622,11 @@ FORMAT:
         usedChunkIds,
         maxContextChunks,
         focusMode: effectiveFocusMode,
-        biasApplied,
-        focusTargets: focusTargets.map((t) => ({ key: t.key, label: t.label })),
+        biasApplied: finalBiasApplied,
+        focusTargets: finalPromptFocusTargets.map((t) => ({ key: t.key, label: t.label })),
         weakSessionCount,
+        structuredFocusSessionCount,
+        legacyFocusSessionCount,
       },
     };
 
