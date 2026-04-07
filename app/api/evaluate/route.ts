@@ -8,8 +8,19 @@ import { enforceRateLimit } from "@/lib/rateLimit";
 import { type NotelyFlow } from "@/lib/openai/requireModel";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
+import {
+  buildFeedbackV2,
+  deriveWeakPointTargetsFromFeedbackV2,
+  normalizeWeakPointTargets,
+  type FeedbackV2,
+} from "@/lib/learning/feedback";
+import { buildDanskTrainerPromptAddendum, inferDanskTrainerTask } from "@/lib/dansk/evaluator";
+import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
+import { buildMatematikTrainerPromptAddendum, inferMatematikTrainerTask } from "@/lib/matematik/evaluator";
+import { buildOkonomiTrainerPromptAddendum, inferOkonomiTrainerTask } from "@/lib/okonomi/evaluator";
 import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
+import { buildSamfundTrainerPromptAddendum, inferSamfundTrainerTask } from "@/lib/samfund/evaluator";
 import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
 import { scopeKeyFromFolderIds } from "@/lib/trainer/generate-question";
 import { ensureProfile } from "@/lib/server/ensureProfile";
@@ -57,11 +68,21 @@ type EvalRequest = {
 type EvalJson = {
   score?: number | string;
   overall?: string;
+  summary?: string;
   strengths?: unknown;
   improvements?: unknown;
   next_steps?: unknown;
+  next_best_action?: unknown;
+  issues?: unknown;
+  task_coverage?: unknown;
+  taskCoverage?: unknown;
+  citations?: unknown;
   weak_points?: unknown;
   weakPoints?: unknown;
+  feedback_v2?: unknown;
+  feedbackV2?: unknown;
+  learning_signals?: unknown;
+  learningSignals?: unknown;
   meta?: { weak_points?: unknown; weakPoints?: unknown } | null;
   metadata?: { weak_points?: unknown; weakPoints?: unknown } | null;
   feedback_meta?: { weak_points?: unknown; weakPoints?: unknown } | null;
@@ -88,43 +109,201 @@ function ensureStringArray(value: unknown): string[] {
   return s ? [s] : [];
 }
 
-type WeakPoint = {
-  key: string;
-  label: string;
-  action?: string;
+const TRAINER_SUMMARY_FALLBACK = "Overordnet et fint, men kort svar.";
+
+type SummarySanitizationResult = {
+  text: string;
+  sanitized: boolean;
+  reason: string | null;
 };
 
-function normalizeWeakPoints(value: unknown): WeakPoint[] {
-  if (!Array.isArray(value)) return [];
+type TrainerScoreCalibrationResult = {
+  rawScore: number;
+  normalizedScore: number;
+  repaired: boolean;
+  reason: string | null;
+};
 
-  const out: WeakPoint[] = [];
-  const seen = new Set<string>();
+function hasTerminalSentence(text: string) {
+  return /[.!?]["')\]]*\s*$/.test(text);
+}
 
-  for (const item of value) {
-    if (typeof item === "string") {
-      const label = item.trim();
-      if (!label) continue;
-      const key = label.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ key, label });
-      continue;
-    }
+function findLastSentenceBoundary(text: string) {
+  const matches = [...text.matchAll(/[.!?](?=(?:["')\]]|\s|$))/g)];
+  if (!matches.length) return -1;
+  const last = matches[matches.length - 1];
+  return typeof last.index === "number" ? last.index + last[0].length : -1;
+}
 
-    if (!item || typeof item !== "object") continue;
-    const obj = item as Record<string, unknown>;
-    const rawKey = String(obj.key ?? "").trim().toLowerCase();
-    const rawLabel = String(obj.label ?? obj.text ?? obj.key ?? "").trim();
-    const rawAction = String(obj.action ?? "").trim();
-    const key = rawKey || rawLabel.toLowerCase();
-    const label = rawLabel || rawKey;
-    if (!key || !label) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(rawAction ? { key, label, action: rawAction } : { key, label });
+function looksLikeBrokenSentenceTail(text: string) {
+  return /\b(og|eller|men|at|som|med|for|på|af|om|i|til|fra|et|en|den|det|de|der|dette|disse|bruge|anvende|bruger|anvender)\s*$/i.test(
+    text,
+  );
+}
+
+function sanitizeTrainerSummary(raw: unknown, fallback = TRAINER_SUMMARY_FALLBACK): SummarySanitizationResult {
+  const original = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (!original) return { text: fallback, sanitized: true, reason: "empty" };
+
+  let text = original;
+  let sanitized = false;
+  let reason: string | null = null;
+
+  if (/(?:\.{3,}|…)\s*$/.test(text)) {
+    text = text.replace(/(?:\.{3,}|…)\s*$/g, "").trim();
+    sanitized = true;
+    reason = "trim_ellipsis";
   }
 
-  return out;
+  if (!text) return { text: fallback, sanitized: true, reason: reason ?? "empty_after_trim" };
+
+  if (/[,:;\-]\s*$/.test(text)) {
+    text = text.replace(/[,:;\-]\s*$/g, "").trim();
+    sanitized = true;
+    reason = reason ?? "trim_dangling_punctuation";
+  }
+
+  if (!hasTerminalSentence(text)) {
+    const lastBoundary = findLastSentenceBoundary(text);
+    if (lastBoundary > 0 && lastBoundary < text.length) {
+      text = text.slice(0, lastBoundary).trim();
+      sanitized = true;
+      reason = reason ?? "clip_to_last_sentence";
+    } else if (looksLikeBrokenSentenceTail(text)) {
+      text = "";
+      sanitized = true;
+      reason = reason ?? "drop_broken_tail";
+    } else if (text.split(/\s+/).filter(Boolean).length >= 4) {
+      text = `${text}.`;
+      sanitized = true;
+      reason = reason ?? "append_period";
+    }
+  }
+
+  if (!text || text.length < 12 || looksLikeBrokenSentenceTail(text)) {
+    return { text: fallback, sanitized: true, reason: reason ?? "fallback_summary" };
+  }
+
+  return { text, sanitized, reason };
+}
+
+function resolveTrainerEvaluator(question: string) {
+  const okonomiTaskType = inferOkonomiTrainerTask(question);
+  if (okonomiTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "okonomi",
+        task_type: okonomiTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildOkonomiTrainerPromptAddendum(okonomiTaskType),
+    };
+  }
+
+  const samfundTaskType = inferSamfundTrainerTask(question);
+  if (samfundTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "samfund",
+        task_type: samfundTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildSamfundTrainerPromptAddendum(samfundTaskType),
+    };
+  }
+
+  const danskTaskType = inferDanskTrainerTask(question);
+  if (danskTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "dansk",
+        task_type: danskTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildDanskTrainerPromptAddendum(danskTaskType),
+    };
+  }
+
+  const matematikTaskType = inferMatematikTrainerTask(question);
+  if (matematikTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "matematik",
+        task_type: matematikTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildMatematikTrainerPromptAddendum(matematikTaskType),
+    };
+  }
+
+  return {
+    evaluator: resolveEvaluatorDefinition("trainer"),
+    promptAddendum: "",
+  };
+}
+
+function inferTrainerScoreFloor(args: {
+  summary: string;
+  strengths: string[];
+  signals: FeedbackV2;
+}) {
+  const summary = args.summary.toLowerCase();
+  const highIssues = args.signals.issues.filter((issue) => issue.severity === "high").length;
+  const mediumIssues = args.signals.issues.filter((issue) => issue.severity === "medium").length;
+  const issueCount = args.signals.issues.length;
+  const strengthsCount = args.strengths.length;
+
+  const clearlyVeryWeak =
+    /\b(meget mangelfuld|meget svag|utilstrækkelig|besvarer ikke|rammer ikke spørgsmålet|alvorlige mangler)\b/i.test(
+      summary,
+    );
+  const clearlyAtLeastMiddling =
+    /\b(godt svar|god besvarelse|fornuftigt|solidt|relevant|rammer spørgsmålet|dækker hovedpointen|middel)\b/i.test(
+      summary,
+    );
+
+  if (clearlyVeryWeak) return 0;
+  if (highIssues === 0 && mediumIssues === 0 && strengthsCount >= 2) return 70;
+  if (highIssues === 0 && mediumIssues <= 1 && strengthsCount >= 2) return 70;
+  if (highIssues === 0 && mediumIssues <= 2 && strengthsCount >= 1) return 55;
+  if (highIssues === 0 && issueCount <= 3 && clearlyAtLeastMiddling) return 55;
+  return 0;
+}
+
+function calibrateTrainerScore(rawScore: number, args: {
+  summary: string;
+  strengths: string[];
+  signals: FeedbackV2;
+}): TrainerScoreCalibrationResult {
+  const normalizedRaw = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0;
+  const inferredFloor = inferTrainerScoreFloor(args);
+  const looksLikeTenScale = normalizedRaw > 0 && normalizedRaw <= 12;
+  const isClearlyTooLow = inferredFloor > 0 && normalizedRaw < inferredFloor && normalizedRaw <= inferredFloor - 20;
+
+  if (!isClearlyTooLow) {
+    return {
+      rawScore: normalizedRaw,
+      normalizedScore: normalizedRaw,
+      repaired: false,
+      reason: null,
+    };
+  }
+
+  if (looksLikeTenScale) {
+    return {
+      rawScore: normalizedRaw,
+      normalizedScore: Math.min(100, Math.max(normalizedRaw * 10, inferredFloor)),
+      repaired: true,
+      reason: "trainer_low_score_looks_like_10_scale",
+    };
+  }
+
+  return {
+    rawScore: normalizedRaw,
+    normalizedScore: inferredFloor,
+    repaired: true,
+    reason: "trainer_structured_feedback_floor",
+  };
 }
 
 async function readJsonBody<T>(req: NextRequest) {
@@ -464,7 +643,7 @@ export async function POST(req: NextRequest) {
     const includeBackground = flow === "trainer" ? true : includeBackgroundClient;
 
     // Auth: session først, getUser kun som fallback
-    let mode: "auth" | "dev" = "auth";
+    const mode: "auth" | "dev" = "auth";
     const authStartedAt = nowMs();
     try {
       sb = await supabaseServerRoute();
@@ -736,34 +915,88 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
     const promptBuildStartedAt = nowMs();
+    const trainerEvaluatorResolution = flow === "trainer" ? resolveTrainerEvaluator(question) : null;
+    const evaluator = trainerEvaluatorResolution?.evaluator ?? resolveEvaluatorDefinition(flow);
+    const trainerPromptAddendum =
+      flow === "trainer"
+        ? [
+            "",
+            "Trainer-stabilisering:",
+            '- "score" er ALTID en procentscore fra 0 til 100. Det er IKKE 10-skala, IKKE 7-trins-skala og IKKE et punkttal ud af 10.',
+            "- Brug disse ankre for score:",
+            "  - 85-100 = meget staerkt svar",
+            "  - 70-84 = godt svar med mindre mangler",
+            "  - 55-69 = nogenlunde / middel",
+            "  - 35-54 = svagt men delvist daekkende",
+            "  - 0-34 = meget mangelfuldt",
+            "- Ingen ellipser.",
+            "- Ingen afbrudte saetninger.",
+            "- Alle tekstfelter skal vaere hele, afsluttede saetninger.",
+            trainerEvaluatorResolution?.promptAddendum ?? "",
+          ].join("\n")
+        : "";
     const systemPrompt = `
-Du er dansk eksamenscensor.
+Du er faglig evaluator for Notely.
+
+Evaluator-kontrakt:
+- subject_family = "${evaluator.subject_family}"
+- task_type = "${evaluator.task_type}"
+- assessment_mode = "${evaluator.assessment_mode}"
 
 Du får:
-- et eksamensspørgsmål ("question"),
-- et elevsvar ("answer"),
-- og evt. baggrundsmateriale ("context") fra elevens eget pensum.
+- et eksamensspørgsmål ("question")
+- et elevsvar ("answer")
+- og evt. baggrundsmateriale ("context") fra elevens eget pensum
 
-Hvis "context" er tomt, skal du vurdere ud fra almindelige faglige kriterier og spørgsmålet.
+Hvis "context" er tomt, skal du stadig vurdere spørgsmålet og svaret fagligt.
+Flyt vurderingen over i struktureret læringsfeedback. Vær konkret, handlingsrettet og kortfattet.
 
-Du skal:
-- give en score i procent (0–100)
-- give kort, præcis feedback på dansk.
-
-Du SKAL svare som gyldigt JSON med PRÆCIS disse felter:
-
+Du SKAL svare som gyldigt JSON med disse felter:
 {
   "score": number,
   "overall": string,
+  "summary": string,
+  "subject_family": string,
+  "task_type": string,
+  "assessment_mode": string,
   "strengths": string[],
   "improvements": string[],
   "next_steps": string[],
-  "weak_points": [{ "key": string, "label": string, "action"?: string }]
+  "next_best_action": string,
+  "issues": [
+    {
+      "code": string,
+      "category": string,
+      "severity": "low" | "medium" | "high",
+      "title": string,
+      "diagnosis": string,
+      "why_it_matters": string,
+      "evidence": string[],
+      "repair": string,
+      "example": string
+    }
+  ],
+  "weak_points": [{ "key": string, "label": string, "action"?: string }],
+  "task_coverage": {
+    "summary": string
+  },
+  "citations": [
+    {
+      "chunk_id": string,
+      "title": string,
+      "why": string
+    }
+  ]
 }
 
-Felter "strengths", "improvements" og "next_steps" SKAL indeholde mindst ét element.
-Feltet "weak_points" SKAL altid være et array (kan være tomt).
-Ingen tekst uden for JSON-objektet.
+Krav:
+- strengths, improvements og next_steps skal have mindst 1 element.
+- next_best_action skal være ét konkret næste skridt.
+- issues skal have 1-4 elementer med læringsværdi. Brug tomt array kun hvis svaret reelt er uden tydelige mangler.
+- weak_points må gerne afledes af issues, men skal være korte.
+- Brug kun citations/task_coverage hvis det er relevant.
+- Ingen tekst uden for JSON-objektet.
+${trainerPromptAddendum}
 `.trim();
 
     const userPayload = { question, answer, context: contextText };
@@ -796,11 +1029,17 @@ Ingen tekst uden for JSON-objektet.
     }
 
     const scoreRaw = typeof parsedEval.score === "number" ? parsedEval.score : Number(parsedEval.score);
-    const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(100, Math.round(scoreRaw))) : 0;
+    const parsedScore = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(100, Math.round(scoreRaw))) : 0;
 
-    const overall =
+    const rawOverall =
       (parsedEval.overall && String(parsedEval.overall).trim().replace(/\s+/g, " ")) ||
-      "Overordnet et fint, men kort svar.";
+      (parsedEval.summary && String(parsedEval.summary).trim().replace(/\s+/g, " ")) ||
+      TRAINER_SUMMARY_FALLBACK;
+    const summarySanitization =
+      flow === "trainer"
+        ? sanitizeTrainerSummary(rawOverall, TRAINER_SUMMARY_FALLBACK)
+        : { text: rawOverall, sanitized: false, reason: null as string | null };
+    const overall = summarySanitization.text;
 
     let strengths = ensureStringArray(parsedEval.strengths);
     let improvements = ensureStringArray(parsedEval.improvements);
@@ -818,15 +1057,77 @@ Ingen tekst uden for JSON-objektet.
       parsedEval.evaluation_meta?.weakPoints ??
       parsedEval.feedback_structured?.weak_points ??
       parsedEval.feedback_structured?.weakPoints;
-    const normalizedWeakPoints = normalizeWeakPoints(weakPointsRaw);
+    const normalizedWeakPoints = normalizeWeakPointTargets(weakPointsRaw);
 
     if (!strengths.length) strengths = ["Du rammer noget af kernen, men kan blive mere præcis."];
     if (!improvements.length) improvements = ["Uddyb centrale begreber og knyt dem tydeligere til spørgsmålet."];
     if (!nextSteps.length) nextSteps = ["Skriv et forbedret svar, hvor du bruger 2–3 nøglebegreber og et konkret eksempel."];
 
-    const feedbackText = buildTrainerFeedbackText({
-      overall,
+    const learningSignals = buildFeedbackV2({
+      evaluator,
+      sourceType: flow,
+      raw:
+        parsedEval.feedback_v2 ??
+        parsedEval.feedbackV2 ??
+        parsedEval.learning_signals ??
+        parsedEval.learningSignals,
+      summary: parsedEval.summary ?? parsedEval.overall,
       strengths,
+      issues: parsedEval.issues,
+      nextBestAction: parsedEval.next_best_action,
+      taskCoverage: parsedEval.task_coverage ?? parsedEval.taskCoverage,
+      citations: parsedEval.citations ?? citations,
+      improvements,
+      nextSteps,
+      weakPoints: normalizedWeakPoints,
+      fallbackSummary: overall,
+      fallbackNextBestAction: nextSteps[0],
+    });
+    const structuredSummarySanitization =
+      flow === "trainer"
+        ? sanitizeTrainerSummary(learningSignals.summary, overall)
+        : { text: learningSignals.summary, sanitized: false, reason: null as string | null };
+    const stabilizedLearningSignals =
+      structuredSummarySanitization.text !== learningSignals.summary
+        ? { ...learningSignals, summary: structuredSummarySanitization.text }
+        : learningSignals;
+    const scoreCalibration =
+      flow === "trainer"
+        ? calibrateTrainerScore(parsedScore, {
+            summary: stabilizedLearningSignals.summary,
+            strengths: stabilizedLearningSignals.strengths,
+            signals: stabilizedLearningSignals,
+          })
+        : {
+            rawScore: parsedScore,
+            normalizedScore: parsedScore,
+            repaired: false,
+            reason: null as string | null,
+          };
+    const score = scoreCalibration.normalizedScore;
+    const backwardCompatibleWeakPoints =
+      normalizedWeakPoints.length > 0
+        ? normalizedWeakPoints
+        : deriveWeakPointTargetsFromFeedbackV2(stabilizedLearningSignals);
+
+    if (process.env.NODE_ENV !== "production" && flow === "trainer") {
+      console.info("[evaluate][trainer][stability]", {
+        requestId,
+        evaluatorId: evaluator.id,
+        subjectFamily: evaluator.subject_family,
+        taskType: evaluator.task_type,
+        rawScore: scoreCalibration.rawScore,
+        normalizedScore: scoreCalibration.normalizedScore,
+        scoreRepairApplied: scoreCalibration.repaired,
+        scoreRepairReason: scoreCalibration.reason,
+        summarySanitized: summarySanitization.sanitized || structuredSummarySanitization.sanitized,
+        summarySanitizationReason: summarySanitization.reason ?? structuredSummarySanitization.reason,
+      });
+    }
+
+    const feedbackText = buildTrainerFeedbackText({
+      overall: stabilizedLearningSignals.summary || overall,
+      strengths: stabilizedLearningSignals.strengths,
       improvements,
       nextSteps,
     });
@@ -850,7 +1151,9 @@ Ingen tekst uden for JSON-objektet.
       citations,
       mode,
       round_id: flow === "trainer" ? roundId : null,
-      weak_points: normalizedWeakPoints,
+      weak_points: backwardCompatibleWeakPoints,
+      feedback_v2: stabilizedLearningSignals,
+      learning_signals: stabilizedLearningSignals,
     };
 
     const resolvedTrackingFolderId = usedFolderId ?? sessionFolderId;
@@ -925,6 +1228,9 @@ Ingen tekst uden for JSON-objektet.
         requestId,
         score,
         feedback: feedbackText,
+        feedback_v2: stabilizedLearningSignals,
+        learning_signals: stabilizedLearningSignals,
+        weak_points: backwardCompatibleWeakPoints,
         usedFileId,
         citations,
       },

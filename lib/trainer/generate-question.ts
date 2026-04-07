@@ -1,5 +1,7 @@
 import "server-only";
 
+import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
+
 export type Difficulty = "easy" | "medium" | "hard";
 export type FocusMode = "normal" | "weakest";
 
@@ -27,6 +29,24 @@ export type WeakPointTarget = {
   label: string;
   action?: string;
 };
+
+function collapseWhitespace(value: string) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function shortenSentence(value: string, maxChars: number) {
+  const text = collapseWhitespace(value);
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+
+  const clipped = text.slice(0, maxChars);
+  const punctuationIdx = Math.max(clipped.lastIndexOf("."), clipped.lastIndexOf("!"), clipped.lastIndexOf("?"));
+  if (punctuationIdx >= 48) return clipped.slice(0, punctuationIdx + 1).trim();
+
+  const spaceIdx = clipped.lastIndexOf(" ");
+  const end = spaceIdx >= 48 ? spaceIdx : maxChars;
+  return `${clipped.slice(0, end).trim()}.`;
+}
 
 export function pickDifficulty(raw: any): Difficulty {
   return raw === "easy" || raw === "hard" ? raw : "medium";
@@ -88,31 +108,38 @@ export function normalizeWeakPointTarget(raw: unknown): WeakPointTarget | null {
   return out;
 }
 
-export function deriveFocusTargetsFromWeakSessions(rows: Array<{ metadata: any }>): WeakPointTarget[] {
-  const acc = new Map<string, { target: WeakPointTarget; weight: number }>();
+export function deriveFocusTargetsFromWeakSessions(rows: LearningFocusSessionRow[]): WeakPointTarget[] {
+  return deriveFocusTargetsFromLearningSignals(rows, 2).targets.map((target) => ({
+    key: target.key,
+    label: target.label,
+    ...(target.suggested_action ? { action: target.suggested_action } : {}),
+  }));
+}
 
-  for (let i = 0; i < rows.length; i++) {
-    const weight = i < 10 ? 2 : 1;
-    const metadata = rows[i]?.metadata as Record<string, unknown> | null;
-    const weakRaw = metadata?.weak_points;
-    if (!Array.isArray(weakRaw)) continue;
+export function compactWeakPointTargetsForPrompt(targets: WeakPointTarget[], limit = 1): WeakPointTarget[] {
+  return targets.slice(0, Math.max(1, limit)).map((target) => ({
+    key: target.key,
+    label: shortenSentence(target.label, 72) || target.label,
+    ...(target.action ? { action: shortenSentence(target.action, 140) } : {}),
+  }));
+}
 
-    for (const item of weakRaw) {
-      const normalized = normalizeWeakPointTarget(item);
-      if (!normalized) continue;
-      const existing = acc.get(normalized.key);
-      if (existing) {
-        existing.weight += weight;
-      } else {
-        acc.set(normalized.key, { target: normalized, weight });
-      }
-    }
+export function truncateContextForQuestionPrompt(contextText: string, maxChars: number) {
+  const text = String(contextText ?? "").trim();
+  if (!text || text.length <= maxChars) return text;
+
+  const separator = "\n\n---\n\n";
+  const boundary = text.lastIndexOf(separator, maxChars);
+  if (boundary >= Math.max(800, Math.floor(maxChars * 0.55))) {
+    return text.slice(0, boundary).trim();
   }
 
-  return Array.from(acc.values())
-    .sort((a, b) => b.weight - a.weight)
-    .slice(0, 2)
-    .map((x) => x.target);
+  const lineBoundary = text.lastIndexOf("\n", maxChars);
+  if (lineBoundary >= Math.max(600, Math.floor(maxChars * 0.5))) {
+    return text.slice(0, lineBoundary).trim();
+  }
+
+  return text.slice(0, maxChars).trim();
 }
 
 export function buildGenerateQuestionPrompts(args: {

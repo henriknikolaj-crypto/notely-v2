@@ -3,7 +3,7 @@
 
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import SidebarRecentMC from "../mc/SidebarRecentMC";
 import SidebarFlashcards from "../flashcards/SidebarFlashcards";
 import SidebarQuotaBox from "./SidebarQuotaBox";
@@ -105,8 +105,10 @@ export default function TrainingSidebarStats({
   const pathname = usePathname() || "";
   const sp = useSearchParams();
   const [mcTotal, setMcTotal] = useState(0);
+  const [liveEvals, setLiveEvals] = useState<Eval[] | null>(null);
+  const [liveEvalCount, setLiveEvalCount] = useState<number | null>(null);
 
-  const evals = latestEvals ?? [];
+  const evals = liveEvals ?? latestEvals ?? [];
 
   const notes = latestNotes ?? [];
   const allResumeNotes = notes.filter((n) => classifyNote(n) === "resume");
@@ -118,7 +120,12 @@ export default function TrainingSidebarStats({
 
   const totalResume = typeof resumeCount === "number" ? resumeCount : allResumeNotes.length;
   const totalFocus = typeof focusCount === "number" ? focusCount : allFocusNotes.length;
-  const totalEvals = typeof evalCount === "number" ? evalCount : evals.length;
+  const totalEvals =
+    typeof liveEvalCount === "number"
+      ? liveEvalCount
+      : typeof evalCount === "number"
+        ? evalCount
+        : evals.length;
 
   const scopeFromUrl = sp?.get("scope") || undefined;
   const folderFromUrl = sp?.get("folder") || undefined;
@@ -141,6 +148,60 @@ export default function TrainingSidebarStats({
 
   // --- Hoved-Træner-siden (/traener) ---
   const isTrainerMain = pathname === "/traener" || pathname === "/traener/";
+
+  useEffect(() => {
+    if (!isTrainerMain) return;
+
+    let cancelled = false;
+
+    const refreshRecentEvals = async () => {
+      try {
+        const params = new URLSearchParams();
+        if (folderFromUrl) params.set("folder", folderFromUrl);
+        const qs = params.toString();
+        const res = await fetch(qs ? `/api/recent-evals?${qs}` : "/api/recent-evals", {
+          method: "GET",
+          cache: "no-store",
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || cancelled) return;
+
+        const items = Array.isArray((data as any).items)
+          ? (data as any).items.map((item: any) => ({
+              id: String(item?.id ?? ""),
+              score:
+                typeof item?.score === "number"
+                  ? item.score
+                  : Number.isFinite(Number(item?.score))
+                    ? Number(item?.score)
+                    : null,
+              created_at: typeof item?.when === "string" ? item.when : typeof item?.created_at === "string" ? item.created_at : null,
+            })).filter((item: Eval) => item.id)
+          : [];
+
+        setLiveEvals(items);
+        setLiveEvalCount(
+          typeof (data as any).total === "number"
+            ? (data as any).total
+            : items.length,
+        );
+      } catch {
+        // keep server-rendered fallback
+      }
+    };
+
+    void refreshRecentEvals();
+
+    const onChanged = () => {
+      void refreshRecentEvals();
+    };
+
+    window.addEventListener("trainer:evaluations-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("trainer:evaluations-changed", onChanged);
+    };
+  }, [isTrainerMain, folderFromUrl]);
 
   if (isTrainerMain) {
     return (

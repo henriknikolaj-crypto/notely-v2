@@ -23,10 +23,11 @@ type FolderRow = {
 export async function GET(req: NextRequest) {
   try {
     const { sb, id: ownerId } = await requireUser(req);
+    const folderId = String(req.nextUrl.searchParams.get("folder") ?? "").trim() || null;
 
     // 1) Hent de seneste træner-evalueringer (ikke-MC)
     // trainer = source_type IS NULL eller 'trainer'
-    const { data: sessions, error } = await sb
+    let sessionsQuery = sb
       .from("exam_sessions")
       .select("id, created_at, score, folder_id, source_type")
       .eq("owner_id", ownerId)
@@ -34,13 +35,34 @@ export async function GET(req: NextRequest) {
       .order("created_at", { ascending: false })
       .limit(5);
 
+    if (folderId) {
+      sessionsQuery = sessionsQuery.eq("folder_id", folderId);
+    }
+
+    const { data: sessions, error } = await sessionsQuery;
+
     if (error) {
       console.error("[recent-evals] query error:", error);
       // Bevidst “blød” fejl (UI kan bare vise tom liste)
-      return NextResponse.json({ ok: true, items: [] }, { status: 200 });
+      return NextResponse.json({ ok: true, items: [], total: 0 }, { status: 200 });
     }
 
     const rows = (sessions ?? []) as SessionRow[];
+
+    let countQuery = sb
+      .from("exam_sessions")
+      .select("id", { count: "exact", head: true })
+      .eq("owner_id", ownerId)
+      .or("source_type.is.null,source_type.eq.trainer");
+
+    if (folderId) {
+      countQuery = countQuery.eq("folder_id", folderId);
+    }
+
+    const { count, error: countError } = await countQuery;
+    if (countError) {
+      console.error("[recent-evals] count query error:", countError);
+    }
 
     // 2) Saml unikke folder_id'er
     const folderIds = Array.from(
@@ -51,17 +73,17 @@ export async function GET(req: NextRequest) {
       ),
     );
 
-    // 3) Hent folder-navne fra training_folders
+    // 3) Hent folder-navne fra folders
     const folderMap = new Map<string, string | null>();
 
     if (folderIds.length > 0) {
       const { data: folders, error: foldersError } = await sb
-        .from("training_folders")
+        .from("folders")
         .select("id, name")
         .in("id", folderIds);
 
       if (foldersError) {
-        console.error("[recent-evals] training_folders lookup error:", foldersError);
+        console.error("[recent-evals] folders lookup error:", foldersError);
       } else {
         for (const f of (folders ?? []) as FolderRow[]) {
           if (f?.id) folderMap.set(f.id, f.name ?? null);
@@ -77,7 +99,7 @@ export async function GET(req: NextRequest) {
       folder_name: r.folder_id ? folderMap.get(r.folder_id) ?? null : null,
     }));
 
-    return NextResponse.json({ ok: true, items }, { status: 200 });
+    return NextResponse.json({ ok: true, items, total: typeof count === "number" ? count : rows.length }, { status: 200 });
   } catch (err: any) {
     const msg = String(err?.message ?? "");
     const isAuth = msg.toLowerCase().includes("unauthorized");

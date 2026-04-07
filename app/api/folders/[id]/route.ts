@@ -3,8 +3,10 @@ import "server-only";
 
 import { revalidatePath } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import { getOwnerCtx } from "@/lib/auth/owner";
+import { purgeFilesInFolders } from "@/lib/server/file-purge";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,6 +39,45 @@ async function countInTable(sb: any, table: string, where: Record<string, any>):
   }
   const { count } = await q;
   return typeof count === "number" ? count : 0;
+}
+
+function supabaseAdminOrThrow() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+async function listActiveDescendantFolderIds(admin: any, ownerId: string, rootId: string): Promise<string[]> {
+  const { data, error } = await admin
+    .from("folders")
+    .select("id,parent_id")
+    .eq("owner_id", ownerId)
+    .is("archived_at", null);
+
+  if (error) throw error;
+
+  const childrenByParent = new Map<string, string[]>();
+  for (const row of data ?? []) {
+    const id = normStr((row as any)?.id);
+    const parentId = normStr((row as any)?.parent_id);
+    if (!id || !parentId) continue;
+    const bucket = childrenByParent.get(parentId) ?? [];
+    bucket.push(id);
+    childrenByParent.set(parentId, bucket);
+  }
+
+  const descendants: string[] = [];
+  const stack = [...(childrenByParent.get(rootId) ?? [])];
+  while (stack.length > 0) {
+    const nextId = stack.pop();
+    if (!nextId) continue;
+    descendants.push(nextId);
+    const children = childrenByParent.get(nextId);
+    if (children?.length) stack.push(...children);
+  }
+
+  return descendants;
 }
 
 export async function PATCH(req: NextRequest, ctx: Ctx) {
@@ -95,9 +136,17 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   }
   if (!id) return NextResponse.json({ ok: false, code: "MISSING_ID", error: "Mangler id." }, { status: 400 });
 
+  let admin: any;
+  try {
+    admin = supabaseAdminOrThrow();
+  } catch (error) {
+    console.error("[folders/:id DELETE] admin init error", error);
+    return NextResponse.json({ ok: false, code: "SERVER_CONFIG_MISSING", error: "Server config mangler." }, { status: 500 });
+  }
+
   const force = req.nextUrl.searchParams.get("force") === "1";
 
-  const { data: folder, error: fErr } = await sb
+  const { data: folder, error: fErr } = await admin
     .from("folders")
     .select("id,owner_id,archived_at,parent_id")
     .eq("id", id)
@@ -116,78 +165,48 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "FORBIDDEN", error: "Ingen adgang." }, { status: 403 });
   }
 
-  const filesCount = await countInTable(sb, "files", { owner_id: ownerId, folder_id: id });
-  const childFoldersCount = await countInTable(sb, "folders", {
+  const filesCount = await countInTable(admin, "files", { owner_id: ownerId, folder_id: id });
+  const childFoldersCount = await countInTable(admin, "folders", {
     owner_id: ownerId,
     parent_id: id,
     archived_at: null,
   });
 
+  let descendantFolderIds: string[] = [];
   if (force) {
-    const { data: fileRows, error: frErr } = await sb
-      .from("files")
-      .select("id")
-      .eq("owner_id", ownerId)
-      .eq("folder_id", id);
-
-    if (frErr) {
-      console.error("[folders/:id DELETE force] files lookup error", frErr);
-      return NextResponse.json({ ok: false, code: "DB_ERROR", error: "Database-fejl." }, { status: 500 });
+    try {
+      descendantFolderIds = await listActiveDescendantFolderIds(admin, ownerId, id);
+    } catch (error) {
+      console.error("[folders/:id DELETE] descendant lookup error", error);
+      return NextResponse.json({ ok: false, code: "DB_ERROR", error: "Kunne ikke læse under-mapper." }, { status: 500 });
     }
+  }
+  const folderIdsToPurge = force ? [id, ...descendantFolderIds] : [id];
 
-    const fileIds = (fileRows ?? []).map((r: any) => r.id).filter(Boolean);
+  try {
+    await purgeFilesInFolders(admin, { ownerId, folderIds: folderIdsToPurge });
+  } catch (error) {
+    console.error("[folders/:id DELETE] file purge error", error);
+    return NextResponse.json({ ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette filer." }, { status: 500 });
+  }
 
-    if (fileIds.length > 0) {
-      const { error: dcErr } = await sb
-        .from("doc_chunks")
-        .delete()
+  if (force) {
+    if (descendantFolderIds.length > 0) {
+      const { error: archChildrenErr } = await admin
+        .from("folders")
+        .update({ archived_at: new Date().toISOString() })
         .eq("owner_id", ownerId)
-        .in("file_id", fileIds);
+        .in("id", descendantFolderIds)
+        .is("archived_at", null);
 
-      if (dcErr) {
-        console.error("[folders/:id DELETE force] doc_chunks delete error", dcErr);
-        return NextResponse.json({ ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette doc_chunks." }, { status: 500 });
+      if (archChildrenErr) {
+        console.error("[folders/:id DELETE force] archive children error", archChildrenErr);
+        return NextResponse.json({ ok: false, code: "DB_UPDATE_FAILED", error: "Kunne ikke arkivere under-mapper." }, { status: 500 });
       }
-    }
-
-    const { error: delFilesErr } = await sb
-      .from("files")
-      .delete()
-      .eq("owner_id", ownerId)
-      .eq("folder_id", id);
-
-    if (delFilesErr) {
-      console.error("[folders/:id DELETE force] files delete error", delFilesErr);
-      return NextResponse.json({ ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette filer." }, { status: 500 });
-    }
-
-    const { error: archChildrenErr } = await sb
-      .from("folders")
-      .update({ archived_at: new Date().toISOString() })
-      .eq("owner_id", ownerId)
-      .eq("parent_id", id)
-      .is("archived_at", null);
-
-    if (archChildrenErr) {
-      console.error("[folders/:id DELETE force] archive children error", archChildrenErr);
-      return NextResponse.json({ ok: false, code: "DB_UPDATE_FAILED", error: "Kunne ikke arkivere under-mapper." }, { status: 500 });
     }
   } else {
-    if (filesCount > 0) {
-      const { error: mvErr } = await sb
-        .from("files")
-        .update({ folder_id: null })
-        .eq("owner_id", ownerId)
-        .eq("folder_id", id);
-
-      if (mvErr) {
-        console.error("[folders/:id DELETE safe] move files error", mvErr);
-        return NextResponse.json({ ok: false, code: "MOVE_FILES_FAILED", error: "Kunne ikke flytte filer ud af mappen." }, { status: 500 });
-      }
-    }
-
     if (childFoldersCount > 0) {
-      const { error: liftErr } = await sb
+      const { error: liftErr } = await admin
         .from("folders")
         .update({ parent_id: null })
         .eq("owner_id", ownerId)
@@ -201,7 +220,7 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     }
   }
 
-  const { error: archErr } = await sb
+  const { error: archErr } = await admin
     .from("folders")
     .update({ archived_at: new Date().toISOString(), parent_id: null })
     .eq("owner_id", ownerId)
@@ -215,5 +234,16 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   revalidatePath("/traener", "layout");
   revalidatePath("/traener/upload");
 
-  return NextResponse.json({ ok: true, mode: force ? "purge" : "safe", meta: { filesCount, childFoldersCount } }, { status: 200 });
+  return NextResponse.json(
+    {
+      ok: true,
+      mode: force ? "purge" : "safe",
+      meta: {
+        filesCount,
+        childFoldersCount,
+        purgedFolderIds: folderIdsToPurge,
+      },
+    },
+    { status: 200 },
+  );
 }

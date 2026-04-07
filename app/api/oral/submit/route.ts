@@ -7,6 +7,8 @@ import { createClient } from "@supabase/supabase-js";
 import { enforceRateLimit } from "@/lib/rateLimit";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
+import { buildFeedbackV2, deriveWeakPointTargetsFromFeedbackV2, type LearningIssue } from "@/lib/learning/feedback";
+import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
 import { danish7ToScore100, type Danish7Grade } from "@/lib/grading/danish7";
 import { buildOralContext } from "@/lib/oral/context";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
@@ -454,6 +456,60 @@ export async function POST(req: NextRequest) {
       },
     };
 
+    const evaluator = resolveEvaluatorDefinition("oral");
+    const oralIssues: LearningIssue[] = weakPoints.map((point) => ({
+      code: point.key,
+      category: "oral_performance",
+      severity: point.severity ?? "medium",
+      title: point.label,
+      diagnosis: point.summary || `${point.label} er et tydeligt forbedringspunkt i den mundtlige præstation.`,
+      why_it_matters:
+        "Det påvirker, hvor præcist, overbevisende og fagligt sikkert svaret fremstår i den mundtlige situation.",
+      evidence: point.evidence ? [point.evidence] : [],
+      repair:
+        point.next_step ??
+        point.action ??
+        `Arbejd målrettet med ${point.label.toLowerCase()} i næste samtale.`,
+    }));
+    const learningSignals = buildFeedbackV2({
+      evaluator,
+      sourceType: "oral",
+      summary,
+      strengths,
+      issues: oralIssues,
+      nextBestAction: weakPoints[0]?.next_step ?? weakPoints[0]?.action ?? improvements[0],
+      improvements,
+      weakPoints,
+      citations: ctx.citations,
+      fallbackSummary: summary,
+      fallbackNextBestAction:
+        weakPoints[0]?.next_step ??
+        weakPoints[0]?.action ??
+        "Brug ét konkret forbedringspunkt aktivt i dit næste mundtlige svar.",
+    });
+    const backwardCompatibleWeakPoints = deriveWeakPointTargetsFromFeedbackV2(learningSignals);
+    const sessionMeta = {
+      mode: "oral",
+      ...(folderIdsMeta ? { folder_ids: folderIdsMeta } : {}),
+      durationMin,
+      startedAt,
+      endedAt,
+      notes,
+      result: structuredResult,
+      weak_points: backwardCompatibleWeakPoints,
+      feedback_v2: learningSignals,
+      learning_signals: learningSignals,
+      turns: allTurns,
+      transcriptSegmentsLast: transcriptSegments,
+      session_id: sessionId,
+      turn_index: turnIndex,
+      citations: ctx.citations,
+      usedFileId: ctx.usedFileId,
+      contextChunkCount: ctx.contextChunkCount,
+      transcription_model: transcribeModel,
+      evaluation_model: model,
+    };
+
     const { error: insertError } = await admin.from("exam_sessions").insert({
       owner_id: ownerId,
       question: "Mundtlig eksamen (samtale)",
@@ -462,26 +518,8 @@ export async function POST(req: NextRequest) {
       score,
       folder_id: sessionFolderId,
       source_type: "oral",
-      meta: {
-        mode: "oral",
-        ...(folderIdsMeta ? { folder_ids: folderIdsMeta } : {}),
-        durationMin,
-        startedAt,
-        endedAt,
-        notes,
-        result: structuredResult,
-        weak_points: weakPoints,
-        turns: allTurns,
-        // segments for sidste tur (hvis vi fik dem)
-        transcriptSegmentsLast: transcriptSegments,
-        session_id: sessionId,
-        turn_index: turnIndex,
-        citations: ctx.citations,
-        usedFileId: ctx.usedFileId,
-        contextChunkCount: ctx.contextChunkCount,
-        transcription_model: transcribeModel,
-        evaluation_model: model,
-      },
+      meta: sessionMeta,
+      metadata: sessionMeta,
     });
 
     if (insertError) {

@@ -11,17 +11,20 @@ import { quotaTryConsume } from "@/lib/quota/rpc";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { createClient } from "@supabase/supabase-js";
+import { parseSingleQuestionOutput, type QuestionOutputDiagnostics } from "@/lib/learning/question-output";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
 import {
   buildGenerateQuestionPrompts,
   clampInt,
-  deriveFocusTargetsFromWeakSessions,
+  compactWeakPointTargetsForPrompt,
   fileTitle,
   pickDifficulty,
   pickFocusMode,
   scopeKeyFromFolderIds,
+  truncateContextForQuestionPrompt,
   uniqTrimmed,
   type ChunkRow,
   type Difficulty,
@@ -76,6 +79,8 @@ type GenerateQuestionOk = {
     biasApplied: boolean;
     focusTargets: Array<{ key: string; label: string }>;
     weakSessionCount: number;
+    structuredFocusSessionCount?: number;
+    legacyFocusSessionCount?: number;
   };
 };
 
@@ -92,6 +97,14 @@ type GenerateQuestionErr = {
   monthEnd?: string;
   resetAt?: string;
   debug?: any;
+};
+
+type TrainerGenerationStrategyKey = "weakest_primary" | "weakest_simplified" | "normal_fallback" | "normal";
+
+type TrainerGenerationAttemptDiagnostic = QuestionOutputDiagnostics & {
+  strategy: TrainerGenerationStrategyKey;
+  attempt: number;
+  rejectReason: "content_missing" | "too_long";
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -269,6 +282,11 @@ export async function POST(req: NextRequest) {
   let modelForDiagnostics: string | null = null;
   let usedFileTitle: string | null = null;
   let weakSessionCount = 0;
+  let structuredFocusSessionCount = 0;
+  let legacyFocusSessionCount = 0;
+  let generationStrategyUsed: TrainerGenerationStrategyKey | null = null;
+  let generationFallbackUsed = false;
+  let finalPromptFocusTargets: WeakPointTarget[] = [];
   const metrics = {
     authSessionMs: 0,
     ensureProfileMs: 0,
@@ -285,6 +303,7 @@ export async function POST(req: NextRequest) {
     docChunkQueries: 0,
     openAiAttempts: 0,
   };
+  const generationAttemptDiagnostics: TrainerGenerationAttemptDiagnostic[] = [];
 
   const respond = <T extends Record<string, unknown>>(body: T, status: number) => {
     responseStatus = status;
@@ -492,13 +511,12 @@ export async function POST(req: NextRequest) {
       effectiveFocusMode === "weakest" && focusScopeFolderId
         ? admin
             .from("exam_sessions")
-            .select("created_at,metadata")
+            .select("created_at,metadata,meta,source_type,score")
             .eq("owner_id", ownerId)
             .eq("folder_id", focusScopeFolderId)
-            .in("source_type", ["trainer", "simulator"])
-            .not("metadata->weak_points", "is", null)
+            .in("source_type", ["trainer", "simulator", "oral"])
             .order("created_at", { ascending: false })
-            .limit(25)
+            .limit(40)
         : Promise.resolve({ data: null });
 
     // Filer i scope
@@ -524,9 +542,16 @@ export async function POST(req: NextRequest) {
     }
 
     if (effectiveFocusMode === "weakest" && focusScopeFolderId) {
-      const weakRowsArr = (((weakRowsResult as any)?.data ?? []) as Array<{ metadata: any }>);
-      weakSessionCount = weakRowsArr.length;
-      focusTargets = deriveFocusTargetsFromWeakSessions(weakRowsArr);
+      const weakRowsArr = (((weakRowsResult as any)?.data ?? []) as LearningFocusSessionRow[]);
+      const derivedFocus = deriveFocusTargetsFromLearningSignals(weakRowsArr, 2);
+      weakSessionCount = derivedFocus.contributing_session_count;
+      structuredFocusSessionCount = derivedFocus.structured_session_count;
+      legacyFocusSessionCount = derivedFocus.legacy_session_count;
+      focusTargets = derivedFocus.targets.map((target) => ({
+        key: target.key,
+        label: target.label,
+        ...(target.suggested_action ? { action: target.suggested_action } : {}),
+      }));
       if (focusTargets.length === 0) {
         effectiveFocusMode = "normal";
       }
@@ -595,7 +620,11 @@ export async function POST(req: NextRequest) {
       const candidate = filtered.length > 0 ? filtered : null;
       if (!candidate) continue;
 
-      const queryForRanking = [topic, difficulty, ...focusTargets.map((t) => t.label)].filter(Boolean).join(" ");
+      const queryForRanking = [
+        topic,
+        difficulty,
+        ...focusTargets.flatMap((t) => [t.label, t.action ?? ""]).filter(Boolean),
+      ].join(" ");
       const rankedCandidate = rankChunksForPrompt(candidate, queryForRanking);
       chosenFile = f;
       pickedChunks = rankedCandidate
@@ -626,19 +655,19 @@ export async function POST(req: NextRequest) {
     generatedFileId = usedFileId;
     usedFileTitle = fileTitle(chosenFile);
 
-    const contextText = pickedChunks
+    const baseContextText = pickedChunks
       .map((c) => `KILDE: ${usedFileTitle}\n\n${(c.content ?? "").trim()}`)
       .filter(Boolean)
       .join("\n\n---\n\n")
       .slice(0, 11000);
 
-    if (!contextText.trim()) {
+    if (!baseContextText.trim()) {
       const err: GenerateQuestionErr = { ok: false, error: "Kontekst blev tom efter filtrering.", requestId };
       return respond(err, 400);
     }
     metrics.retrievalMs += nowMs() - retrievalStartedAt;
     metrics.selectedChunkCount = pickedChunks.length;
-    metrics.contextChars = contextText.length;
+    metrics.contextChars = baseContextText.length;
 
     const citations: TrainerCitationPayload[] = pickedChunks.map((c) => ({
       chunkId: String(c.id),
@@ -649,59 +678,146 @@ export async function POST(req: NextRequest) {
 
     modelForDiagnostics = resolveModelForFeature("generate_question");
 
-    const promptBuildStartedAt = nowMs();
-    const { systemPrompt, userPrompt, biasApplied } = buildGenerateQuestionPrompts({
-      topic,
-      difficulty,
-      effectiveFocusMode,
-      focusTargets,
-      avoidQuestions,
-      usedFileTitle,
-      contextText,
-    });
-    metrics.promptBuildMs += nowMs() - promptBuildStartedAt;
-
     let finalQuestion = "";
+    let finalBiasApplied = false;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      metrics.openAiAttempts += 1;
-      const messages = [
-        { role: "system" as const, content: systemPrompt },
-        { role: "user" as const, content: userPrompt },
-      ];
+    const weakestBiasAvailable = effectiveFocusMode === "weakest" && focusTargets.length > 0;
+    const generationStrategies: Array<{
+      key: TrainerGenerationStrategyKey;
+      focusMode: FocusMode;
+      focusTargets: WeakPointTarget[];
+      contextText: string;
+      attempts: number;
+    }> = weakestBiasAvailable
+      ? [
+          {
+            key: "weakest_primary",
+            focusMode: "weakest",
+            focusTargets,
+            contextText: truncateContextForQuestionPrompt(baseContextText, 9000),
+            attempts: 2,
+          },
+          {
+            key: "weakest_simplified",
+            focusMode: "weakest",
+            focusTargets: compactWeakPointTargetsForPrompt(focusTargets, 1),
+            contextText: truncateContextForQuestionPrompt(baseContextText, 6200),
+            attempts: 1,
+          },
+          {
+            key: "normal_fallback",
+            focusMode: "normal",
+            focusTargets: [],
+            contextText: truncateContextForQuestionPrompt(baseContextText, 9000),
+            attempts: 1,
+          },
+        ]
+      : [
+          {
+            key: "normal",
+            focusMode: effectiveFocusMode,
+            focusTargets,
+            contextText: truncateContextForQuestionPrompt(baseContextText, 10000),
+            attempts: 3,
+          },
+        ];
 
-      const openAiStartedAt = nowMs();
-      const { completion } = await createChatCompletion(openai, {
-        feature: "generate_question",
-        purpose: "json",
-        modelOverride: modelForDiagnostics,
-        payload: {
-          response_format: { type: "json_object" as const },
-          messages,
-        },
+    generationLoop: for (const strategy of generationStrategies) {
+      const promptBuildStartedAt = nowMs();
+      const { systemPrompt, userPrompt, biasApplied } = buildGenerateQuestionPrompts({
+        topic,
+        difficulty,
+        effectiveFocusMode: strategy.focusMode,
+        focusTargets: strategy.focusTargets,
+        avoidQuestions,
+        usedFileTitle,
+        contextText: strategy.contextText,
       });
-      metrics.openAiMs += nowMs() - openAiStartedAt;
+      metrics.promptBuildMs += nowMs() - promptBuildStartedAt;
 
-      const parseStartedAt = nowMs();
-      const raw = completion.choices?.[0]?.message?.content ?? "{}";
-      let payload: any = {};
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        payload = {};
+      for (let attempt = 0; attempt < strategy.attempts; attempt += 1) {
+        metrics.openAiAttempts += 1;
+        metrics.contextChars = strategy.contextText.length;
+        const messages = [
+          { role: "system" as const, content: systemPrompt },
+          { role: "user" as const, content: userPrompt },
+        ];
+
+        const openAiStartedAt = nowMs();
+        const { completion } = await createChatCompletion(openai, {
+          feature: "generate_question",
+          purpose: "json",
+          modelOverride: modelForDiagnostics,
+          payload: {
+            response_format: { type: "json_object" as const },
+            messages,
+          },
+        });
+        metrics.openAiMs += nowMs() - openAiStartedAt;
+
+        const parseStartedAt = nowMs();
+        const raw = completion.choices?.[0]?.message?.content ?? "";
+        const finishReason = completion.choices?.[0]?.finish_reason ?? null;
+        const parsedOutput = parseSingleQuestionOutput(raw, finishReason);
+        const qText = normalizeQuestionOutput(parsedOutput.question);
+        const rejectReason: TrainerGenerationAttemptDiagnostic["rejectReason"] | null = !qText
+          ? "content_missing"
+          : isTooLongTrainerQuestion(qText)
+            ? "too_long"
+            : null;
+        metrics.parsingMs += nowMs() - parseStartedAt;
+
+        if (rejectReason) {
+          const diagnostic: TrainerGenerationAttemptDiagnostic = {
+            ...parsedOutput.diagnostics,
+            strategy: strategy.key,
+            attempt: attempt + 1,
+            rejectReason,
+          };
+          generationAttemptDiagnostics.push(diagnostic);
+          if (process.env.NODE_ENV !== "production") {
+            console.warn("[generate-question] invalid-model-output", {
+              requestId,
+              model: modelForDiagnostics,
+              strategy: strategy.key,
+              attempt: attempt + 1,
+              finishReason,
+              rawLength: diagnostic.rawLength,
+              rawPreview: diagnostic.rawPreview,
+              parseOk: diagnostic.parseOk,
+              extractedFrom: diagnostic.extractedFrom,
+              contentMissing: diagnostic.contentMissing,
+              questionLength: diagnostic.questionLength,
+              rejectReason,
+            });
+          }
+          continue;
+        }
+
+        finalQuestion = qText;
+        finalBiasApplied = biasApplied;
+        generationStrategyUsed = strategy.key;
+        generationFallbackUsed = strategy.key === "weakest_simplified" || strategy.key === "normal_fallback";
+        effectiveFocusMode = strategy.focusMode;
+        finalPromptFocusTargets = strategy.focusTargets;
+        break generationLoop;
       }
-
-      const qText = normalizeQuestionOutput(String(payload?.question ?? ""));
-      metrics.parsingMs += nowMs() - parseStartedAt;
-      if (!qText) continue;
-      if (isTooLongTrainerQuestion(qText)) continue;
-
-      finalQuestion = qText;
-      break;
     }
 
     if (!finalQuestion) {
-      const err: GenerateQuestionErr = { ok: false, error: "Modellen returnerede tomt/ufuldstændigt output.", requestId };
+      const err: GenerateQuestionErr = {
+        ok: false,
+        error: "Modellen returnerede tomt/ufuldstændigt output.",
+        requestId,
+        ...(process.env.NODE_ENV !== "production"
+          ? {
+              debug: {
+                focusMode: effectiveFocusMode,
+                attempts: generationAttemptDiagnostics.slice(-4),
+              },
+            }
+          : {}),
+      };
       return respond(err, 500);
     }
 
@@ -726,7 +842,7 @@ export async function POST(req: NextRequest) {
       evals_used: 0,
       max_evals: 2,
       focusMode: effectiveFocusMode,
-      focusTargets,
+      focusTargets: finalPromptFocusTargets,
     };
 
     const basePayload = {
@@ -766,9 +882,11 @@ export async function POST(req: NextRequest) {
         maxContextChunks,
         difficulty,
         focusMode: effectiveFocusMode,
-        biasApplied,
-        focusTargets: focusTargets.map((t) => ({ key: t.key, label: t.label })),
+        biasApplied: finalBiasApplied,
+        focusTargets: finalPromptFocusTargets.map((t) => ({ key: t.key, label: t.label })),
         weakSessionCount,
+        structuredFocusSessionCount,
+        legacyFocusSessionCount,
       },
     };
 
@@ -813,6 +931,8 @@ export async function POST(req: NextRequest) {
       scopeKey,
       focusMode: effectiveFocusMode,
       weakSessionCount,
+      generationStrategyUsed,
+      generationFallbackUsed,
       usedFileId: generatedFileId,
       usedFileTitle,
       selectedChunkCount: metrics.selectedChunkCount,
@@ -822,6 +942,11 @@ export async function POST(req: NextRequest) {
       docChunkQueries: metrics.docChunkQueries,
       model: modelForDiagnostics,
       openAiAttempts: metrics.openAiAttempts,
+      ...(process.env.NODE_ENV !== "production"
+        ? {
+            outputDiagnostics: generationAttemptDiagnostics.slice(-4),
+          }
+        : {}),
       stageTimingsMs: {
         authSession: metrics.authSessionMs,
         ensureProfile: metrics.ensureProfileMs,

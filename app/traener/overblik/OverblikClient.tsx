@@ -10,6 +10,11 @@ type OverviewItem = {
   attemptsWritten?: number;
   lastTrainedAt?: string | null;
   avgLast5?: number | null;
+  focus_label?: string | null;
+  focus_reason?: string | null;
+  next_training_text?: string | null;
+  next_step_text?: string | null;
+  focus_badge_tone?: "neutral" | "low" | "medium" | "high";
 
   folder_id: string | null;
   folder_title: string;
@@ -102,7 +107,39 @@ function sinceLabel(iso: string | null): string {
   return `For ${d} dage siden`;
 }
 
+function normalizedCopyKey(raw: unknown): string {
+  return String(raw ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9æøå]+/gi, " ")
+    .trim();
+}
+
+function copyOverlapRatio(a: unknown, b: unknown): number {
+  const aTokens = normalizedCopyKey(a)
+    .split(" ")
+    .filter((token) => token.length >= 4);
+  const bTokens = normalizedCopyKey(b)
+    .split(" ")
+    .filter((token) => token.length >= 4);
+  if (!aTokens.length || !bTokens.length) return 0;
+  const bSet = new Set(bTokens);
+  let overlap = 0;
+  for (const token of aTokens) {
+    if (bSet.has(token)) overlap += 1;
+  }
+  return overlap / Math.max(1, Math.min(aTokens.length, bTokens.length));
+}
+
+function isDuplicateishCopy(candidate: unknown, blocker: unknown): boolean {
+  const a = normalizedCopyKey(candidate);
+  const b = normalizedCopyKey(blocker);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a) || copyOverlapRatio(a, b) >= 0.72;
+}
+
 function focusText(item: OverviewItem): string {
+  const structured = String(item.focus_label ?? "").trim();
+  if (structured) return structured;
   if (item.attempts_total === 0) return "Ikke startet endnu";
   const avg = item.avg_last5;
   if (avg === null) return "Ikke startet endnu";
@@ -113,6 +150,8 @@ function focusText(item: OverviewItem): string {
 }
 
 function nextExerciseText(item: OverviewItem): string {
+  const structured = String(item.next_training_text ?? item.next_step_text ?? "").trim();
+  if (structured) return structured;
   if (item.attempts_total === 0) return "Start med 1 kort træning (10-15 min)";
   const avg = item.avg_last5;
   if (avg === null || avg < 50) {
@@ -123,6 +162,10 @@ function nextExerciseText(item: OverviewItem): string {
 }
 
 function focusBadgeClass(item: OverviewItem): string {
+  if (item.focus_badge_tone === "high") return "bg-red-50 text-red-700 border-red-200";
+  if (item.focus_badge_tone === "medium") return "bg-amber-50 text-amber-700 border-amber-200";
+  if (item.focus_badge_tone === "low") return "bg-yellow-50 text-yellow-700 border-yellow-200";
+  if (item.focus_badge_tone === "neutral") return "bg-zinc-100 text-zinc-700 border-zinc-200";
   if (item.attempts_total === 0 || item.avg_last5 === null) {
     return "bg-zinc-100 text-zinc-700 border-zinc-200";
   }
@@ -396,6 +439,18 @@ function sanitizeOverviewItems(raw: OverviewItem[]): OverviewItem[] {
       attempts_total: attempts,
       avg_last5: avg,
       last_trained_at: lastTrained,
+      focus_label: typeof item.focus_label === "string" || item.focus_label === null ? item.focus_label : null,
+      focus_reason: typeof item.focus_reason === "string" || item.focus_reason === null ? item.focus_reason : null,
+      next_training_text:
+        typeof item.next_training_text === "string" || item.next_training_text === null ? item.next_training_text : null,
+      next_step_text: typeof item.next_step_text === "string" || item.next_step_text === null ? item.next_step_text : null,
+      focus_badge_tone:
+        item.focus_badge_tone === "high" ||
+        item.focus_badge_tone === "medium" ||
+        item.focus_badge_tone === "low" ||
+        item.focus_badge_tone === "neutral"
+          ? item.focus_badge_tone
+          : undefined,
     });
   }
 
@@ -489,9 +544,11 @@ export default function OverblikClient() {
             const isOpen = !!expanded[key];
             const detail = details[key];
             const recent3 = (detail?.sessions ?? []).slice(0, 3);
-            const focus = focusText(card);
-            const nextExercise = nextExerciseText(card);
-            const readHereSuggestions = detail?.readingRefs ?? [];
+	            const focus = focusText(card);
+	            const nextExercise = nextExerciseText(card);
+	            const focusReason = String(card.focus_reason ?? "").trim();
+	            const displayFocusReason = focusReason && !isDuplicateishCopy(focusReason, nextExercise) ? focusReason : "";
+	            const readHereSuggestions = detail?.readingRefs ?? [];
             const isReadHereOpen = !!readHereExpanded[key];
             const isWeakPointsOpen = !!weakPointsExpanded[key];
             const weakPoints = detail?.weakPoints ?? [];
@@ -515,6 +572,12 @@ export default function OverblikClient() {
                   >
                     {focus}
                   </span>
+	                  {displayFocusReason ? (
+	                    <p className="mt-2 text-sm leading-relaxed text-zinc-700">{displayFocusReason}</p>
+	                  ) : null}
+                  <p className="mt-2 text-sm text-zinc-600">
+                    <span className="font-medium text-zinc-800">Næste træning:</span> {nextExercise}
+                  </p>
                 </div>
 
                 <div className="mt-4 grid grid-cols-3 gap-3 text-sm">

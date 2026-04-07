@@ -649,6 +649,10 @@ export default function ClientTrainer({
 
       // ✅ efter første eval: knappen skal næste gang stå “Prøv igen”
       setEvalAttemptsUsed((n) => Math.min(EVAL_ATTEMPTS_MAX, n + 1));
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("trainer:evaluations-changed"));
+      }
+      router.refresh();
     } catch (err: any) {
       console.warn("[client-trainer] evaluate", {
         requestId: null,
@@ -846,7 +850,7 @@ export default function ClientTrainer({
 
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold">Dit svar / 100</h3>
+          <h3 className="text-sm font-semibold">Dit svar</h3>
           <button
             type="button"
             onClick={handleEvaluate}

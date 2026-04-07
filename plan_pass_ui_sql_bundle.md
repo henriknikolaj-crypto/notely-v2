@@ -7033,7 +7033,7 @@ export default function ClientTrainer({
 
       <section className="space-y-2 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold">Dit svar / 100</h3>
+          <h3 className="text-sm font-semibold">Dit svar</h3>
           <button
             type="button"
             onClick={handleEvaluate}

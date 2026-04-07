@@ -8,6 +8,8 @@ import { createClient } from "@supabase/supabase-js";
 
 import { calcSessionGrade } from "@/lib/grading/sessionGrade";
 import { danish7ToScore100, type Danish7Grade } from "@/lib/grading/danish7";
+import { buildFeedbackV2, deriveWeakPointTargetsFromFeedbackV2 } from "@/lib/learning/feedback";
+import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { ensureProfile } from "@/lib/server/ensureProfile";
@@ -336,6 +338,15 @@ export async function POST(req: NextRequest) {
     }
 
     const fileById = new Map<string, any>(fileRows.map((f) => [String(f.id), f]));
+    const contextCitations = chunksNonEmpty.slice(0, 8).map((chunk) => {
+      const file = fileById.get(String(chunk.file_id));
+      return {
+        chunk_id: String(chunk.id),
+        file_id: String(chunk.file_id),
+        title: fileTitle(file),
+        url: null,
+      };
+    });
 
     const contextText = chunksNonEmpty
       .map((c) => {
@@ -495,10 +506,49 @@ export async function POST(req: NextRequest) {
       improvements,
       items,
     });
+    const sourceType = mode === "oral" ? "oral" : "simulator";
+    const evaluator = resolveEvaluatorDefinition(sourceType);
+    const taskCoverage = {
+      answered_count: answeredCount,
+      expected_count: sg.plannedQuestions,
+      ratio: sg.plannedQuestions > 0 ? Math.max(0, Math.min(1, answeredCount / sg.plannedQuestions)) : null,
+      summary: `Besvaret ${answeredCount} ud af ca. ${sg.plannedQuestions} forventede spørgsmål.`,
+    };
+    const learningSignals = buildFeedbackV2({
+      evaluator,
+      sourceType,
+      summary,
+      strengths,
+      nextBestAction: improvements[0],
+      taskCoverage,
+      citations: contextCitations,
+      improvements,
+      fallbackSummary: summary,
+      fallbackNextBestAction:
+        improvements[0] || "Forbedr det største faglige hul først, før du arbejder med finpudsning.",
+    });
+    const backwardCompatibleWeakPoints = deriveWeakPointTargetsFromFeedbackV2(learningSignals);
+    const sessionMeta = {
+      mode,
+      includeBackground,
+      durationMin,
+      startedAt: body.startedAt ?? null,
+      endedAt: body.endedAt ?? null,
+      answeredCount,
+      qualityGrade,
+      finalGrade,
+      result: out.result,
+      scopeFolderIds,
+      ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
+      task_coverage: taskCoverage,
+      citations: contextCitations,
+      weak_points: backwardCompatibleWeakPoints,
+      feedback_v2: learningSignals,
+      learning_signals: learningSignals,
+    };
 
     // Best-effort: gem exam_session (stabilt scope)
     try {
-      const sourceType = mode === "oral" ? "oral" : "simulator";
       const score = danish7ToScore100(finalGrade);
 
       const { error: insertError } = await admin.from("exam_sessions").insert({
@@ -509,19 +559,8 @@ export async function POST(req: NextRequest) {
         score,
         folder_id: sessionFolderId,
         source_type: sourceType,
-        meta: {
-          mode,
-          includeBackground,
-          durationMin,
-          startedAt: body.startedAt ?? null,
-          endedAt: body.endedAt ?? null,
-          answeredCount,
-          qualityGrade,
-          finalGrade,
-          result: out.result,
-          scopeFolderIds,
-          ...(sessionFolderIdsMeta ? { folder_ids: sessionFolderIdsMeta } : {}),
-        },
+        meta: sessionMeta,
+        metadata: sessionMeta,
       });
 
       if (insertError) {
