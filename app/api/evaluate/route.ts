@@ -14,9 +14,13 @@ import {
   normalizeWeakPointTargets,
   type FeedbackV2,
 } from "@/lib/learning/feedback";
+import { buildDanskTrainerPromptAddendum, inferDanskTrainerTask } from "@/lib/dansk/evaluator";
 import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
+import { buildMatematikTrainerPromptAddendum, inferMatematikTrainerTask } from "@/lib/matematik/evaluator";
+import { buildOkonomiTrainerPromptAddendum, inferOkonomiTrainerTask } from "@/lib/okonomi/evaluator";
 import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
+import { buildSamfundTrainerPromptAddendum, inferSamfundTrainerTask } from "@/lib/samfund/evaluator";
 import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
 import { scopeKeyFromFolderIds } from "@/lib/trainer/generate-question";
 import { ensureProfile } from "@/lib/server/ensureProfile";
@@ -181,6 +185,61 @@ function sanitizeTrainerSummary(raw: unknown, fallback = TRAINER_SUMMARY_FALLBAC
   }
 
   return { text, sanitized, reason };
+}
+
+function resolveTrainerEvaluator(question: string) {
+  const okonomiTaskType = inferOkonomiTrainerTask(question);
+  if (okonomiTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "okonomi",
+        task_type: okonomiTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildOkonomiTrainerPromptAddendum(okonomiTaskType),
+    };
+  }
+
+  const samfundTaskType = inferSamfundTrainerTask(question);
+  if (samfundTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "samfund",
+        task_type: samfundTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildSamfundTrainerPromptAddendum(samfundTaskType),
+    };
+  }
+
+  const danskTaskType = inferDanskTrainerTask(question);
+  if (danskTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "dansk",
+        task_type: danskTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildDanskTrainerPromptAddendum(danskTaskType),
+    };
+  }
+
+  const matematikTaskType = inferMatematikTrainerTask(question);
+  if (matematikTaskType) {
+    return {
+      evaluator: resolveEvaluatorDefinition("trainer", {
+        subject_family: "matematik",
+        task_type: matematikTaskType,
+        assessment_mode: "trainer",
+      }),
+      promptAddendum: buildMatematikTrainerPromptAddendum(matematikTaskType),
+    };
+  }
+
+  return {
+    evaluator: resolveEvaluatorDefinition("trainer"),
+    promptAddendum: "",
+  };
 }
 
 function inferTrainerScoreFloor(args: {
@@ -856,7 +915,8 @@ export async function POST(req: NextRequest) {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
     const promptBuildStartedAt = nowMs();
-    const evaluator = resolveEvaluatorDefinition(flow);
+    const trainerEvaluatorResolution = flow === "trainer" ? resolveTrainerEvaluator(question) : null;
+    const evaluator = trainerEvaluatorResolution?.evaluator ?? resolveEvaluatorDefinition(flow);
     const trainerPromptAddendum =
       flow === "trainer"
         ? [
@@ -872,6 +932,7 @@ export async function POST(req: NextRequest) {
             "- Ingen ellipser.",
             "- Ingen afbrudte saetninger.",
             "- Alle tekstfelter skal vaere hele, afsluttede saetninger.",
+            trainerEvaluatorResolution?.promptAddendum ?? "",
           ].join("\n")
         : "";
     const systemPrompt = `
@@ -1052,6 +1113,9 @@ ${trainerPromptAddendum}
     if (process.env.NODE_ENV !== "production" && flow === "trainer") {
       console.info("[evaluate][trainer][stability]", {
         requestId,
+        evaluatorId: evaluator.id,
+        subjectFamily: evaluator.subject_family,
+        taskType: evaluator.task_type,
         rawScore: scoreCalibration.rawScore,
         normalizedScore: scoreCalibration.normalizedScore,
         scoreRepairApplied: scoreCalibration.repaired,

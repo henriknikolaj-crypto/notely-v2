@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { buildFolderLearningSummary } from "@/lib/learning/ui-selectors";
 
-const SOURCE_TYPES = "trainer,simulator";
+const SOURCE_TYPES = "trainer,simulator,oral";
 const FOCUS_WINDOW_SIZE = 25;
 
 const COPY = {
@@ -27,6 +28,11 @@ type OverviewItem = {
   attempts_total: number;
   avg_last5: number | null;
   last_trained_at: string | null;
+  focus_label?: string | null;
+  focus_reason?: string | null;
+  next_training_text?: string | null;
+  next_step_text?: string | null;
+  focus_badge_tone?: "neutral" | "low" | "medium" | "high";
 };
 
 type OverviewResponse = {
@@ -148,6 +154,8 @@ type FocusInsight = {
   count: number;
   evidenceFeedback: string[];
   evidenceText: FocusEvidenceText | null;
+  evidenceBridge: string | null;
+  evidenceSpecificity: "general" | "specific";
   actions: string[];
   templatePrefill: {
     improvement: string;
@@ -225,6 +233,94 @@ function clampWithEllipsis(raw: string, maxLen: number): string {
   const lastSpace = sliced.lastIndexOf(" ");
   const safe = lastSpace > Math.floor(maxLen * 0.6) ? sliced.slice(0, lastSpace) : sliced;
   return `${safe.trim()}...`;
+}
+
+function normalizeSentenceWhitespace(raw: unknown): string {
+  return String(raw ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function wholeSentenceOrEmpty(raw: unknown, maxLen = 220): string {
+  const text = normalizeSentenceWhitespace(raw);
+  if (!text) return "";
+  const match = text.match(/.+?[.!?](?=\s|$)/);
+  if (match?.[0]) {
+    const sentence = match[0].trim();
+    if (/\.\.\.\s*$/.test(sentence)) return "";
+    if (/\b(?!fx|osv|ca|bl.a|mfl)[a-zæøå]{1,3}\.\s*$/i.test(sentence)) return "";
+    return sentence.length <= maxLen ? sentence : "";
+  }
+  if (text.length <= maxLen && !/\.\.\.\s*$/.test(text)) {
+    const trimmed = text.replace(/\.\.\.\s*$/, "").trim();
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    if (/\b(?!fx|osv|ca|bl.a|mfl)[a-zæøå]{1,3}\.\s*$/i.test(trimmed)) return "";
+    if (/^[a-zæøå-]{1,8}$/i.test(trimmed)) return "";
+    if (words.length < 4) return "";
+    if ((words[words.length - 1] ?? "").length < 4) return "";
+    return /[.!?]\s*$/.test(trimmed) ? trimmed : `${trimmed}.`;
+  }
+  return "";
+}
+
+function normalizedCopyKey(raw: unknown): string {
+  return normalizeSentenceWhitespace(raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9æøå]+/gi, " ")
+    .trim();
+}
+
+const COPY_DEDUPE_STOPWORDS = new Set([
+  "dine",
+  "dette",
+  "dette",
+  "denne",
+  "dine",
+  "næste",
+  "svar",
+  "svaret",
+  "teksten",
+  "fokus",
+  "gøre",
+  "tydeligere",
+  "kort",
+  "bruge",
+  "brug",
+  "aktivt",
+  "forsøg",
+]);
+
+function copyTokens(raw: unknown): string[] {
+  return normalizedCopyKey(raw)
+    .split(" ")
+    .filter((token) => token.length >= 4 && !COPY_DEDUPE_STOPWORDS.has(token));
+}
+
+function copyOverlapRatio(a: unknown, b: unknown): number {
+  const aTokens = copyTokens(a);
+  const bTokens = copyTokens(b);
+  if (!aTokens.length || !bTokens.length) return 0;
+  const bSet = new Set(bTokens);
+  let overlap = 0;
+  for (const token of aTokens) {
+    if (bSet.has(token)) overlap += 1;
+  }
+  return overlap / Math.max(1, Math.min(aTokens.length, bTokens.length));
+}
+
+function isDuplicateishCopy(candidate: string, blockers: Array<string | null | undefined>) {
+  const normalizedCandidate = normalizedCopyKey(candidate);
+  if (!normalizedCandidate) return true;
+  return blockers.some((blocker) => {
+    const normalizedBlocker = normalizedCopyKey(blocker);
+    if (!normalizedBlocker) return false;
+    return (
+      normalizedCandidate === normalizedBlocker ||
+      normalizedCandidate.includes(normalizedBlocker) ||
+      normalizedBlocker.includes(normalizedCandidate) ||
+      copyOverlapRatio(normalizedCandidate, normalizedBlocker) >= 0.72
+    );
+  });
 }
 
 function asWeakPointRawList(v: unknown): unknown[] {
@@ -907,7 +1003,11 @@ function focusText(item: FolderStats): string {
   return "Fokus: finpudsning";
 }
 
-function focusBadgeClass(item: FolderStats): string {
+function focusBadgeClass(item: FolderStats, tone?: "neutral" | "low" | "medium" | "high"): string {
+  if (tone === "high") return "bg-red-50 text-red-700 border-red-200";
+  if (tone === "medium") return "bg-amber-50 text-amber-700 border-amber-200";
+  if (tone === "low") return "bg-yellow-50 text-yellow-700 border-yellow-200";
+  if (tone === "neutral") return "bg-zinc-100 text-zinc-700 border-zinc-200";
   if (item.attempts_total === 0 || item.avg_last5 === null) {
     return "bg-zinc-100 text-zinc-700 border-zinc-200";
   }
@@ -1289,13 +1389,32 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
   const trendDelta = useMemo(() => deriveTrendDelta(sessions), [sessions]);
   const scorePoints = useMemo(() => buildScorePoints(sessions, 20), [sessions]);
   const recent3 = useMemo(() => sessions.slice(0, 3), [sessions]);
-  const focus = useMemo(() => focusText(stats), [stats]);
-  const nextStep = useMemo(() => nextExerciseText(stats), [stats]);
-  const canStartTargetedTraining = stats.attempts_total >= 2;
   const focusWindowSessions = useMemo(() => sessions.slice(0, FOCUS_WINDOW_SIZE), [sessions]);
+  const learningSummary = useMemo(
+    () =>
+      buildFolderLearningSummary(focusWindowSessions, {
+        avgLast5: stats.avg_last5,
+        attemptsTotal: stats.attempts_total,
+      }),
+    [focusWindowSessions, stats.avg_last5, stats.attempts_total],
+  );
+  const hasStructuredFocus = learningSummary.structured_session_count > 0 && learningSummary.top_issues.length > 0;
+  const focus = useMemo(
+    () => overviewItem?.focus_label || learningSummary.focus_label || focusText(stats),
+    [overviewItem?.focus_label, learningSummary.focus_label, stats],
+  );
+  const nextStep = useMemo(
+    () => overviewItem?.next_step_text || learningSummary.next_step_text || nextExerciseText(stats),
+    [overviewItem?.next_step_text, learningSummary.next_step_text, stats],
+  );
+  const badgeTone = overviewItem?.focus_badge_tone || learningSummary.badge_tone;
+  const canStartTargetedTraining = stats.attempts_total >= 2;
   const sessionsWithWeakPoints = useMemo(
-    () => focusWindowSessions.filter((s) => getWeakPointListFromSession(s).length > 0).length,
-    [focusWindowSessions],
+    () =>
+      hasStructuredFocus
+        ? learningSummary.sessions_with_focus
+        : focusWindowSessions.filter((s) => getWeakPointListFromSession(s).length > 0).length,
+    [focusWindowSessions, hasStructuredFocus, learningSummary.sessions_with_focus],
   );
   const repeatedWeakPoints = useMemo(() => deriveRepeatedWeakPoints(focusWindowSessions), [focusWindowSessions]);
   const topTwoWeakPoints = useMemo(() => repeatedWeakPoints.slice(0, 2), [repeatedWeakPoints]);
@@ -1339,15 +1458,82 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
       };
     });
   }, [topTwoWeakPoints, focusWindowSessions]);
-  const citationRefs = useMemo(() => deriveReadingRefsFromSessions(focusWindowSessions), [focusWindowSessions]);
+  const citationRefs = useMemo(
+    () => (hasStructuredFocus ? learningSummary.reading_refs : deriveReadingRefsFromSessions(focusWindowSessions)),
+    [focusWindowSessions, hasStructuredFocus, learningSummary.reading_refs],
+  );
   const topCitation = citationRefs[0] ?? null;
-  const topFocusInsights = useMemo<FocusInsight[]>(() => {
+  const structuredFocusInsights = useMemo<FocusInsight[]>(() => {
+    return learningSummary.top_issues.slice(0, 2).map((issue) => {
+      const primaryCitation = issue.citations[0] ?? topCitation ?? null;
+      const citationSnippet = wholeSentenceOrEmpty(
+        asText(primaryCitation?.snippet) || asText(primaryCitation?.why) || issue.evidence[0] || issue.reason,
+        220,
+      );
+      const page =
+        asText(primaryCitation?.page_from ?? primaryCitation?.page ?? primaryCitation?.source_page) ||
+        parsePageFromSource(primaryCitation?.title ?? null);
+      const actions = resolveFocusActions(issue.label, [
+        wholeSentenceOrEmpty(issue.repair, 180) || issue.repair,
+        issue.evidence_specificity === "general"
+          ? wholeSentenceOrEmpty(issue.next_best_action || learningSummary.next_training_text || "", 180) ||
+            issue.next_best_action ||
+            learningSummary.next_training_text ||
+            ""
+          : wholeSentenceOrEmpty(issue.example || issue.next_best_action || learningSummary.next_training_text || "", 180) ||
+            issue.example ||
+            issue.next_best_action ||
+            learningSummary.next_training_text ||
+            "",
+      ]);
+
+      return {
+        key: issue.key,
+        title: issue.label,
+        description:
+          wholeSentenceOrEmpty(issue.reason, 220) ||
+          wholeSentenceOrEmpty(issue.repair, 220) ||
+          wholeSentenceOrEmpty(issue.evidence_bridge, 220) ||
+          `Fokusér på ${issue.label.toLowerCase()} i dit næste svar.`,
+        count: issue.count,
+        evidenceFeedback: issue.evidence.length > 0 ? issue.evidence : [issue.reason],
+        evidenceBridge: issue.evidence_bridge ?? null,
+        evidenceSpecificity: issue.evidence_specificity,
+        evidenceText: primaryCitation && citationSnippet
+          ? {
+              title: primaryCitation.title || "Kilde",
+              snippet: citationSnippet,
+              ...(page ? { page } : {}),
+              url: primaryCitation.url ?? null,
+            }
+          : null,
+        actions,
+        templatePrefill: {
+          improvement:
+            wholeSentenceOrEmpty(issue.repair, 180) ||
+            learningSummary.suggestion_prefill.improvement,
+          example:
+            wholeSentenceOrEmpty(issue.example, 180) ||
+            (issue.evidence_specificity === "general"
+              ? wholeSentenceOrEmpty(issue.evidence_bridge, 180)
+              : "") ||
+            learningSummary.suggestion_prefill.example,
+          shortExplanation:
+            wholeSentenceOrEmpty(issue.reason, 180) ||
+            learningSummary.suggestion_prefill.shortExplanation,
+        },
+      };
+    });
+  }, [learningSummary, topCitation]);
+  const legacyTopFocusInsights = useMemo<FocusInsight[]>(() => {
     return focusSeeds.map((seed) => ({
       key: seed.key,
       title: seed.title,
       description: seed.description,
       count: seed.count,
       evidenceFeedback: seed.evidenceFeedback,
+      evidenceBridge: null,
+      evidenceSpecificity: "general",
       evidenceText: focusEvidenceByKey[seed.key] ?? null,
       actions: (() => {
         const resolved = resolveFocusActions(seed.title, [seed.actions[0], seed.actions[1]]);
@@ -1356,7 +1542,102 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
       templatePrefill: seed.templatePrefill,
     }));
   }, [focusSeeds, focusEvidenceByKey]);
-  const suggestionCopy = useMemo(() => getSuggestionCopy(topFocusInsights[0]?.title ?? null), [topFocusInsights]);
+  const topFocusInsights = hasStructuredFocus ? structuredFocusInsights : legacyTopFocusInsights;
+  const primaryFocusInsight = topFocusInsights[0] ?? null;
+  const suggestionCopy = useMemo(
+    () => (hasStructuredFocus ? learningSummary.suggestion_prefill : getSuggestionCopy(topFocusInsights[0]?.title ?? null)),
+    [hasStructuredFocus, learningSummary.suggestion_prefill, topFocusInsights],
+  );
+  const focusReasonText = useMemo(
+    () => wholeSentenceOrEmpty(learningSummary.focus_reason, 220) || learningSummary.focus_reason || "",
+    [learningSummary.focus_reason],
+  );
+  const compactSuggestionCopy = useMemo(
+    () => ({
+      improvement:
+        wholeSentenceOrEmpty(suggestionCopy.improvement, 180) ||
+        "Gør din hovedpointe tydeligere i næste svar.",
+      example:
+        wholeSentenceOrEmpty(suggestionCopy.example, 180) ||
+        "Underbyg din pointe med et kort tekstbelæg og forklar, hvad det viser.",
+      shortExplanation:
+        wholeSentenceOrEmpty(suggestionCopy.shortExplanation, 180) ||
+        "Det gør svaret mere præcist og lettere at vurdere fagligt.",
+    }),
+    [suggestionCopy],
+  );
+  const trainingLead = useMemo(() => {
+    const candidates = [
+      wholeSentenceOrEmpty(primaryFocusInsight?.description, 200),
+      wholeSentenceOrEmpty(learningSummary.next_training_text, 200),
+      "Arbejd videre med dette fokus i dit næste svar.",
+    ].filter(Boolean);
+    return candidates.find((candidate) => !isDuplicateishCopy(candidate, [focusReasonText])) || candidates[0] || "";
+  }, [focusReasonText, learningSummary.next_training_text, primaryFocusInsight?.description]);
+  const trainingActions = useMemo(() => {
+    const seen = new Set<string>();
+    const blockers = [focusReasonText, trainingLead, primaryFocusInsight?.evidenceBridge];
+    const filtered = (primaryFocusInsight?.actions ?? [])
+      .map((action) => wholeSentenceOrEmpty(action, 180) || action)
+      .filter(Boolean)
+      .filter((action) => {
+        const key = normalizedCopyKey(action);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return !isDuplicateishCopy(action, blockers);
+      });
+    return filtered.slice(0, 2);
+  }, [focusReasonText, primaryFocusInsight?.actions, primaryFocusInsight?.evidenceBridge, trainingLead]);
+  const visibleSuggestionLines = useMemo(() => {
+    const blockers = [focusReasonText, trainingLead, ...trainingActions];
+    const lines = [
+      { label: "Forbedring", text: compactSuggestionCopy.improvement },
+      { label: "Eksempel", text: compactSuggestionCopy.example },
+      { label: "Kort forklaring", text: compactSuggestionCopy.shortExplanation },
+    ];
+    const seen = new Set<string>();
+    return lines.filter((line) => {
+      const text = wholeSentenceOrEmpty(line.text, 180) || line.text;
+      const key = normalizedCopyKey(text);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return !isDuplicateishCopy(text, blockers);
+    });
+  }, [compactSuggestionCopy.example, compactSuggestionCopy.improvement, compactSuggestionCopy.shortExplanation, focusReasonText, trainingActions, trainingLead]);
+  const visibleWritingTips = useMemo(() => {
+    const blockers = [
+      focusReasonText,
+      trainingLead,
+      primaryFocusInsight?.evidenceBridge,
+      ...trainingActions,
+      ...visibleSuggestionLines.map((line) => line.text),
+      nextStep,
+    ];
+    const seen = new Set<string>();
+    return learningSummary.writing_tips
+      .map((tip) => wholeSentenceOrEmpty(tip, 180))
+      .filter(Boolean)
+      .filter((tip) => {
+        const key = normalizedCopyKey(tip);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return !isDuplicateishCopy(tip, blockers);
+      })
+      .slice(0, 2);
+  }, [focusReasonText, learningSummary.writing_tips, nextStep, primaryFocusInsight?.evidenceBridge, trainingActions, trainingLead, visibleSuggestionLines]);
+  const nextStepChecklist = useMemo(() => {
+    const blockers = [focusReasonText, trainingLead, primaryFocusInsight?.evidenceBridge, ...trainingActions, ...visibleSuggestionLines.map((line) => line.text)];
+    const seen = new Set<string>();
+    return [wholeSentenceOrEmpty(nextStep, 180) || nextStep, "Brug feedbacken aktivt i næste forsøg."]
+      .filter(Boolean)
+      .filter((item) => !isDuplicateishCopy(item, blockers))
+      .filter((item) => {
+        const key = normalizedCopyKey(item);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }, [focusReasonText, nextStep, primaryFocusInsight?.evidenceBridge, trainingActions, trainingLead, visibleSuggestionLines]);
   const topChunkId = useMemo(() => {
     const cid = String(topCitation?.chunk_id ?? "").trim();
     return isUuidLike(cid) ? cid : null;
@@ -1374,10 +1655,11 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
     return Array.from(new Set(title)).slice(0, 2);
   }, [topCitation?.title]);
   const snippetKeywordsCsv = useMemo(() => {
+    const primaryStructuredIssue = learningSummary.top_issues[0] ?? null;
     const kws = getSnippetKeywordsForFocus({
-      key: topWeakPoint?.key ?? null,
-      label: topWeakPoint?.label ?? null,
-      action: topWeakPoint?.action ?? null,
+      key: primaryStructuredIssue?.key ?? topWeakPoint?.key ?? null,
+      label: primaryStructuredIssue?.label ?? topWeakPoint?.label ?? null,
+      action: primaryStructuredIssue?.repair ?? topWeakPoint?.action ?? null,
     });
     const merged = [...kws, ...topTitleKeywords];
     const out: string[] = [];
@@ -1389,12 +1671,24 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
       if (out.length >= 10) break;
     }
     return out.join(",");
-  }, [topWeakPoint?.key, topWeakPoint?.label, topWeakPoint?.action, topTitleKeywords]);
+  }, [
+    learningSummary.top_issues,
+    topWeakPoint?.key,
+    topWeakPoint?.label,
+    topWeakPoint?.action,
+    topTitleKeywords,
+  ]);
   const readLocationLabel = useMemo(() => buildReadLocationLabel(chunkSnippet, topCitation), [chunkSnippet, topCitation]);
   useEffect(() => {
     let active = true;
 
     async function run() {
+      if (hasStructuredFocus) {
+        if (!active) return;
+        setFocusEvidenceByKey({});
+        return;
+      }
+
       if (focusSeeds.length === 0) {
         if (!active) return;
         setFocusEvidenceByKey({});
@@ -1407,12 +1701,12 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
       for (const seed of focusSeeds) {
         if (!active) return;
 
-        const fallbackSnippet = clampWithEllipsis(asText(seed.citation?.snippet), 220);
+        const fallbackSnippet = wholeSentenceOrEmpty(asText(seed.citation?.snippet), 220);
         const fallbackTitle = asText(seed.citation?.title) || "Kilde";
         const fallbackPage = parsePageFromSource(seed.citation?.title ?? null);
         const fallback: FocusEvidenceText = {
           title: fallbackTitle,
-          snippet: fallbackSnippet || "Find et kort citat i kilden og knyt det til din pointe.",
+              snippet: fallbackSnippet || "Find et kort tekststed i kilden og knyt det til din pointe.",
           ...(fallbackPage ? { page: fallbackPage } : {}),
           url: seed.citation?.url ?? null,
         };
@@ -1482,7 +1776,10 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
           }
 
           const titleRaw = picked?.title || asText(item.title) || fallback.title;
-          const snippetRaw = picked?.snippet || clampWithEllipsis(asText(item.snippetShort), 220) || fallback.snippet;
+          const snippetRaw =
+            wholeSentenceOrEmpty(picked?.snippet, 220) ||
+            wholeSentenceOrEmpty(asText(item.snippetShort), 220) ||
+            fallback.snippet;
           const page =
             picked?.page ||
             asText(item.pageFrom ?? item.page ?? item.sourcePage) ||
@@ -1511,7 +1808,7 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
     return () => {
       active = false;
     };
-  }, [focusSeeds, folderId]);
+  }, [focusSeeds, folderId, hasStructuredFocus]);
   useEffect(() => {
     let active = true;
 
@@ -1651,7 +1948,7 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
         <p className="mt-1 text-sm text-zinc-600">{COPY.subtitle}</p>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span
-            className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-medium ${focusBadgeClass(stats)}`}
+            className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-medium ${focusBadgeClass(stats, badgeTone)}`}
           >
             {focus}
           </span>
@@ -1744,61 +2041,73 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
 
               <div className="mt-3">
                 <p className="text-xs font-semibold text-zinc-700">Dit fokus</p>
-                {sessionsWithWeakPoints < 2 || topFocusInsights.length === 0 ? (
+                {sessionsWithWeakPoints < 2 || !primaryFocusInsight ? (
                   <p className="mt-1 text-sm text-zinc-600">
                     Lav 2–3 træninger i denne mappe for et mere stabilt fokus.
                   </p>
                 ) : (
-                  <div className="mt-2 divide-y divide-zinc-200 rounded-xl border border-zinc-200 bg-zinc-50">
-                    {topFocusInsights.map((focusItem, idx) => {
-                      const evidenceText: FocusEvidenceText = focusItem.evidenceText ?? {
-                        title: "Kilde",
-                        snippet: "Find et kort citat i teksten, som understøtter din pointe.",
-                      };
-                      const shortestFeedback =
-                        focusItem.evidenceFeedback.slice().sort((a, b) => a.length - b.length)[0] ??
-                        "Brug feedbacken fra din seneste vurdering.";
-                      const feedbackProof = clampWithEllipsis(shortestFeedback, 140);
-                      const quoteProof = clampWithEllipsis(evidenceText.snippet, 140);
+                  <div className="mt-2 rounded-xl border border-zinc-200 bg-zinc-50">
+                    {topFocusInsights.slice(0, 1).map((focusItem) => {
+                      const evidenceText = focusItem.evidenceText;
+                      const quoteProof = wholeSentenceOrEmpty(evidenceText?.snippet, 180);
                       return (
                         <div key={focusItem.key} className="p-3">
                           <p className="font-medium text-zinc-800">
-                            {idx + 1}. {focusItem.title}
+                            {focusItem.title}
                           </p>
-                          <p className="mt-1 overflow-hidden text-xs text-zinc-600 text-ellipsis whitespace-nowrap">
-                            {focusItem.description || `Fokusér på ${focusItem.title.toLowerCase()} i næste svar.`}
+                          <p className="mt-1 text-sm leading-relaxed text-zinc-700">
+                            {trainingLead || focusItem.description || `Fokusér på ${focusItem.title.toLowerCase()} i næste svar.`}
                           </p>
                           <p className="mt-0.5 text-[10px] text-zinc-400">{focusItem.count} vurderinger</p>
 
-                          <div className="mt-3">
-                            <p className="text-xs font-semibold text-zinc-700">Næste skridt</p>
-                            <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-zinc-700">
-                              <li>{focusItem.actions[0]}</li>
-                              <li>{focusItem.actions[1]}</li>
-                            </ul>
-                          </div>
+	                        {trainingActions.length > 0 ? (
+	                          <div className="mt-3">
+	                            <p className="text-xs font-semibold text-zinc-700">Næste skridt</p>
+	                            <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-zinc-700">
+	                              {trainingActions.map((action) => (
+	                                <li key={action}>{action}</li>
+	                              ))}
+	                            </ul>
+	                          </div>
+	                        ) : null}
 
-                          <div className="mt-3">
-                            <p className="text-xs font-semibold text-zinc-700">Det bygger på:</p>
-                            <p className="mt-1 text-xs text-zinc-700">Feedback: {feedbackProof}</p>
-                            <p className="mt-1 text-xs italic text-zinc-700">Citat: &ldquo;{quoteProof}&rdquo;</p>
-                            <p className="mt-1 text-[11px] text-zinc-500">
-                              {evidenceText.title}
-                              {evidenceText.page ? `, side ${evidenceText.page}` : ""}
-                            </p>
-                          </div>
+                          {focusItem.evidenceBridge || quoteProof ? (
+                            <div className="mt-3">
+                              <p className="text-xs font-semibold text-zinc-700">Det bygger på</p>
+                              {focusItem.evidenceBridge ? (
+                                <p className="mt-1 text-sm leading-relaxed text-zinc-700">
+                                  {wholeSentenceOrEmpty(focusItem.evidenceBridge, 200) || focusItem.evidenceBridge}
+                                </p>
+                              ) : null}
+                              {!focusItem.evidenceBridge && quoteProof ? (
+                                <>
+                                  <p className="mt-1 text-sm italic leading-relaxed text-zinc-700">
+                                    &ldquo;{quoteProof}&rdquo;
+                                  </p>
+                                  <p className="mt-1 text-[11px] text-zinc-500">
+                                    {evidenceText?.title}
+                                    {evidenceText?.page ? `, side ${evidenceText.page}` : ""}
+                                  </p>
+                                </>
+                              ) : null}
+                            </div>
+                          ) : null}
 
                         </div>
                       );
                     })}
-                    <div className="border-t border-zinc-300 p-3">
-                      <p className="text-xs font-semibold text-zinc-700">Forslag til næste svar</p>
-                      <div className="mt-2 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs leading-relaxed text-zinc-700">
-                        <p>Forbedring: {suggestionCopy.improvement}</p>
-                        <p className="mt-1">Eksempel: {suggestionCopy.example}</p>
-                        <p className="mt-1">Kort forklaring: {suggestionCopy.shortExplanation}</p>
-                      </div>
-                    </div>
+	                    {visibleSuggestionLines.length > 0 ? (
+	                      <div className="border-t border-zinc-300 p-3">
+	                        <p className="text-xs font-semibold text-zinc-700">Forslag til næste svar</p>
+	                        <div className="mt-2 space-y-1 text-sm leading-relaxed text-zinc-700">
+	                          {visibleSuggestionLines.map((line) => (
+	                            <p key={line.label}>
+	                              {line.label}: {line.text}
+	                            </p>
+	                          ))}
+	                        </div>
+	                      </div>
+	                    ) : null}
                   </div>
                 )}
               </div>
@@ -1820,13 +2129,13 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
                     <p className="mt-1 text-[11px] text-zinc-500">Brugt i {topCitation.count} vurderinger.</p>
                     {snippetLoading ? (
                       <p className="mt-2 text-xs text-zinc-500">Henter uddrag...</p>
-                    ) : chunkSnippet?.snippetShort ? (
+                    ) : wholeSentenceOrEmpty(chunkSnippet?.snippetShort, 220) ? (
                       <p className="mt-2 max-h-24 overflow-hidden text-xs leading-relaxed text-zinc-700">
-                        {chunkSnippet.snippetShort}
+                        {wholeSentenceOrEmpty(chunkSnippet?.snippetShort, 220)}
                       </p>
-                    ) : topCitation?.snippet ? (
+                    ) : wholeSentenceOrEmpty(topCitation?.snippet, 220) ? (
                       <p className="mt-2 max-h-24 overflow-hidden text-xs leading-relaxed text-zinc-700">
-                        {clampWithEllipsis(topCitation.snippet, 220)}
+                        {wholeSentenceOrEmpty(topCitation?.snippet, 220)}
                       </p>
                     ) : snippetError ? (
                       <p className="mt-2 text-xs text-zinc-500">Kunne ikke hente uddrag.</p>
@@ -1862,40 +2171,37 @@ export default function MappeIndsigtClient({ folderId }: MappeIndsigtClientProps
               <h2 className="text-base font-semibold">Fokus nu</h2>
               <div className="mt-2">
                 <span
-                  className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-medium ${focusBadgeClass(stats)}`}
+                  className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-medium ${focusBadgeClass(stats, badgeTone)}`}
                 >
                   {focus}
                 </span>
               </div>
               <p className="mt-2 text-sm leading-relaxed text-zinc-700 break-words whitespace-normal">
-                Vælg dette fokus i de næste 1-2 svar, så du løfter både klarhed og faglig præcision.
+                {learningSummary.focus_reason ||
+                  "Vælg dette fokus i de næste 1-2 svar, så du løfter både klarhed og faglig præcision."}
               </p>
             </section>
 
-            <section className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm min-w-0">
-              <h2 className="text-base font-semibold">{COPY.writingTipsTitle}</h2>
-              <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-zinc-700">
-                <li>Vælg ét konkret tekststed til hver hovedpointe.</li>
-                <li>Forklar kort hvorfor dit belæg understøtter din påstand.</li>
-                <li>Slut af med en kort delkonklusion, før du går videre.</li>
-              </ul>
-            </section>
+            {visibleWritingTips.length > 0 ? (
+              <section className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm min-w-0">
+                <h2 className="text-base font-semibold">{COPY.writingTipsTitle}</h2>
+                <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-zinc-700">
+                  {visibleWritingTips.map((tip, index) => (
+                    <li key={`${index}-${tip}`}>{tip}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm min-w-0">
               <h2 className="text-base font-semibold">{COPY.nextStepTitle}</h2>
               <ul className="mt-3 space-y-2 text-sm text-zinc-700">
-                <li className="flex items-start gap-2">
-                  <span className="mt-[2px] text-zinc-500">✓</span>
-                  <span>{nextStep}</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="mt-[2px] text-zinc-500">✓</span>
-                  <span>Vælg fokus “Træn på det du er dårligst til”.</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="mt-[2px] text-zinc-500">✓</span>
-                  <span>Evaluer mindst 1 svar og brug feedbacken i næste forsøg.</span>
-                </li>
+                {nextStepChecklist.map((item) => (
+                  <li key={item} className="flex items-start gap-2">
+                    <span className="mt-[2px] text-zinc-500">✓</span>
+                    <span>{item}</span>
+                  </li>
+                ))}
               </ul>
               {canStartTargetedTraining ? (
                 <div className="mt-3">

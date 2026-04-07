@@ -649,6 +649,10 @@ export default function ClientTrainer({
 
       // ✅ efter første eval: knappen skal næste gang stå “Prøv igen”
       setEvalAttemptsUsed((n) => Math.min(EVAL_ATTEMPTS_MAX, n + 1));
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("trainer:evaluations-changed"));
+      }
+      router.refresh();
     } catch (err: any) {
       console.warn("[client-trainer] evaluate", {
         requestId: null,

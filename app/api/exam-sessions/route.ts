@@ -1,6 +1,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { buildFolderLearningSummary } from "@/lib/learning/ui-selectors";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 
 export const runtime = "nodejs";
@@ -23,6 +24,11 @@ type OverviewItem = {
   attemptsWritten: number;
   lastTrainedAt: string | null;
   avgLast5: number | null;
+  focus_label?: string | null;
+  focus_reason?: string | null;
+  next_training_text?: string | null;
+  next_step_text?: string | null;
+  focus_badge_tone?: "neutral" | "low" | "medium" | "high";
 
   folder_id: string;
   folder_title: string;
@@ -123,7 +129,7 @@ async function getOverview(req: NextRequest, sb: any, ownerId: string) {
 
   const { data, error } = await sb
     .from("exam_sessions")
-    .select("id, score, created_at, folder_id, source_type")
+    .select("id, score, created_at, folder_id, source_type, meta, metadata")
     .eq("owner_id", ownerId)
     .not("folder_id", "is", null)
     .in("source_type", sourceTypes)
@@ -165,6 +171,10 @@ async function getOverview(req: NextRequest, sb: any, ownerId: string) {
 
     const folderTitle = asNonEmpty((folder as any)?.name ?? null) ?? "Ukendt mappe";
     const attemptsWritten = sessions.length;
+    const learningSummary = buildFolderLearningSummary(sessions, {
+      avgLast5: avg_last5,
+      attemptsTotal: attemptsWritten,
+    });
 
     items.push({
       folderId,
@@ -178,6 +188,11 @@ async function getOverview(req: NextRequest, sb: any, ownerId: string) {
       attempts_total: attemptsWritten,
       avg_last5,
       last_trained_at,
+      focus_label: learningSummary.focus_label,
+      focus_reason: learningSummary.focus_reason,
+      next_training_text: learningSummary.next_training_text,
+      next_step_text: learningSummary.next_step_text,
+      focus_badge_tone: learningSummary.badge_tone,
     });
   }
 

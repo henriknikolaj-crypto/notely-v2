@@ -1,4 +1,8 @@
 import { resolveEvaluatorDefinition, type EvaluatorDefinition, type LearningSourceType } from "@/lib/learning/evaluator-registry";
+import { getDanskIssueDefaults } from "@/lib/dansk/evaluator";
+import { getMatematikIssueDefaults } from "@/lib/matematik/evaluator";
+import { getOkonomiIssueDefaults } from "@/lib/okonomi/evaluator";
+import { getSamfundIssueDefaults } from "@/lib/samfund/evaluator";
 
 export type LearningIssueSeverity = "low" | "medium" | "high";
 
@@ -186,13 +190,18 @@ function normalizeLearningIssue(raw: unknown, index: number): LearningIssue | nu
   const obj = asRecord(raw);
   if (!obj) return null;
 
-  const title = clampText(asText(obj.title ?? obj.label ?? obj.code), 140);
-  const code = toKey(asText(obj.code) || title || `issue_${index + 1}`, `issue_${index + 1}`);
-  const category = toKey(asText(obj.category) || "general", "general");
-  const diagnosis = clampText(asText(obj.diagnosis ?? obj.summary ?? obj.title), 260);
-  const whyItMatters = clampText(asText(obj.why_it_matters ?? obj.whyItMatters), 260);
-  const repair = clampText(asText(obj.repair ?? obj.action ?? obj.next_step ?? obj.nextStep), 220);
-  const example = clampText(asText(obj.example), 220);
+  const code = toKey(asText(obj.code) || asText(obj.title ?? obj.label) || `issue_${index + 1}`, `issue_${index + 1}`);
+  const defaults =
+    getSamfundIssueDefaults(code) ??
+    getDanskIssueDefaults(code) ??
+    getMatematikIssueDefaults(code) ??
+    getOkonomiIssueDefaults(code);
+  const title = clampText(asText(obj.title ?? obj.label ?? defaults?.title ?? obj.code), 140);
+  const category = toKey(asText(obj.category ?? defaults?.category) || "general", "general");
+  const diagnosis = clampText(asText(obj.diagnosis ?? obj.summary ?? obj.title ?? defaults?.diagnosis), 260);
+  const whyItMatters = clampText(asText(obj.why_it_matters ?? obj.whyItMatters ?? defaults?.why_it_matters), 260);
+  const repair = clampText(asText(obj.repair ?? obj.action ?? obj.next_step ?? obj.nextStep ?? defaults?.repair), 220);
+  const example = clampText(asText(obj.example ?? defaults?.example), 220);
   const evidence = normalizeEvidence(obj.evidence);
 
   if (!title && !diagnosis && !repair) return null;
@@ -202,11 +211,13 @@ function normalizeLearningIssue(raw: unknown, index: number): LearningIssue | nu
     category,
     severity: normalizeSeverity(obj.severity),
     title: title || clampText(code.replace(/_/g, " "), 140),
-    diagnosis: diagnosis || title || "Der er et tydeligt forbedringspunkt.",
+    diagnosis: diagnosis || title || defaults?.diagnosis || "Der er et tydeligt forbedringspunkt.",
     why_it_matters:
-      whyItMatters || "Det har betydning for kvaliteten af besvarelsen og hvor præcist spørgsmålet bliver besvaret.",
+      whyItMatters ||
+      defaults?.why_it_matters ||
+      "Det har betydning for kvaliteten af besvarelsen og hvor præcist spørgsmålet bliver besvaret.",
     evidence,
-    repair: repair || diagnosis || "Forbedr dette punkt i næste forsøg.",
+    repair: repair || defaults?.repair || diagnosis || "Forbedr dette punkt i næste forsøg.",
     ...(example ? { example } : {}),
   };
 }

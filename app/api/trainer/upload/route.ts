@@ -20,6 +20,7 @@ import {
 import { generateNotesForFile } from "@/lib/notes/generateFromFile";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
+import { getActiveFolderIdSet, purgeFileArtifacts, purgeInactiveDuplicateFiles } from "@/lib/server/file-purge";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -311,41 +312,6 @@ function buildQuotaExceededResponse(args: {
   );
 }
 
-async function cleanupUploadArtifacts(
-  admin: any,
-  args: { ownerId: string; fileId: string; storagePath: string; fileMd5: string },
-) {
-  const { ownerId, fileId, storagePath, fileMd5 } = args;
-
-  try {
-    await admin.from("notes").delete().eq("owner_id", ownerId).eq("file_id", fileId);
-  } catch {}
-
-  try {
-    await admin.from("notes").delete().eq("owner_id", ownerId).eq("source_url", `notely://audio/${fileId}`);
-  } catch {}
-
-  try {
-    await admin.from("ocr_texts").delete().eq("owner_id", ownerId).eq("file_id", fileId);
-  } catch {}
-
-  try {
-    await admin.from("ocr_texts").delete().eq("owner_id", ownerId).eq("file_md5", fileMd5);
-  } catch {}
-
-  try {
-    await admin.from("doc_chunks").delete().eq("owner_id", ownerId).eq("file_id", fileId);
-  } catch {}
-
-  try {
-    await admin.from("files").delete().eq("owner_id", ownerId).eq("id", fileId);
-  } catch {}
-
-  try {
-    await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
-  } catch {}
-}
-
 async function uploadStorageObjectExists(admin: any, storagePath: string) {
   const safePath = String(storagePath ?? "").trim();
   if (!safePath) return false;
@@ -355,6 +321,47 @@ async function uploadStorageObjectExists(admin: any, storagePath: string) {
   } catch {
     return false;
   }
+}
+
+async function findActiveDuplicateUpload(admin: any, args: { ownerId: string; md5: string }) {
+  const { ownerId, md5 } = args;
+  const { data, error } = await admin
+    .from("files")
+    .select("id,folder_id,storage_path")
+    .eq("owner_id", ownerId)
+    .eq("md5", md5)
+    .limit(20);
+
+  if (error) return { duplicate: null as null | { id: string; storage_path: string }, error };
+
+  const rows = Array.isArray(data)
+    ? (data as Array<{ id?: string | null; folder_id?: string | null; storage_path?: string | null }>)
+    : [];
+  const folderIds = Array.from(
+    new Set(
+      rows
+        .map((row) => String(row?.folder_id ?? "").trim())
+        .filter(Boolean),
+    ),
+  );
+
+  let activeFolderIds = new Set<string>();
+  try {
+    activeFolderIds = await getActiveFolderIdSet(admin, { ownerId, folderIds });
+  } catch (foldersError) {
+    return { duplicate: null as null | { id: string; storage_path: string }, error: foldersError };
+  }
+
+  for (const row of rows) {
+    const id = String(row?.id ?? "").trim();
+    const folderId = String(row?.folder_id ?? "").trim();
+    const storagePath = String(row?.storage_path ?? "").trim();
+    if (!id || !folderId || !storagePath) continue;
+    if (!activeFolderIds.has(folderId)) continue;
+    return { duplicate: { id, storage_path: storagePath }, error: null };
+  }
+
+  return { duplicate: null as null | { id: string; storage_path: string }, error: null };
 }
 
 export async function POST(req: NextRequest) {
@@ -455,6 +462,7 @@ export async function POST(req: NextRequest) {
       .select("id")
       .eq("owner_id", ownerId)
       .eq("id", folderId)
+      .is("archived_at", null)
       .maybeSingle();
 
     if (folderErr) console.error("[trainer/upload] folder lookup error:", errInfo(folderErr));
@@ -476,17 +484,20 @@ export async function POST(req: NextRequest) {
     const buf = Buffer.from(ab);
     const md5 = createHash("md5").update(buf).digest("hex");
 
-    // duplicate check (før quota)
-    const { data: existing, error: existingErr } = await admin
-      .from("files")
-      .select("id,storage_path")
-      .eq("owner_id", ownerId)
-      .eq("md5", md5)
-      .maybeSingle();
+    const { removedIds: orphanedDuplicateIds } = await purgeInactiveDuplicateFiles(admin, { ownerId, md5 });
+    if (orphanedDuplicateIds.length > 0) {
+      console.warn("[trainer/upload] purged inactive duplicate rows before insert:", {
+        ownerId,
+        md5,
+        removedIds: orphanedDuplicateIds,
+      });
+    }
 
+    // duplicate check (før quota)
+    const { duplicate: existing, error: existingErr } = await findActiveDuplicateUpload(admin, { ownerId, md5 });
     if (existingErr) console.error("[trainer/upload] duplicate lookup error:", errInfo(existingErr));
     if (existing?.id) {
-      const existingStoragePath = String((existing as any)?.storage_path ?? "").trim();
+      const existingStoragePath = String(existing.storage_path ?? "").trim();
       const storageStillExists = existingStoragePath
         ? await uploadStorageObjectExists(admin, existingStoragePath)
         : false;
@@ -509,7 +520,7 @@ export async function POST(req: NextRequest) {
         existingFileId: existing.id,
         storagePath: existingStoragePath || null,
       });
-      await cleanupUploadArtifacts(admin, {
+      await purgeFileArtifacts(admin, {
         ownerId,
         fileId: String(existing.id),
         storagePath: existingStoragePath,
@@ -748,7 +759,7 @@ export async function POST(req: NextRequest) {
       chunkCount = r.chunkCount;
     } catch (e) {
       console.error("[trainer/upload] rebuildDocChunks error:", errInfo(e));
-      await cleanupUploadArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
       return NextResponse.json(
         { ok: false, code: "CHUNK_BUILD_FAILED", error: "Kunne ikke bygge tekstgrundlag for filen.", requestId, fileId },
         { status: 500 },
@@ -788,7 +799,7 @@ export async function POST(req: NextRequest) {
         });
       } catch (e: any) {
         console.error("[trainer/upload] audio note generation error:", errInfo(e));
-        await cleanupUploadArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+        await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
 
         if (String(e?.code ?? "") === "NOTES_LIMIT_REACHED") {
           return NextResponse.json(
@@ -825,7 +836,7 @@ export async function POST(req: NextRequest) {
     });
 
     if (!quotaConsume.ok) {
-      await cleanupUploadArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
       if (quotaConsume.status === 429) {
         return buildQuotaExceededResponse({
           requestId,
