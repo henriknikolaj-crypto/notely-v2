@@ -31,6 +31,11 @@ type ImportStatusResponse = {
   // optional (nyere “flat” helpers)
   filesTotal?: number;
   latestFile?: { name?: string; uploadedAt?: string | null; updated_at?: string | null } | null;
+  folderReadinessSummary?: {
+    ready: number;
+    processing: number;
+    failed: number;
+  } | null;
 
   error?: string;
   details?: string;
@@ -88,6 +93,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [data, setData] = useState<ImportStatusResponse | null>(null);
+  const [uploadActive, setUploadActive] = useState(false);
 
   const url = useMemo(() => {
     const qs = folderId ? `folder_id=${encodeURIComponent(folderId)}` : "";
@@ -104,18 +110,19 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
           cache: "no-store",
           headers: { Accept: "application/json" },
         }),
-        fetch("/api/quota/current", {
-          method: "GET",
-          cache: "no-store",
-          headers: { Accept: "application/json" },
-        }),
+        uploadActive
+          ? Promise.resolve(null)
+          : fetch("/api/quota/current", {
+              method: "GET",
+              cache: "no-store",
+              headers: { Accept: "application/json" },
+            }),
       ]);
 
       const statusJson = (await safeJson(statusRes)) as ImportStatusResponse | null;
-      const quotaJson = (await safeJson(quotaRes)) as QuotaCurrentResponse | null;
+      const quotaJson = quotaRes ? ((await safeJson(quotaRes)) as QuotaCurrentResponse | null) : null;
 
-      if (statusRes.status === 401 || quotaRes.status === 401) {
-        setData(null);
+      if (statusRes.status === 401 || statusRes.status === 429 || quotaRes?.status === 401 || quotaRes?.status === 429) {
         setErr("Upload-status opdateres lige nu.");
         return;
       }
@@ -133,7 +140,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
       }
 
       const merged: ImportStatusResponse =
-        quotaRes.ok && quotaJson?.ok
+        quotaRes?.ok && quotaJson?.ok
           ? {
               ...statusJson,
               plan: quotaJson.plan ?? statusJson.plan,
@@ -154,29 +161,34 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
       setData(merged);
     } catch (e) {
       console.error("[ImportStatusBox] load error", e);
-      setData(null);
       setErr("Upload-status opdateres lige nu.");
     } finally {
       setLoading(false);
     }
-  }, [url]);
+  }, [url, uploadActive]);
 
   useEffect(() => {
     setLoading(true);
     void load();
 
     const onRefresh = () => void load();
+    const onUploadActivity = (event: Event) => {
+      const customEvent = event as CustomEvent<{ active?: boolean }>;
+      setUploadActive(Boolean(customEvent.detail?.active));
+    };
     window.addEventListener("notely:import-status-refresh", onRefresh);
     window.addEventListener("notely-quota-changed", onRefresh);
+    window.addEventListener("notely:upload-activity", onUploadActivity as EventListener);
 
-    const t = setInterval(() => void load(), Math.max(5000, refreshMs));
+    const t = uploadActive ? null : setInterval(() => void load(), Math.max(15000, refreshMs));
 
     return () => {
       window.removeEventListener("notely:import-status-refresh", onRefresh);
       window.removeEventListener("notely-quota-changed", onRefresh);
-      clearInterval(t);
+      window.removeEventListener("notely:upload-activity", onUploadActivity as EventListener);
+      if (t != null) clearInterval(t);
     };
-  }, [load, refreshMs]);
+  }, [load, refreshMs, uploadActive]);
 
   // ✅ robust udlæsning (nestet + flat)
   const planRaw = (data?.quota?.plan ?? data?.plan ?? "freemium").toString();
@@ -199,6 +211,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
   const latestName = data?.files?.latest?.name ?? data?.latestFile?.name ?? null;
   const latestAt =
     data?.files?.latest?.updated_at ?? data?.latestFile?.uploadedAt ?? data?.latestFile?.updated_at ?? null;
+  const folderReadinessSummary = data?.folderReadinessSummary ?? null;
 
   // ✅ info-tekst om slet (frigiver ikke sider)
   const showDeleteWarning = true;
@@ -252,6 +265,11 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
             </>
           ) : null}
         </div>
+        {folderReadinessSummary ? (
+          <div className="mt-2 text-[11px] text-zinc-500">
+            Klar: {folderReadinessSummary.ready} · Behandles: {folderReadinessSummary.processing} · Fejlede: {folderReadinessSummary.failed}
+          </div>
+        ) : null}
       </div>
 
       {loading ? <div className="mt-3 text-xs text-zinc-500">Indlæser…</div> : null}

@@ -101,6 +101,7 @@ type PdfPageSource = {
 
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+const OCR_TIMEOUT_MS = 45_000;
 const require = createRequire(import.meta.url);
 
 function normalizePageText(input: string) {
@@ -501,9 +502,14 @@ async function runOpenAIOcrForPage(args: {
   pageNumber: number;
   pagePdfBuffer: Buffer;
 }): Promise<string> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: OCR_TIMEOUT_MS });
   const base64 = args.pagePdfBuffer.toString("base64");
 
+  console.info("[pdf/extract] OCR request started", {
+    fileName: args.fileName,
+    pageNumber: args.pageNumber,
+    timeoutMs: OCR_TIMEOUT_MS,
+  });
   const response: any = await (openai as any).responses.create({
     model: OCR_MODEL,
     input: [
@@ -524,6 +530,10 @@ async function runOpenAIOcrForPage(args: {
         ],
       },
     ],
+  });
+  console.info("[pdf/extract] OCR request finished", {
+    fileName: args.fileName,
+    pageNumber: args.pageNumber,
   });
 
   return normalizePageText(getResponseText(response));

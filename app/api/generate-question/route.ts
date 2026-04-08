@@ -18,12 +18,16 @@ import { trackProductEvent } from "@/lib/server/trackProductEvent";
 import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
 import {
   buildGenerateQuestionPrompts,
+  calibrateGeneratedQuestionWithDiagnostics,
   clampInt,
   compactWeakPointTargetsForPrompt,
+  expandQuantitativeContextChunks,
   fileTitle,
+  inferQuestionSubjectFamily,
   pickDifficulty,
   pickFocusMode,
   scopeKeyFromFolderIds,
+  salvageTooLongTrainerQuestion,
   truncateContextForQuestionPrompt,
   uniqTrimmed,
   type ChunkRow,
@@ -32,6 +36,10 @@ import {
   type FocusMode,
   type WeakPointTarget,
 } from "@/lib/trainer/generate-question";
+import {
+  isImportJobFailedStatus,
+  normalizeImportJobRow,
+} from "@/lib/trainer/materialReadiness";
 import { supabaseServerRoute } from "@/lib/supabase/server-route";
 
 export const runtime = "nodejs";
@@ -265,6 +273,43 @@ async function finishTrainerRoundJob(db: any, ownerId: string, roundId: string, 
   } catch {
     // ignore
   }
+}
+
+async function getScopeMaterialState(args: {
+  admin: any;
+  ownerId: string;
+  fileIds: string[];
+}) {
+  if (args.fileIds.length === 0) {
+    return { hasFailedMaterial: false, hasProcessingMaterial: false };
+  }
+
+  const fileIdSet = new Set(args.fileIds.map((fileId) => String(fileId)));
+  const jobsRes = await args.admin
+    .from("jobs")
+    .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at")
+    .eq("owner_id", args.ownerId)
+    .eq("kind", "import")
+    .order("queued_at", { ascending: false, nullsFirst: false })
+    .limit(200);
+
+  if (jobsRes.error || !Array.isArray(jobsRes.data)) {
+    return { hasFailedMaterial: false, hasProcessingMaterial: true };
+  }
+
+  let hasFailedMaterial = false;
+  let hasProcessingMaterial = false;
+  for (const row of jobsRes.data as any[]) {
+    const job = normalizeImportJobRow(row);
+    if (!job?.fileId || !fileIdSet.has(job.fileId)) continue;
+    if (isImportJobFailedStatus(job.status)) {
+      hasFailedMaterial = true;
+      continue;
+    }
+    hasProcessingMaterial = true;
+  }
+
+  return { hasFailedMaterial, hasProcessingMaterial };
 }
 
 export async function POST(req: NextRequest) {
@@ -540,6 +585,7 @@ export async function POST(req: NextRequest) {
     if ((topicResult as any)?.data?.name) {
       topic = String((topicResult as any).data.name);
     }
+    const explicitSubjectFamily = inferQuestionSubjectFamily(topic, "");
 
     if (effectiveFocusMode === "weakest" && focusScopeFolderId) {
       const weakRowsArr = (((weakRowsResult as any)?.data ?? []) as LearningFocusSessionRow[]);
@@ -585,9 +631,11 @@ export async function POST(req: NextRequest) {
 
     let chosenFile: FileRow | null = null;
     let pickedChunks: ChunkRow[] = [];
+    let chosenPoolRows: ChunkRow[] = [];
 
     let fallbackFile: FileRow | null = null;
     let fallbackChunks: ChunkRow[] = [];
+    let fallbackPoolRows: ChunkRow[] = [];
 
     for (const f of rotated.slice(0, scanMax)) {
       metrics.fileCandidatesScanned += 1;
@@ -609,6 +657,7 @@ export async function POST(req: NextRequest) {
       if (!fallbackFile) {
         const rankedFallback = rankChunksForPrompt(nonEmpty, topic);
         fallbackFile = f;
+        fallbackPoolRows = nonEmpty;
         fallbackChunks = rankedFallback
           .slice(0, Math.min(maxContextChunks * 2, rankedFallback.length))
           .map((r) => r.chunk)
@@ -627,6 +676,7 @@ export async function POST(req: NextRequest) {
       ].join(" ");
       const rankedCandidate = rankChunksForPrompt(candidate, queryForRanking);
       chosenFile = f;
+      chosenPoolRows = nonEmpty;
       pickedChunks = rankedCandidate
         .slice(0, Math.min(maxContextChunks * 2, rankedCandidate.length))
         .map((r) => r.chunk)
@@ -639,21 +689,39 @@ export async function POST(req: NextRequest) {
     if (!chosenFile || pickedChunks.length === 0) {
       chosenFile = fallbackFile;
       pickedChunks = fallbackChunks;
+      chosenPoolRows = fallbackPoolRows;
     }
 
     if (!chosenFile || pickedChunks.length === 0) {
+      const materialState = await getScopeMaterialState({
+        admin,
+        ownerId,
+        fileIds: fileRows.map((file) => String(file.id)),
+      });
       const err: GenerateQuestionErr = {
         ok: false,
-        error: "Ingen kontekst fundet (doc_chunks). Tjek at upload/parse er kørt.",
+        code: materialState.hasFailedMaterial ? "MATERIAL_FAILED" : "MATERIAL_PROCESSING",
+        error: materialState.hasFailedMaterial
+          ? "Behandlingen af materialet fejlede. Gå til Upload og prøv igen."
+          : "Materialet behandles stadig. Prøv igen om lidt.",
         requestId,
         debug: { scopeFolderIds },
       };
-      return respond(err, 400);
+      return respond(err, materialState.hasFailedMaterial ? 409 : 409);
     }
 
     const usedFileId = String(chosenFile.id);
     generatedFileId = usedFileId;
     usedFileTitle = fileTitle(chosenFile);
+
+    const quantitativeExpansion = expandQuantitativeContextChunks({
+      topic,
+      explicitSubjectFamily,
+      selectedChunks: pickedChunks,
+      poolRows: chosenPoolRows,
+      maxExtraChunks: 2,
+    });
+    pickedChunks = quantitativeExpansion.chunks;
 
     const baseContextText = pickedChunks
       .map((c) => `KILDE: ${usedFileTitle}\n\n${(c.content ?? "").trim()}`)
@@ -668,6 +736,23 @@ export async function POST(req: NextRequest) {
     metrics.retrievalMs += nowMs() - retrievalStartedAt;
     metrics.selectedChunkCount = pickedChunks.length;
     metrics.contextChars = baseContextText.length;
+
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[generate-question][quantitative-context]", {
+        requestId,
+        selectedChunkIds: quantitativeExpansion.diagnostics.selectedChunkIds,
+        isQuantitative: quantitativeExpansion.diagnostics.isQuantitative,
+        explicitSubjectFamily: quantitativeExpansion.diagnostics.explicitSubjectFamily,
+        inferredSubjectFamily: quantitativeExpansion.diagnostics.inferredSubjectFamily,
+        resolvedSubjectFamily: quantitativeExpansion.diagnostics.resolvedSubjectFamily,
+        subjectFamily: quantitativeExpansion.diagnostics.subjectFamily,
+        addedChunkIds: quantitativeExpansion.diagnostics.addedChunkIds,
+        addedReasons: quantitativeExpansion.diagnostics.addedReasons,
+        containsCoordinates: quantitativeExpansion.diagnostics.containsCoordinates,
+        containsMeasurements: quantitativeExpansion.diagnostics.containsMeasurements,
+        containsConstant: quantitativeExpansion.diagnostics.containsConstant,
+      });
+    }
 
     const citations: TrainerCitationPayload[] = pickedChunks.map((c) => ({
       chunkId: String(c.id),
@@ -726,6 +811,7 @@ export async function POST(req: NextRequest) {
       const promptBuildStartedAt = nowMs();
       const { systemPrompt, userPrompt, biasApplied } = buildGenerateQuestionPrompts({
         topic,
+        explicitSubjectFamily,
         difficulty,
         effectiveFocusMode: strategy.focusMode,
         focusTargets: strategy.focusTargets,
@@ -760,12 +846,86 @@ export async function POST(req: NextRequest) {
         const finishReason = completion.choices?.[0]?.finish_reason ?? null;
         const parsedOutput = parseSingleQuestionOutput(raw, finishReason);
         const qText = normalizeQuestionOutput(parsedOutput.question);
-        const rejectReason: TrainerGenerationAttemptDiagnostic["rejectReason"] | null = !qText
+        const calibration = calibrateGeneratedQuestionWithDiagnostics(qText, {
+          topic,
+          contextText: strategy.contextText,
+          explicitSubjectFamily,
+        });
+        const rewrittenQuestion = normalizeQuestionOutput(calibration.question);
+        const salvagedTooLongQuestion =
+          rewrittenQuestion && isTooLongTrainerQuestion(rewrittenQuestion)
+            ? normalizeQuestionOutput(
+                salvageTooLongTrainerQuestion(rewrittenQuestion, {
+                  topic,
+                  contextText: strategy.contextText,
+                  explicitSubjectFamily,
+                }),
+              )
+            : "";
+        const finalCandidateQuestion = salvagedTooLongQuestion || rewrittenQuestion;
+        const rejectReason: TrainerGenerationAttemptDiagnostic["rejectReason"] | null = !finalCandidateQuestion
           ? "content_missing"
-          : isTooLongTrainerQuestion(qText)
+          : isTooLongTrainerQuestion(finalCandidateQuestion)
             ? "too_long"
             : null;
         metrics.parsingMs += nowMs() - parseStartedAt;
+
+        if (process.env.NODE_ENV !== "production" && calibration.profile.subjectFamily === "fysik") {
+          console.info("[generate-question][physics][calibration]", {
+            requestId,
+            strategy: strategy.key,
+            attempt: attempt + 1,
+            explicitSubjectFamily: calibration.diagnostics.explicitSubjectFamily,
+            inferredSubjectFamily: calibration.diagnostics.inferredSubjectFamily,
+            resolvedSubjectFamily: calibration.diagnostics.resolvedSubjectFamily,
+            subjectFamily: calibration.profile.subjectFamily,
+            rawQuestion: calibration.diagnostics.rawQuestion,
+            extractedCoordinates: calibration.diagnostics.physics?.coordinateSentence ?? "",
+            extractedCoordinatesSource: calibration.diagnostics.physics?.coordinateSource ?? "none",
+            extractedMeasurements: calibration.diagnostics.physics?.measurementSentence ?? "",
+            extractedMeasurementsSource: calibration.diagnostics.physics?.measurementSource ?? "none",
+            extractedTimeSentence: calibration.diagnostics.physics?.timeSentence ?? "",
+            timeSource: calibration.diagnostics.physics?.timeSource ?? "none",
+            timeMatches: calibration.diagnostics.physics?.timeMatches ?? [],
+            extractedDistance: calibration.diagnostics.physics?.distanceSentence ?? "",
+            extractedDistanceSource: calibration.diagnostics.physics?.distanceSource ?? "none",
+            derivedDistanceSentence: calibration.diagnostics.physics?.derivedDistanceSentence ?? "",
+            extractedConstant: calibration.diagnostics.physics?.constantInstruction ?? "",
+            extractedConstantSource: calibration.diagnostics.physics?.constantSource ?? "none",
+            extractedMainRequirement: calibration.diagnostics.physics?.mainRequirement ?? "",
+            extractedMainRequirementSource: calibration.diagnostics.physics?.mainRequirementSource ?? "none",
+            extractedHint: calibration.diagnostics.physics?.hintSentence ?? "",
+            extractedHintSource: calibration.diagnostics.physics?.hintSource ?? "none",
+            physicsPositionGuardTriggered: calibration.diagnostics.physics?.positionGuardTriggered ?? false,
+            physicsCompletenessGuardTriggered:
+              calibration.diagnostics.physics?.physicsCompletenessGuardTriggered ?? false,
+            hasCoordinates: calibration.diagnostics.physics?.hasCoordinates ?? false,
+            hasTimes: calibration.diagnostics.physics?.hasTimes ?? false,
+            hasConstant: calibration.diagnostics.physics?.hasConstant ?? false,
+            usedTimesInQuestion: calibration.diagnostics.physics?.usedTimesInQuestion ?? false,
+            hasDistanceDifferences: calibration.diagnostics.physics?.hasDistanceDifferences ?? false,
+            hasExtraDistance: calibration.diagnostics.physics?.hasExtraDistance ?? false,
+            usedDerivedDistanceFallback: calibration.diagnostics.physics?.usedDerivedDistanceFallback ?? false,
+            usedContextEnrichment: calibration.diagnostics.physics?.usedContextEnrichment ?? false,
+            usedPhysicsFallbackQuestion: calibration.diagnostics.physics?.usedPhysicsFallbackQuestion ?? false,
+            usedFallbackQuestion: calibration.diagnostics.physics?.usedFallbackQuestion ?? false,
+          });
+        }
+
+        if (process.env.NODE_ENV !== "production" && calibration.diagnostics.quantitative?.quantitativeGuardTriggered) {
+          console.info("[generate-question][quantitative][givens]", {
+            requestId,
+            strategy: strategy.key,
+            attempt: attempt + 1,
+            subjectFamily: calibration.profile.subjectFamily,
+            quantitativeGuardTriggered: calibration.diagnostics.quantitative.quantitativeGuardTriggered,
+            contextGivens: calibration.diagnostics.quantitative.contextGivens,
+            questionGivens: calibration.diagnostics.quantitative.questionGivens,
+            missingCriticalGivens: calibration.diagnostics.quantitative.missingCriticalGivens,
+            usedGivensEnrichment: calibration.diagnostics.quantitative.usedGivensEnrichment,
+            usedQuantitativeFallback: calibration.diagnostics.quantitative.usedQuantitativeFallback,
+          });
+        }
 
         if (rejectReason) {
           const diagnostic: TrainerGenerationAttemptDiagnostic = {
@@ -794,7 +954,7 @@ export async function POST(req: NextRequest) {
           continue;
         }
 
-        finalQuestion = qText;
+        finalQuestion = finalCandidateQuestion;
         finalBiasApplied = biasApplied;
         generationStrategyUsed = strategy.key;
         generationFallbackUsed = strategy.key === "weakest_simplified" || strategy.key === "normal_fallback";
@@ -805,9 +965,14 @@ export async function POST(req: NextRequest) {
     }
 
     if (!finalQuestion) {
+      const hasTooLongOnly =
+        generationAttemptDiagnostics.length > 0 &&
+        generationAttemptDiagnostics.every((diagnostic) => diagnostic.rejectReason === "too_long");
       const err: GenerateQuestionErr = {
         ok: false,
-        error: "Modellen returnerede tomt/ufuldstændigt output.",
+        error: hasTooLongOnly
+          ? "Modellen returnerede et for langt spørgsmål, som ikke kunne forkortes sikkert."
+          : "Modellen returnerede tomt/ufuldstændigt output.",
         requestId,
         ...(process.env.NODE_ENV !== "production"
           ? {

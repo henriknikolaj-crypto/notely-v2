@@ -1,10 +1,11 @@
 import "server-only";
 
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 import { createHash, randomUUID } from "node:crypto";
 import OpenAI from "openai";
+import { PDFDocument } from "pdf-lib";
 import { extractPdfWithFallback, type ExtractedPdfPage } from "@/lib/pdf/extractPdfWithFallback";
 import { buildChunksFromExtractedPages } from "@/lib/pdf/chunkStructuredPages";
 import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
@@ -18,6 +19,7 @@ import {
   getNoteEntitlement,
 } from "@/lib/notes/entitlements";
 import { generateNotesForFile } from "@/lib/notes/generateFromFile";
+import { normalizePlanCode } from "@/lib/plan/limits";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { trackProductEvent } from "@/lib/server/trackProductEvent";
 import { getActiveFolderIdSet, purgeFileArtifacts, purgeInactiveDuplicateFiles } from "@/lib/server/file-purge";
@@ -27,8 +29,17 @@ export const dynamic = "force-dynamic";
 
 // Hold denne i sync med DELETE-route (din /api/files/[id] bruger trainer_uploads)
 const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "trainer_uploads";
-const MAX_FILE_BYTES = 30 * 1024 * 1024; // hård beskyttelse (ikke quota)
+const MAX_FILE_BYTES = 50 * 1024 * 1024; // hård beskyttelse (ikke quota)
+const FREEMIUM_PDF_PAGE_LIMIT = 15;
 const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".mp4", ".mpeg", ".mpga", ".webm", ".ogg", ".oga", ".flac", ".aac"]);
+
+function logUploadStage(requestId: string, stage: string, meta?: Record<string, unknown>) {
+  console.info("[trainer/upload] stage", {
+    requestId,
+    stage,
+    ...(meta ?? {}),
+  });
+}
 
 function errInfo(e: any) {
   if (!e) return { message: "Unknown error" };
@@ -107,13 +118,43 @@ function resolveUploadAuthClient(req: NextRequest) {
 
 
 
-async function getPlan(admin: any, ownerId: string): Promise<string> {
+async function getUploadPlan(admin: any, ownerId: string): Promise<{
+  plan: string;
+  rawPlan: string | null;
+  resolved: boolean;
+}> {
   try {
-    const r = await admin.from("profiles").select("plan").eq("id", ownerId).maybeSingle();
-    const p = String((r.data as any)?.plan ?? "").trim();
-    return p || "freemium";
-  } catch {
-    return "freemium";
+    const r = await admin.from("profiles").select("id, plan").eq("id", ownerId).maybeSingle();
+    if (r.error) {
+      console.warn("[trainer/upload] plan lookup failed", {
+        ownerId,
+        error: errInfo(r.error),
+      });
+      return { plan: "freemium", rawPlan: null, resolved: false };
+    }
+
+    const profileId = String((r.data as any)?.id ?? "").trim();
+    const rawPlanValue = (r.data as any)?.plan;
+    const rawPlan = rawPlanValue == null ? null : String(rawPlanValue).trim();
+    if (!profileId) {
+      console.warn("[trainer/upload] plan lookup missing profile", {
+        ownerId,
+        rawPlan,
+      });
+      return { plan: normalizePlanCode(rawPlan), rawPlan, resolved: false };
+    }
+
+    return {
+      plan: normalizePlanCode(rawPlan),
+      rawPlan,
+      resolved: true,
+    };
+  } catch (error) {
+    console.warn("[trainer/upload] plan lookup exception", {
+      ownerId,
+      error: errInfo(error),
+    });
+    return { plan: "freemium", rawPlan: null, resolved: false };
   }
 }
 
@@ -123,6 +164,31 @@ async function tryInsertFile(admin: any, rows: Array<{ label: string; row: Recor
     const r = await admin.from("files").insert(attempt.row).select("id").maybeSingle();
     if (!r.error) return { ok: true as const, id: (r.data as any)?.id ?? attempt.row.id };
     console.error("[trainer/upload] files insert attempt failed:", {
+      label: attempt.label,
+      keys: Object.keys(attempt.row),
+      error: errInfo(r.error),
+    });
+    lastErr = r.error;
+  }
+  return { ok: false as const, error: lastErr };
+}
+
+async function tryInsertJob(admin: any, rows: Array<{ label: string; row: Record<string, unknown> }>) {
+  let lastErr: any = null;
+  for (const attempt of rows) {
+    const r = await admin.from("jobs").insert(attempt.row).select("id");
+    const data = r.data as any;
+    const insertId =
+      Array.isArray(data)
+        ? ((data[0] as any)?.id ? String((data[0] as any).id) : null)
+        : data && typeof data === "object" && "id" in data
+          ? String((data as any).id)
+          : null;
+    if (!r.error) {
+      const fallbackId = typeof attempt.row.id === "string" ? attempt.row.id : null;
+      return { ok: true as const, id: insertId ?? fallbackId, label: attempt.label };
+    }
+    console.warn("[trainer/upload] jobs insert attempt failed:", {
       label: attempt.label,
       keys: Object.keys(attempt.row),
       error: errInfo(r.error),
@@ -364,9 +430,523 @@ async function findActiveDuplicateUpload(admin: any, args: { ownerId: string; md
   return { duplicate: null as null | { id: string; storage_path: string }, error: null };
 }
 
+async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<string, unknown>) {
+  if (!jobId) return;
+  const payload = (patch as any).payload;
+  const meta = (patch as any).meta;
+  const errorValue = (patch as any).error;
+  const basePatch = { ...patch };
+
+  const seedPatches: Record<string, unknown>[] = [basePatch];
+  if (payload && !meta) {
+    const next = { ...basePatch };
+    delete (next as any).payload;
+    (next as any).meta = payload;
+    seedPatches.push(next);
+  }
+  if (typeof errorValue === "object" && errorValue !== null) {
+    seedPatches.push({
+      ...basePatch,
+      error: JSON.stringify(errorValue),
+    });
+  }
+  if (payload) {
+    const next = { ...basePatch };
+    delete (next as any).payload;
+    delete (next as any).result;
+    (next as any).meta = payload;
+    if (typeof errorValue === "object" && errorValue !== null) {
+      (next as any).error = JSON.stringify(errorValue);
+    }
+    seedPatches.push(next);
+  }
+
+  const attempts: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  const pushAttempt = (candidate: Record<string, unknown>) => {
+    const key = JSON.stringify(candidate);
+    if (seen.has(key)) return;
+    seen.add(key);
+    attempts.push(candidate);
+  };
+  for (const seed of seedPatches) {
+    pushAttempt(seed);
+    if ("started_at" in seed || "finished_at" in seed) {
+      const withoutTimestamps = { ...seed };
+      delete (withoutTimestamps as any).started_at;
+      delete (withoutTimestamps as any).finished_at;
+      pushAttempt(withoutTimestamps);
+    }
+  }
+
+  try {
+    let lastError: any = null;
+    for (const attempt of attempts) {
+      const result = await admin.from("jobs").update(attempt).eq("id", jobId);
+      if (!result.error) return;
+      lastError = result.error;
+    }
+    console.warn("[trainer/upload] job update warning:", {
+      jobId,
+      error: errInfo(lastError),
+      patchKeys: Object.keys(patch),
+    });
+  } catch (error) {
+    console.warn("[trainer/upload] job update warning:", { jobId, error: errInfo(error), patchKeys: Object.keys(patch) });
+  }
+}
+
+function buildJobTrackingPayload(args: {
+  requestId: string;
+  folderId: string | null;
+  fileName: string;
+  mimeType: string;
+  uploadKind: "pdf" | "audio" | "other";
+  sizeBytes: number | null;
+  stage: string;
+  md5?: string;
+  fileId?: string;
+  storagePath?: string;
+  pageCount?: number;
+  ocrPages?: number;
+  extractionMethod?: string;
+  extractionQuality?: string;
+  chunkCount?: number;
+}) {
+  const payload: Record<string, unknown> = {
+    source: "trainer_upload",
+    request_id: args.requestId,
+    folder_id: args.folderId,
+    file_name: args.fileName,
+    mime_type: args.mimeType,
+    upload_kind: args.uploadKind,
+    size_bytes: args.sizeBytes,
+    stage: args.stage,
+  };
+  if (args.md5) payload.md5 = args.md5;
+  if (args.fileId) payload.file_id = args.fileId;
+  if (args.storagePath) payload.storage_path = args.storagePath;
+  if (typeof args.pageCount === "number") payload.page_count = args.pageCount;
+  if (typeof args.ocrPages === "number") payload.ocr_pages = args.ocrPages;
+  if (args.extractionMethod) payload.extraction_method = args.extractionMethod;
+  if (args.extractionQuality) payload.extraction_quality = args.extractionQuality;
+  if (typeof args.chunkCount === "number") payload.chunkCount = args.chunkCount;
+  return payload;
+}
+
+async function countPdfPagesQuick(buf: Buffer) {
+  const doc = await PDFDocument.load(buf);
+  return Number(doc.getPageCount() ?? 0) || 0;
+}
+
+async function safeUpdateFileRecord(admin: any, fileId: string, patch: Record<string, unknown>) {
+  try {
+    const result = await admin.from("files").update(patch).eq("id", fileId);
+    if (result.error) {
+      console.warn("[trainer/upload] files update warning:", {
+        fileId,
+        error: errInfo(result.error),
+        patchKeys: Object.keys(patch),
+      });
+    }
+  } catch (error) {
+    console.warn("[trainer/upload] files update warning:", {
+      fileId,
+      error: errInfo(error),
+      patchKeys: Object.keys(patch),
+    });
+  }
+}
+
+async function processAcceptedPdfUpload(args: {
+  requestId: string;
+  jobId: string | null;
+  ownerId: string;
+  folderId: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  md5: string;
+  buf: Buffer;
+  fileId: string;
+  storagePath: string;
+  effectivePages: number;
+  quotaResetAt: string;
+}) {
+  const {
+    requestId,
+    jobId,
+    ownerId,
+    folderId,
+    originalName,
+    mimeType,
+    sizeBytes,
+    md5,
+    buf,
+    fileId,
+    storagePath,
+    effectivePages,
+    quotaResetAt,
+  } = args;
+  const admin = supabaseAdmin();
+
+  try {
+    logUploadStage(requestId, "processing_started", { jobId, fileId, storagePath });
+    await safeUpdateJob(admin, jobId, {
+      status: "started",
+      started_at: new Date().toISOString(),
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "processing_started",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "processing_started",
+      }),
+    });
+
+    logUploadStage(requestId, "pdf_extract_started", { jobId, fileName: originalName, fileId });
+    await safeUpdateJob(admin, jobId, {
+      status: "started",
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "pdf_extract_started",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "pdf_extract_started",
+      }),
+    });
+
+    const extraction = await extractPdfWithFallback(buf, { fileName: originalName });
+    logUploadStage(requestId, "pdf_extract_finished", {
+      jobId,
+      fileId,
+      pageCount: extraction.pageCount,
+      ocrPages: extraction.ocrPages,
+      extractionMethod: extraction.extractionMethod,
+    });
+    await safeUpdateFileRecord(admin, fileId, {
+      page_count: extraction.pageCount,
+      ocr_pages: extraction.ocrPages,
+      extraction_method: extraction.extractionMethod,
+      extraction_quality: extraction.extractionQuality,
+      extraction_meta: {
+        ...extraction.extractionMeta,
+        input_kind: "pdf",
+        processing_status: "extract_finished",
+        request_id: requestId,
+      },
+    });
+    await safeUpdateJob(admin, jobId, {
+      status: "started",
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        stage: "pdf_extract_finished",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        stage: "pdf_extract_finished",
+      }),
+    });
+
+    logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind: "pdf" });
+    await safeUpdateJob(admin, jobId, {
+      status: "started",
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        stage: "chunk_build_started",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        stage: "chunk_build_started",
+      }),
+    });
+    const chunkBuild = await rebuildDocChunksForFile(admin, {
+      ownerId,
+      fileId,
+      folderId,
+      originalName,
+      pages: extraction.pages,
+    });
+    await syncOcrTextsForFile(admin, {
+      ownerId,
+      fileId,
+      fileMd5: md5,
+      ocrTexts: extraction.ocrTexts,
+    });
+    logUploadStage(requestId, "chunk_build_finished", { jobId, fileId, chunkCount: chunkBuild.chunkCount });
+    await safeUpdateJob(admin, jobId, {
+      status: "started",
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        chunkCount: chunkBuild.chunkCount,
+        stage: "chunk_build_finished",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+        extractionQuality: extraction.extractionQuality,
+        chunkCount: chunkBuild.chunkCount,
+        stage: "chunk_build_finished",
+      }),
+    });
+
+    const quotaConsume = await quotaTryConsume({
+      admin,
+      ownerId,
+      feature: "import",
+      amount: extraction.pageCount,
+      exceededMessage: `Grænse nået. Du kan uploade igen efter nulstilling (${quotaResetAt ? formatDa(quotaResetAt) : "snart"}).`,
+    });
+
+    if (!quotaConsume.ok) {
+      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+      await safeUpdateJob(admin, jobId, {
+        status: "failed",
+        finished_at: new Date().toISOString(),
+        error: {
+          message:
+            quotaConsume.message ??
+            "Uploaden kunne ikke færdiggøres, fordi din upload-kvote blev nået under behandlingen.",
+        },
+        payload: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind: "pdf",
+          sizeBytes,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: extraction.pageCount,
+          ocrPages: extraction.ocrPages,
+          extractionMethod: extraction.extractionMethod,
+          extractionQuality: extraction.extractionQuality,
+          chunkCount: chunkBuild.chunkCount,
+          stage: "failed",
+        }),
+      });
+      return;
+    }
+
+    await safeUpdateFileRecord(admin, fileId, {
+      page_count: extraction.pageCount,
+      ocr_pages: extraction.ocrPages,
+      extraction_method: extraction.extractionMethod,
+      extraction_quality: extraction.extractionQuality,
+      extraction_meta: {
+        ...extraction.extractionMeta,
+        input_kind: "pdf",
+        processing_status: "finished",
+        request_id: requestId,
+      },
+    });
+    await safeUpdateJob(admin, jobId, {
+      status: "finished",
+      finished_at: new Date().toISOString(),
+      payload: {
+        ...buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind: "pdf",
+          sizeBytes,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: extraction.pageCount,
+          ocrPages: extraction.ocrPages,
+          extractionMethod: extraction.extractionMethod,
+          extractionQuality: extraction.extractionQuality,
+          chunkCount: chunkBuild.chunkCount,
+          stage: "finished",
+        }),
+        dominant_page_type: extraction.extractionMeta.dominant_page_type,
+        pages: extraction.pageCount,
+      },
+      result: {
+        ok: true,
+        requestId,
+        fileId,
+        folderId,
+        uploadKind: "pdf",
+        pages: extraction.pageCount,
+        chunkCount: chunkBuild.chunkCount,
+      },
+      error: null,
+    });
+    logUploadStage(requestId, "response_ready", {
+      jobId,
+      fileId,
+      uploadKind: "pdf",
+      pages: extraction.pageCount,
+      chunkCount: chunkBuild.chunkCount,
+      accepted: true,
+    });
+
+    await trackProductEvent({
+      admin,
+      ownerId,
+      eventName: "upload_completed",
+      metadata: {
+        source: "own",
+        folder_id: folderId,
+        file_id: fileId,
+        feature: "trainer_upload",
+        upload_kind: "pdf",
+      },
+    });
+  } catch (e: any) {
+    await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+    await safeUpdateJob(admin, jobId, {
+      status: "failed",
+      finished_at: new Date().toISOString(),
+      error: { message: e?.message ?? "PDF-behandling fejlede." },
+      payload: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "failed",
+      }),
+      meta: buildJobTrackingPayload({
+        requestId,
+        folderId,
+        fileName: originalName,
+        mimeType,
+        uploadKind: "pdf",
+        sizeBytes,
+        md5,
+        fileId,
+        storagePath,
+        pageCount: effectivePages,
+        stage: "failed",
+      }),
+    });
+    console.error("[trainer/upload] accepted pdf processing error:", errInfo(e));
+  }
+}
+
 export async function POST(req: NextRequest) {
-  const requestId = randomUUID();
+  const fallbackRequestId = randomUUID();
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
+  let requestId = fallbackRequestId;
+  let jobId: string | null = null;
 
   let ownerId = "";
   try {
@@ -436,6 +1016,9 @@ export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
 
+    requestId = String(form.get("request_id") ?? form.get("requestId") ?? fallbackRequestId).trim() || fallbackRequestId;
+    logUploadStage(requestId, "upload_started", { cookieCount: cookieNames.length });
+
     await ensureProfile(admin, ownerId);
 
     const folderId = String(form.get("folder_id") ?? form.get("folderId") ?? form.get("folder") ?? "").trim() || null;
@@ -444,12 +1027,19 @@ export async function POST(req: NextRequest) {
     if (!folderId) return NextResponse.json({ ok: false, error: "Manglende folder_id.", requestId }, { status: 400 });
     if (!file) return NextResponse.json({ ok: false, error: "Manglende fil.", requestId }, { status: 400 });
 
+    const originalName = stripPathy(file.name || "upload");
+    const mimeType = String((file as any).type || "application/octet-stream") || "application/octet-stream";
+    const uploadKind = detectUploadKind(file, originalName);
+
     if ((file as any).size != null && Number((file as any).size) > MAX_FILE_BYTES) {
       return NextResponse.json(
         {
           ok: false,
           code: "FILE_TOO_LARGE",
-          error: `Filen er for stor. Maks. ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB pr. fil.`,
+          error:
+            uploadKind === "pdf"
+              ? "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer."
+              : `Filen er for stor. Maks. ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB pr. fil.`,
           requestId,
         },
         { status: 413 },
@@ -469,10 +1059,6 @@ export async function POST(req: NextRequest) {
     if (!folderRow)
       return NextResponse.json({ ok: false, error: "Ugyldig mappe (folder_id).", requestId }, { status: 400 });
 
-    const originalName = stripPathy(file.name || "upload");
-    const mimeType = String((file as any).type || "application/octet-stream") || "application/octet-stream";
-    const uploadKind = detectUploadKind(file, originalName);
-
     if (uploadKind === "other") {
       return NextResponse.json(
         { ok: false, error: "Filtypen understøttes ikke endnu. Upload PDF eller lydfil.", requestId },
@@ -480,9 +1066,159 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    logUploadStage(requestId, "validation_passed", {
+      ownerId,
+      folderId,
+      fileName: originalName,
+      uploadKind,
+      sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+    });
+
+    try {
+      const jobQueuedAt = new Date().toISOString();
+      const jobRowId = randomUUID();
+      const jobTracking = {
+        source: "trainer_upload",
+        request_id: requestId,
+        folder_id: folderId,
+        file_name: originalName,
+        mime_type: mimeType,
+        upload_kind: uploadKind,
+        size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+        stage: "queued",
+      };
+      console.info("[trainer/upload] job create payload", {
+        requestId,
+        ownerId,
+        kind: "import",
+        status: "queued",
+        payload: jobTracking,
+        meta: jobTracking,
+      });
+      const jobInsert = await tryInsertJob(admin, [
+        {
+          label: "full_payload_meta_result_error",
+          row: {
+            id: jobRowId,
+            owner_id: ownerId,
+            kind: "import",
+            status: "queued",
+            queued_at: jobQueuedAt,
+            payload: jobTracking,
+            meta: jobTracking,
+            result: null,
+            error: null,
+          },
+        },
+        {
+          label: "payload_meta_only",
+          row: {
+            id: jobRowId,
+            owner_id: ownerId,
+            kind: "import",
+            status: "queued",
+            queued_at: jobQueuedAt,
+            payload: jobTracking,
+            meta: jobTracking,
+          },
+        },
+        {
+          label: "payload_only",
+          row: {
+            id: jobRowId,
+            owner_id: ownerId,
+            kind: "import",
+            status: "queued",
+            queued_at: jobQueuedAt,
+            payload: jobTracking,
+          },
+        },
+        {
+          label: "meta_only",
+          row: {
+            id: jobRowId,
+            owner_id: ownerId,
+            kind: "import",
+            status: "queued",
+            queued_at: jobQueuedAt,
+            meta: jobTracking,
+          },
+        },
+        {
+          label: "minimal_without_payload",
+          row: {
+            id: jobRowId,
+            owner_id: ownerId,
+            kind: "import",
+            status: "queued",
+            queued_at: jobQueuedAt,
+          },
+        },
+      ]);
+
+      if (jobInsert.ok && jobInsert.id) {
+        jobId = String(jobInsert.id);
+        logUploadStage(requestId, "job_created", { jobId, strategy: jobInsert.label });
+      } else {
+        const lookup = await admin
+          .from("jobs")
+          .select("id,payload,meta,queued_at")
+          .eq("owner_id", ownerId)
+          .eq("kind", "import")
+          .gte("queued_at", new Date(new Date(jobQueuedAt).getTime() - 5000).toISOString())
+          .lte("queued_at", new Date(new Date(jobQueuedAt).getTime() + 5000).toISOString())
+          .order("queued_at", { ascending: false, nullsFirst: false })
+          .limit(25);
+
+        if (!lookup.error && Array.isArray(lookup.data)) {
+          const matched = lookup.data.find((row: any) => {
+            const payloadRequestId = String(row?.payload?.request_id ?? "").trim();
+            const metaRequestId = String(row?.meta?.request_id ?? "").trim();
+            return payloadRequestId === requestId || metaRequestId === requestId;
+          });
+          if (matched?.id) {
+            jobId = String(matched.id);
+            logUploadStage(requestId, "job_linked_from_lookup", { jobId });
+          } else if (lookup.data.length === 1 && (lookup.data[0] as any)?.id) {
+            jobId = String((lookup.data[0] as any).id);
+            logUploadStage(requestId, "job_linked_from_time_window", { jobId });
+            await safeUpdateJob(admin, jobId, {
+              payload: jobTracking,
+              meta: jobTracking,
+            });
+          }
+        }
+
+        if (!jobId) {
+          console.warn("[trainer/upload] job create warning:", errInfo(jobInsert.error));
+        }
+      }
+      await safeUpdateJob(admin, jobId, {
+        status: "queued",
+        payload: jobTracking,
+        meta: jobTracking,
+      });
+    } catch (jobCreateError) {
+      console.warn("[trainer/upload] job create warning:", errInfo(jobCreateError));
+    }
+
     const ab = await file.arrayBuffer();
     const buf = Buffer.from(ab);
     const md5 = createHash("md5").update(buf).digest("hex");
+    logUploadStage(requestId, "file_buffered", { jobId, bytes: buf.length, md5 });
+    await safeUpdateJob(admin, jobId, {
+      payload: {
+        source: "trainer_upload",
+        request_id: requestId,
+        folder_id: folderId,
+        file_name: originalName,
+        mime_type: mimeType,
+        upload_kind: uploadKind,
+        size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+        md5,
+        stage: "file_buffered",
+      },
+    });
 
     const { removedIds: orphanedDuplicateIds } = await purgeInactiveDuplicateFiles(admin, { ownerId, md5 });
     if (orphanedDuplicateIds.length > 0) {
@@ -528,10 +1264,324 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    if (uploadKind === "pdf") {
+      let effectivePages = 0;
+      try {
+        effectivePages = await countPdfPagesQuick(buf);
+      } catch (e) {
+        const extractionError = errInfo(e);
+        console.error("[trainer/upload] pdf page count error", {
+          requestId,
+          filename: originalName,
+          contentType: mimeType || null,
+          size: typeof file.size === "number" ? file.size : buf.length,
+          errorMessage: extractionError.message ?? "Unknown error",
+        });
+        return NextResponse.json(
+          {
+            ok: false,
+            code: "PDF_UNREADABLE",
+            error: "PDF kunne ikke læses.",
+            requestId,
+          },
+          { status: 400 },
+        );
+      }
+
+      if (!effectivePages || effectivePages < 1) {
+        return NextResponse.json(
+          { ok: false, code: "PDF_NO_PAGES", error: "PDF har ingen sider.", requestId },
+          { status: 400 },
+        );
+      }
+
+      const planInfo = await getUploadPlan(admin, ownerId);
+      if (!planInfo.resolved) {
+        console.warn("[trainer/upload] skipping freemium page gate because plan lookup was not resolved", {
+          ownerId,
+          requestId,
+          rawPlan: planInfo.rawPlan,
+          normalizedPlan: planInfo.plan,
+          effectivePages,
+        });
+      }
+      if (planInfo.resolved && planInfo.plan === "freemium" && effectivePages > FREEMIUM_PDF_PAGE_LIMIT) {
+        return NextResponse.json(
+          {
+            ok: false,
+            code: "FILE_TOO_LONG",
+            message: `Denne PDF har ${effectivePages} sider, men Freemium-planen tillader maks. ${FREEMIUM_PDF_PAGE_LIMIT} sider pr. fil.`,
+            pages: effectivePages,
+            pageLimit: FREEMIUM_PDF_PAGE_LIMIT,
+            plan: planInfo.plan,
+            requestId,
+          },
+          { status: 413 },
+        );
+      }
+
+      let quotaBefore;
+      try {
+        quotaBefore = await getImportQuotaSnapshot({ admin, ownerId });
+      } catch (e) {
+        console.error("[trainer/upload] import quota snapshot error:", errInfo(e));
+        return NextResponse.json(
+          {
+            ok: false,
+            code: "QUOTA_CHECK_FAILED",
+            message: "Kunne ikke tjekke din grænse lige nu. Prøv igen om lidt.",
+            requestId,
+          },
+          { status: 503 },
+        );
+      }
+
+      if (quotaBefore.monthlyLimit != null && quotaBefore.usedThisMonth + effectivePages > quotaBefore.monthlyLimit) {
+        return buildQuotaExceededResponse({
+          requestId,
+          pages: effectivePages,
+          usedThisMonth: quotaBefore.usedThisMonth,
+          monthlyLimit: quotaBefore.monthlyLimit,
+          resetAt: quotaBefore.resetAt,
+        });
+      }
+
+      const fileId = randomUUID();
+      const fileExt = getFileExtension(originalName);
+      const storagePath = `${ownerId}/${folderId}/${fileId}${fileExt || ".pdf"}`;
+
+      logUploadStage(requestId, "storage_upload_started", { jobId, fileId, storagePath });
+      await safeUpdateJob(admin, jobId, {
+        payload: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "storage_upload_started",
+        }),
+        meta: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "storage_upload_started",
+        }),
+      });
+
+      const up = await admin.storage.from(UPLOAD_BUCKET).upload(storagePath, buf, {
+        contentType: mimeType || "application/pdf",
+        upsert: false,
+      });
+
+      if (up.error) {
+        console.error("[trainer/upload] storage upload error:", errInfo(up.error));
+        return NextResponse.json({ ok: false, error: "Kunne ikke uploade filen til storage.", requestId }, { status: 500 });
+      }
+
+      logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath });
+      await safeUpdateJob(admin, jobId, {
+        status: "queued",
+        payload: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "storage_upload_finished",
+        }),
+        meta: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "storage_upload_finished",
+        }),
+      });
+
+      const uploadedAt = new Date().toISOString();
+      const placeholderExtractionMeta = {
+        input_kind: uploadKind,
+        processing_status: "queued",
+        request_id: requestId,
+      };
+      const insertAttempts = [
+        {
+          label: "pdf_processing_full",
+          row: {
+            id: fileId,
+            owner_id: ownerId,
+            folder_id: folderId,
+            name: originalName,
+            original_name: originalName,
+            mime_type: mimeType,
+            size_bytes: (file as any).size ?? null,
+            storage_path: storagePath,
+            md5,
+            uploaded_at: uploadedAt,
+            page_count: effectivePages,
+            ocr_pages: 0,
+            extraction_method: null,
+            extraction_quality: null,
+            extraction_meta: placeholderExtractionMeta,
+          },
+        },
+        {
+          label: "pdf_processing_compact",
+          row: {
+            id: fileId,
+            owner_id: ownerId,
+            folder_id: folderId,
+            name: originalName,
+            original_name: originalName,
+            mime_type: mimeType,
+            size_bytes: (file as any).size ?? null,
+            storage_path: storagePath,
+            md5,
+            uploaded_at: uploadedAt,
+            page_count: effectivePages,
+            extraction_meta: placeholderExtractionMeta,
+          },
+        },
+        {
+          label: "pdf_processing_legacy",
+          row: {
+            id: fileId,
+            owner_id: ownerId,
+            folder_id: folderId,
+            name: originalName,
+            original_name: originalName,
+            storage_path: storagePath,
+            md5,
+            uploaded_at: uploadedAt,
+          },
+        },
+      ];
+
+      const ins = await tryInsertFile(admin, insertAttempts);
+      if (!ins.ok) {
+        console.error("[trainer/upload] files insert error:", errInfo(ins.error));
+        try {
+          await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+        } catch {}
+        return NextResponse.json({ ok: false, error: "Kunne ikke gemme fil i databasen.", requestId }, { status: 500 });
+      }
+
+      await safeUpdateJob(admin, jobId, {
+        status: "queued",
+        payload: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "queued",
+        }),
+        meta: buildJobTrackingPayload({
+          requestId,
+          folderId,
+          fileName: originalName,
+          mimeType,
+          uploadKind,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          fileId,
+          storagePath,
+          pageCount: effectivePages,
+          stage: "queued",
+        }),
+      });
+      logUploadStage(requestId, "response_ready", {
+        jobId,
+        fileId,
+        uploadKind,
+        pages: effectivePages,
+        accepted: true,
+      });
+
+      after(async () => {
+        await processAcceptedPdfUpload({
+          requestId,
+          jobId,
+          ownerId,
+          folderId,
+          originalName,
+          mimeType,
+          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          buf,
+          fileId,
+          storagePath,
+          effectivePages,
+          quotaResetAt: quotaBefore.resetAt,
+        });
+      });
+
+      return NextResponse.json(
+        {
+          ok: true,
+          accepted: true,
+          processing: true,
+          requestId,
+          jobId,
+          fileId,
+          folderId,
+          md5,
+          uploadKind,
+          pages: effectivePages,
+          stage: "queued",
+          jobStatus: "queued",
+          storage: { bucket: UPLOAD_BUCKET, path: storagePath },
+        },
+        { status: 202 },
+      );
+    }
+
     let extraction: Awaited<ReturnType<typeof extractPdfWithFallback>> | null = null;
     let transcriptText = "";
 
     if (uploadKind === "pdf") {
+      logUploadStage(requestId, "pdf_extract_started", { jobId, fileName: originalName });
+      await safeUpdateJob(admin, jobId, {
+        payload: {
+          source: "trainer_upload",
+          request_id: requestId,
+          folder_id: folderId,
+          file_name: originalName,
+          mime_type: mimeType,
+          upload_kind: uploadKind,
+          size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          stage: "pdf_extract_started",
+        },
+      });
       try {
         extraction = await extractPdfWithFallback(buf, { fileName: originalName });
       } catch (e) {
@@ -557,6 +1607,29 @@ export async function POST(req: NextRequest) {
           { status: 400 },
         );
       }
+
+      logUploadStage(requestId, "pdf_extract_finished", {
+        jobId,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+      });
+      await safeUpdateJob(admin, jobId, {
+        payload: {
+          source: "trainer_upload",
+          request_id: requestId,
+          folder_id: folderId,
+          file_name: originalName,
+          mime_type: mimeType,
+          upload_kind: uploadKind,
+          size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+          md5,
+          stage: "pdf_extract_finished",
+          page_count: extraction.pageCount,
+          ocr_pages: extraction.ocrPages,
+          extraction_method: extraction.extractionMethod,
+        },
+      });
 
       if (!extraction.pageCount || extraction.pageCount < 1) {
         return NextResponse.json(
@@ -591,15 +1664,25 @@ export async function POST(req: NextRequest) {
 
     const effectivePages = uploadKind === "audio" ? 1 : extraction!.pageCount;
 
-    const plan = await getPlan(admin, ownerId);
-    if (uploadKind === "pdf" && plan === "freemium" && effectivePages > 10) {
+    const planInfo = await getUploadPlan(admin, ownerId);
+    if (!planInfo.resolved) {
+      console.warn("[trainer/upload] skipping freemium page gate because plan lookup was not resolved", {
+        ownerId,
+        requestId,
+        rawPlan: planInfo.rawPlan,
+        normalizedPlan: planInfo.plan,
+        effectivePages,
+      });
+    }
+    if (uploadKind === "pdf" && planInfo.resolved && planInfo.plan === "freemium" && effectivePages > FREEMIUM_PDF_PAGE_LIMIT) {
       return NextResponse.json(
         {
           ok: false,
           code: "FILE_TOO_LONG",
-          message: "Denne fil er for stor til Freemium-planen. Maks. 10 sider pr. fil.",
+          message: `Denne PDF har ${effectivePages} sider, men Freemium-planen tillader maks. ${FREEMIUM_PDF_PAGE_LIMIT} sider pr. fil.`,
           pages: effectivePages,
-          pageLimit: 10,
+          pageLimit: FREEMIUM_PDF_PAGE_LIMIT,
+          plan: planInfo.plan,
           requestId,
         },
         { status: 413 },
@@ -637,6 +1720,23 @@ export async function POST(req: NextRequest) {
     const fileExt = getFileExtension(originalName);
     const storagePath = `${ownerId}/${folderId}/${fileId}${fileExt || (uploadKind === "pdf" ? ".pdf" : ".bin")}`;
 
+    logUploadStage(requestId, "storage_upload_started", { jobId, fileId, storagePath });
+    await safeUpdateJob(admin, jobId, {
+      payload: {
+        source: "trainer_upload",
+        request_id: requestId,
+        folder_id: folderId,
+        file_name: originalName,
+        mime_type: mimeType,
+        upload_kind: uploadKind,
+        size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+        md5,
+        file_id: fileId,
+        storage_path: storagePath,
+        stage: "storage_upload_started",
+      },
+    });
+
     const up = await admin.storage.from(UPLOAD_BUCKET).upload(storagePath, buf, {
       contentType: mimeType || "application/pdf",
       upsert: false,
@@ -646,6 +1746,8 @@ export async function POST(req: NextRequest) {
       console.error("[trainer/upload] storage upload error:", errInfo(up.error));
       return NextResponse.json({ ok: false, error: "Kunne ikke uploade filen til storage.", requestId }, { status: 500 });
     }
+
+    logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath });
 
     const uploadedAt = new Date().toISOString();
 
@@ -740,6 +1842,7 @@ export async function POST(req: NextRequest) {
     // ✅ lav chunks nu (så du ikke ender i 0-chunks igen)
     let chunkCount = 0;
     try {
+      logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind });
       const r =
         uploadKind === "pdf"
           ? await rebuildDocChunksForFile(admin, {
@@ -757,6 +1860,7 @@ export async function POST(req: NextRequest) {
               transcriptText,
             });
       chunkCount = r.chunkCount;
+      logUploadStage(requestId, "chunk_build_finished", { jobId, fileId, chunkCount });
     } catch (e) {
       console.error("[trainer/upload] rebuildDocChunks error:", errInfo(e));
       await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
@@ -778,6 +1882,7 @@ export async function POST(req: NextRequest) {
     let generatedNotes: any[] = [];
     if (uploadKind === "audio") {
       try {
+        logUploadStage(requestId, "audio_notes_started", { jobId, fileId });
         const requestedModes = parseRequestedNoteModes(form.get("audio_note_mode"));
         for (const mode of requestedModes) {
           await assertCanGenerateNoteType(admin, ownerId, mode === "golden" ? "focus" : "resume");
@@ -797,6 +1902,7 @@ export async function POST(req: NextRequest) {
           fileId,
           modes: requestedModes,
         });
+        logUploadStage(requestId, "audio_notes_finished", { jobId, fileId, generatedNotes: generatedNotes.length });
       } catch (e: any) {
         console.error("[trainer/upload] audio note generation error:", errInfo(e));
         await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
@@ -857,32 +1963,37 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // valgfri job-log (best-effort)
-    try {
-      await admin.from("jobs").insert({
-        id: randomUUID(),
-        owner_id: ownerId,
-        kind: "import",
-        status: "finished",
-        queued_at: uploadedAt,
-        started_at: uploadedAt,
-        finished_at: new Date().toISOString(),
-        payload: {
-          source: "trainer_upload",
-          input_kind: uploadKind,
-          folder_id: folderId,
-          file_id: fileId,
-          md5,
-          pages: effectivePages,
-          chunkCount,
-          extraction_method: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
-          extraction_quality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
-          ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-          dominant_page_type: uploadKind === "pdf" ? extraction!.extractionMeta.dominant_page_type : "audio_transcript",
-          storage_path: storagePath,
-        },
-      });
-    } catch {}
+    await safeUpdateJob(admin, jobId, {
+      status: "finished",
+      finished_at: new Date().toISOString(),
+      payload: {
+        source: "trainer_upload",
+        request_id: requestId,
+        input_kind: uploadKind,
+        folder_id: folderId,
+        file_id: fileId,
+        md5,
+        pages: effectivePages,
+        chunkCount,
+        extraction_method: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
+        extraction_quality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
+        ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
+        dominant_page_type: uploadKind === "pdf" ? extraction!.extractionMeta.dominant_page_type : "audio_transcript",
+        storage_path: storagePath,
+        stage: "finished",
+      },
+      result: {
+        ok: true,
+        requestId,
+        fileId,
+        folderId,
+        uploadKind,
+        pages: effectivePages,
+        chunkCount,
+      },
+      error: null,
+    });
+    logUploadStage(requestId, "response_ready", { jobId, fileId, uploadKind, pages: effectivePages, chunkCount });
 
     await trackProductEvent({
       admin,
@@ -901,6 +2012,7 @@ export async function POST(req: NextRequest) {
       {
         ok: true,
         requestId,
+        jobId,
         fileId,
         folderId,
         md5,
@@ -921,6 +2033,16 @@ export async function POST(req: NextRequest) {
       { status: 200 },
     );
   } catch (e: any) {
+    await safeUpdateJob(admin, jobId, {
+      status: "failed",
+      finished_at: new Date().toISOString(),
+      error: { message: e?.message ?? "Uventet fejl i upload." },
+      payload: {
+        source: "trainer_upload",
+        request_id: requestId,
+        stage: "failed",
+      },
+    });
     console.error("[trainer/upload] route error:", errInfo(e));
     return NextResponse.json({ ok: false, error: e?.message ?? "Uventet fejl i upload.", requestId }, { status: 500 });
   }

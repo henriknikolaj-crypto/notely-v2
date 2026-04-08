@@ -19,12 +19,48 @@ type FileRow = {
   uploadedAt: string | null;
 };
 
+type FileReadiness = {
+  id: string;
+  readiness: "ready" | "processing" | "failed";
+  readinessLabel: string;
+  readinessDetail: string | null;
+  ready: boolean;
+  chunkCount: number;
+  jobStatus: string | null;
+  jobStage: string | null;
+};
+
 type UploadResult = {
   kind: "pdf" | "audio";
   fileName: string;
   message: string;
   noteCount?: number;
   audioNoteMode?: "resume" | "focus" | "both";
+};
+
+type ActiveUpload = {
+  requestId: string;
+  startedAt: number;
+  fileName: string;
+  folderId: string;
+  jobId: string | null;
+  fileId: string | null;
+  responseSettled: boolean;
+  kind: "pdf" | "audio";
+  status: string | null;
+  stage: string | null;
+};
+
+type ImportStatusPayload = {
+  ok?: boolean;
+  error?: string | null;
+  activeJob?: {
+    id?: string | null;
+    status?: string | null;
+    stage?: string | null;
+    error?: string | null;
+  } | null;
+  folderFiles?: FileReadiness[] | null;
 };
 
 type GeneratedUploadNote = {
@@ -39,6 +75,27 @@ type Props = {
   ownerId: string;
   onFoldersChange?: (folders: Folder[]) => void;
 };
+
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const PDF_TOO_LARGE_ERROR = "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer.";
+const PDF_TOO_MANY_PAGES_ERROR = "PDF’en har for mange sider til din plan.";
+const MONTHLY_IMPORT_QUOTA_ERROR = "Du har nået din månedlige importkvote.";
+const WEBUPLOAD_PAYLOAD_TOO_LARGE_ERROR =
+  "Filen er for stor til at blive sendt gennem webupload lige nu. Prøv en mindre fil eller komprimer PDF’en.";
+const UPLOAD_STATUS_POLL_MS = 5_000;
+const UPLOAD_STATUS_BACKOFF_MS = 15_000;
+const UPLOAD_JOB_BOOT_TIMEOUT_MS = 45_000;
+const DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
+const PDF_UPLOAD_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+const ACTIVE_UPLOAD_REFRESH_MS = 15_000;
+const UPLOAD_READY_FOLLOWUP_REFRESH_MS = 1_500;
+
+function createClientRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `upload_${Date.now()}`;
+}
 
 function asString(v: any): string | null {
   if (v == null) return null;
@@ -101,11 +158,106 @@ function safeJson(text: string) {
   }
 }
 
+function isVercelPayloadTooLarge(status: number, res: Response | null, responseText: string, data: any) {
+  if (status !== 413) return false;
+  const headerSignal = String(res?.headers.get("x-vercel-error") ?? "")
+    .trim()
+    .toUpperCase();
+  if (headerSignal === "FUNCTION_PAYLOAD_TOO_LARGE") return true;
+
+  const codeSignal = String(data?.code ?? "").trim().toUpperCase();
+  if (codeSignal === "FUNCTION_PAYLOAD_TOO_LARGE") return true;
+
+  const textSignal = String(responseText ?? "").trim().toUpperCase();
+  return textSignal.includes("FUNCTION_PAYLOAD_TOO_LARGE");
+}
+
+function resolveUploadErrorMessage(
+  status: number,
+  data: any,
+  file: File | null,
+  options?: { res?: Response | null; responseText?: string | null },
+) {
+  const res = options?.res ?? null;
+  const responseText = String(options?.responseText ?? "");
+  const serverMessage = asString(data?.message) ?? asString(data?.error);
+  if (serverMessage) return serverMessage;
+
+  const code = String(data?.code ?? "").trim().toUpperCase();
+
+  if (status === 402 || status === 429) {
+    return MONTHLY_IMPORT_QUOTA_ERROR;
+  }
+
+  if (status === 413) {
+    if (isVercelPayloadTooLarge(status, res, responseText, data)) {
+      return WEBUPLOAD_PAYLOAD_TOO_LARGE_ERROR;
+    }
+    if (code === "FILE_TOO_LARGE") {
+      if (isPdfFile(file)) return PDF_TOO_LARGE_ERROR;
+      return `Filen er for stor. Maks. ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB pr. fil.`;
+    }
+    if (code === "FILE_TOO_LONG") {
+      return PDF_TOO_MANY_PAGES_ERROR;
+    }
+    if (isPdfFile(file) && typeof file?.size === "number" && file.size > MAX_FILE_BYTES) {
+      return PDF_TOO_LARGE_ERROR;
+    }
+    if (isPdfFile(file)) {
+      return PDF_TOO_MANY_PAGES_ERROR;
+    }
+  }
+
+  if (status >= 400) {
+    if (isVercelPayloadTooLarge(status, res, responseText, data)) {
+      return WEBUPLOAD_PAYLOAD_TOO_LARGE_ERROR;
+    }
+    return `Ukendt uploadfejl (${status}). Prøv igen.`;
+  }
+
+  return "Ukendt uploadfejl. Prøv igen.";
+}
+
+function buildReadinessMap(rows: FileReadiness[]) {
+  return rows.reduce<Record<string, FileReadiness>>((acc, row) => {
+    if (!row?.id) return acc;
+    acc[String(row.id)] = row;
+    return acc;
+  }, {});
+}
+
+function findMatchingUploadFile(upload: ActiveUpload | null, rows: FileRow[]) {
+  if (!upload) return null;
+  return (
+    rows.find((file) => {
+      if (upload.fileId && file.id === upload.fileId) return true;
+      return file.name === upload.fileName;
+    }) ?? null
+  );
+}
+
+function isUploadReadyFromSnapshot(
+  upload: ActiveUpload | null,
+  rows: FileRow[],
+  readinessById: Record<string, FileReadiness>,
+) {
+  const matchedFile = findMatchingUploadFile(upload, rows);
+  if (!matchedFile) return false;
+  return readinessById[matchedFile.id]?.ready === true;
+}
+
 function isAudioFile(file: File | null) {
   if (!file) return false;
   const mime = String(file.type ?? "").toLowerCase();
   if (mime.startsWith("audio/")) return true;
   return /\.(mp3|m4a|wav|mp4|mpeg|mpga|webm|ogg|oga|flac|aac)$/i.test(file.name ?? "");
+}
+
+function isPdfFile(file: File | null) {
+  if (!file) return false;
+  const mime = String(file.type ?? "").toLowerCase();
+  if (mime === "application/pdf") return true;
+  return /\.pdf$/i.test(file.name ?? "");
 }
 
 function pickImportQuota(json: any): { used: number; limit: number | null } {
@@ -118,6 +270,23 @@ function pickImportQuota(json: any): { used: number; limit: number | null } {
     (typeof json?.monthlyLimit === "number" ? json.monthlyLimit : null);
 
   return { used: Number.isFinite(used) ? used : 0, limit: typeof limit === "number" ? limit : null };
+}
+
+function describeProcessingStage(activeUpload: ActiveUpload | null) {
+  if (!activeUpload || activeUpload.kind !== "pdf" || !activeUpload.responseSettled) return null;
+
+  const status = String(activeUpload.status ?? "").toLowerCase();
+  const stage = String(activeUpload.stage ?? "").toLowerCase();
+
+  if (status === "failed") return "Behandlingen af PDF’en fejlede.";
+  if (stage === "queued") return "PDF’en er modtaget. Materialet står i kø til behandling.";
+  if (stage === "processing_started") return "PDF’en er modtaget. Materialet bliver klargjort nu.";
+  if (stage === "pdf_extract_started") return "PDF’en læses og OCR-behandles nu.";
+  if (stage === "pdf_extract_finished" || stage === "chunk_build_started") {
+    return "Teksten er hentet. Materialet bliver gjort klar til brug i Notely.";
+  }
+  if (stage === "chunk_build_finished") return "Materialet færdiggøres nu.";
+  return "PDF’en er modtaget. Materialet bliver gjort klar til brug i Notely.";
 }
 
 export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId, onFoldersChange }: Props) {
@@ -144,6 +313,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [files, setFiles] = useState<FileRow[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError, setFilesError] = useState<string | null>(null);
+  const [fileReadinessById, setFileReadinessById] = useState<Record<string, FileReadiness>>({});
 
   // upload
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -155,6 +325,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [quotaBlocked, setQuotaBlocked] = useState<string | null>(null);
   const [audioNoteMode, setAudioNoteMode] = useState<"resume" | "focus" | "both">("both");
   const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
+  const [activeUpload, setActiveUpload] = useState<ActiveUpload | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const uploadAbortReasonRef = useRef<string | null>(null);
+  const lastActiveUploadRefreshRef = useRef(0);
+  const uploadReadyRefreshTimeoutRef = useRef<number | null>(null);
 
   // delete
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -174,6 +349,15 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const dispatchImportStatusRefresh = useCallback(() => {
     if (typeof window === "undefined") return;
     window.dispatchEvent(new Event("notely:import-status-refresh"));
+  }, []);
+
+  const dispatchUploadActivity = useCallback((active: boolean) => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(
+      new CustomEvent("notely:upload-activity", {
+        detail: { active },
+      }),
+    );
   }, []);
 
   const folderOptions = useMemo(() => folders, [folders]);
@@ -287,43 +471,59 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const loadFiles = useCallback(async (folderId: string | null) => {
     if (!folderId) {
       setFiles([]);
-      return;
+      setFileReadinessById({});
+      return { files: [] as FileRow[], readinessById: {} as Record<string, FileReadiness> };
     }
 
     setFilesLoading(true);
     setFilesError(null);
 
     try {
-      const url = `/api/files?folder_id=${encodeURIComponent(folderId)}`;
-      const res = await fetch(url, { method: "GET", cache: "no-store", headers: { Accept: "application/json" } });
+      const filesUrl = `/api/files?folder_id=${encodeURIComponent(folderId)}`;
+      const [res, readinessRes] = await Promise.all([
+        fetch(filesUrl, { method: "GET", cache: "no-store", headers: { Accept: "application/json" } }),
+        fetch(`/api/import-status?folder_id=${encodeURIComponent(folderId)}`, {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        }),
+      ]);
       const text = await res.text();
       const json = safeJson(text);
+      const readinessText = await readinessRes.text();
+      const readinessJson = (safeJson(readinessText) ?? {}) as ImportStatusPayload;
 
       if (res.status === 401) {
         setFiles([]);
         setFilesError("Filer opdateres lige nu.");
-        return;
+        return null;
       }
 
       if (!res.ok) {
         setFiles([]);
         setFilesError("Filer opdateres lige nu.");
-        return;
+        return null;
       }
 
       if (!json || json.ok === false) {
         setFiles([]);
         setFilesError("Filer opdateres lige nu.");
-        return;
+        return null;
       }
 
       const raw = Array.isArray(json.files) ? json.files : Array.isArray(json.items) ? json.items : [];
       const normalized = raw.map(normalizeFileRow).filter(Boolean) as FileRow[];
       setFiles(normalized);
+      const readinessRows = Array.isArray(readinessJson.folderFiles) ? readinessJson.folderFiles : [];
+      const readinessById = buildReadinessMap(readinessRows);
+      setFileReadinessById(readinessById);
+      return { files: normalized, readinessById };
     } catch (e) {
       console.error("[UploadClient] loadFiles error", e);
       setFiles([]);
+      setFileReadinessById({});
       setFilesError("Filer opdateres lige nu.");
+      return null;
     } finally {
       setFilesLoading(false);
     }
@@ -333,10 +533,29 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     void loadFiles(listFolderId);
   }, [listFolderId, loadFiles]);
 
+  useEffect(() => {
+    lastActiveUploadRefreshRef.current = 0;
+  }, [activeUpload?.requestId]);
+
+  useEffect(() => {
+    return () => {
+      if (uploadReadyRefreshTimeoutRef.current != null) {
+        window.clearTimeout(uploadReadyRefreshTimeoutRef.current);
+      }
+    };
+  }, []);
+
   function onPickFile(f: File | null) {
     setUploadError(null);
     setUploadNotice(null);
     setUploadResult(null);
+
+    if (f && isPdfFile(f) && typeof f.size === "number" && f.size > MAX_FILE_BYTES) {
+      setPickedFile(null);
+      setUploadError(PDF_TOO_LARGE_ERROR);
+      return;
+    }
+
     setPickedFile(f);
   }
 
@@ -349,7 +568,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       if (typeof limit === "number" && limit > 0) {
         const remaining = Math.max(0, limit - used);
         if (remaining <= 0) {
-          setQuotaBlocked("Du har nået din månedlige upload-kvote.");
+          setQuotaBlocked(MONTHLY_IMPORT_QUOTA_ERROR);
           setUploadError(null);
           return true;
         }
@@ -372,6 +591,301 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
   const hasValidUploadFolder = !!uploadFolderId && folderOptions.some((folder) => folder.id === uploadFolderId);
   const canUpload = !!pickedFile && hasValidUploadFolder && !uploading && !quotaBlocked && !foldersLoading;
+  const processingStatusText = describeProcessingStage(activeUpload);
+
+  const refreshActiveUploadFiles = useCallback(
+    async (upload: ActiveUpload | null, reason: string, force = false) => {
+      if (!upload || !upload.responseSettled) return null;
+      const currentFolderId = listFolderIdRef.current;
+      if (!currentFolderId || currentFolderId !== upload.folderId) return null;
+
+      const now = Date.now();
+      if (!force && now - lastActiveUploadRefreshRef.current < ACTIVE_UPLOAD_REFRESH_MS) {
+        return null;
+      }
+
+      lastActiveUploadRefreshRef.current = now;
+      console.info("[UploadClient] refreshing visible upload file list", {
+        requestId: upload.requestId,
+        fileId: upload.fileId,
+        fileName: upload.fileName,
+        folderId: upload.folderId,
+        reason,
+        force,
+      });
+      return await loadFiles(currentFolderId);
+    },
+    [loadFiles],
+  );
+
+  const refreshCompletedUploadFiles = useCallback(
+    async (upload: ActiveUpload | null, reason: string, skipImmediateRefresh = false) => {
+      const folderId = upload?.folderId ?? listFolderIdRef.current ?? uploadFolderId;
+      const shouldRefreshVisibleFolder = !!folderId && listFolderIdRef.current === folderId;
+
+      if (shouldRefreshVisibleFolder && !skipImmediateRefresh) {
+        console.info("[UploadClient] refreshing file list after completed upload", {
+          requestId: upload?.requestId ?? null,
+          folderId,
+          reason,
+        });
+        await loadFiles(folderId);
+      }
+
+      if (uploadReadyRefreshTimeoutRef.current != null) {
+        window.clearTimeout(uploadReadyRefreshTimeoutRef.current);
+      }
+
+      if (shouldRefreshVisibleFolder && folderId) {
+        uploadReadyRefreshTimeoutRef.current = window.setTimeout(() => {
+          console.info("[UploadClient] running follow-up file list refresh", {
+            requestId: upload?.requestId ?? null,
+            folderId,
+            reason,
+          });
+          void loadFiles(folderId);
+        }, UPLOAD_READY_FOLLOWUP_REFRESH_MS);
+      }
+    },
+    [loadFiles, uploadFolderId],
+  );
+
+  useEffect(() => {
+    if (!activeUpload) return;
+    if (!activeUpload.responseSettled) return;
+    if (activeUpload.kind !== "pdf") return;
+    if (listFolderId !== activeUpload.folderId) return;
+
+    const matchedFile = findMatchingUploadFile(activeUpload, files);
+    if (!matchedFile) return;
+    const readiness = fileReadinessById[matchedFile.id] ?? null;
+    if (!readiness?.ready) return;
+
+    console.info("[UploadClient] stopping processing state because file is ready", {
+      requestId: activeUpload.requestId,
+      fileId: matchedFile.id,
+      fileName: activeUpload.fileName,
+      folderId: activeUpload.folderId,
+      readiness: readiness.readiness,
+      chunkCount: readiness.chunkCount,
+    });
+    clearCompletedUploadStatus(activeUpload, matchedFile.id);
+    void refreshCompletedUploadFiles(activeUpload, "visible-file-ready", true);
+    setUploadNotice("Materialet er klar nu.");
+    setActiveUpload(null);
+    setUploading(false);
+    dispatchQuotaChanged();
+  }, [activeUpload, dispatchQuotaChanged, fileReadinessById, files, listFolderId, refreshCompletedUploadFiles]);
+
+  function readinessTone(readiness: FileReadiness | null) {
+    if (!readiness) return "border-zinc-200 bg-zinc-50 text-zinc-700";
+    if (readiness.readiness === "failed") return "border-stone-200 bg-stone-50 text-zinc-700";
+    return "border-zinc-200 bg-zinc-50 text-zinc-600";
+  }
+
+  function fileListBadgeLabel(readiness: FileReadiness | null) {
+    if (!readiness || readiness.ready || readiness.readiness === "ready") return null;
+    if (readiness.readiness === "failed") return "Fejlede";
+    return "Behandles";
+  }
+
+  function fileListStatusDetail(readiness: FileReadiness | null) {
+    if (!readiness) return null;
+    if (readiness.readiness === "failed") return readiness.readinessDetail ?? "Klargøring fejlede";
+    return null;
+  }
+
+  function clearCompletedUploadStatus(upload: ActiveUpload | null, matchedFileId?: string | null) {
+    if (!upload) return;
+    setFileReadinessById((prev) => {
+      const next = { ...prev };
+
+      if (matchedFileId && matchedFileId in next) {
+        delete next[matchedFileId];
+        return next;
+      }
+
+      if (upload.fileId && upload.fileId in next) {
+        delete next[upload.fileId];
+        return next;
+      }
+
+      const fallbackFile = files.find((file) => file.name === upload.fileName);
+      if (fallbackFile?.id && fallbackFile.id in next) {
+        delete next[fallbackFile.id];
+      }
+
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    if (!activeUpload) return;
+
+    let cancelled = false;
+    let nextDelayMs = UPLOAD_STATUS_POLL_MS;
+    let timeoutId: number | null = null;
+    console.info("[UploadClient] polling started", {
+      requestId: activeUpload.requestId,
+      fileName: activeUpload.fileName,
+      startedAt: activeUpload.startedAt,
+    });
+
+    const stopWithError = (message: string, reason: string) => {
+      if (cancelled) return;
+      uploadAbortReasonRef.current = message;
+      uploadAbortRef.current?.abort(reason);
+      setUploadError(message);
+      setUploading(false);
+      setActiveUpload(null);
+      console.warn("[UploadClient] polling stopped with error", {
+        requestId: activeUpload.requestId,
+        reason,
+        message,
+      });
+    };
+
+      const poll = async () => {
+      const elapsedMs = Date.now() - activeUpload.startedAt;
+      const timeoutMs = activeUpload.kind === "pdf" ? PDF_UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS;
+      if (elapsedMs > timeoutMs) {
+        stopWithError(
+          activeUpload.kind === "pdf"
+            ? "Uploaden tager længere tid end forventet. PDF’en behandles muligvis stadig. Prøv at opdatere listen om lidt."
+            : "Uploaden tog for lang tid og blev afbrudt. Prøv igen.",
+          "upload-timeout",
+        );
+        return;
+      }
+
+      try {
+        const statusQuery = activeUpload.jobId
+          ? `job_id=${encodeURIComponent(activeUpload.jobId)}`
+          : `request_id=${encodeURIComponent(activeUpload.requestId)}`;
+        const res = await fetch(`/api/import-status?${statusQuery}`, {
+          method: "GET",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+
+        if (res.status === 401 || res.status === 429) {
+          nextDelayMs = UPLOAD_STATUS_BACKOFF_MS;
+          console.warn("[UploadClient] polling temporary auth/status issue", {
+            requestId: activeUpload.requestId,
+            status: res.status,
+            nextDelayMs,
+          });
+          return;
+        }
+
+        const text = await res.text();
+        const json = (safeJson(text) ?? {}) as ImportStatusPayload;
+        const activeJob = json?.activeJob ?? null;
+        nextDelayMs = UPLOAD_STATUS_POLL_MS;
+
+        console.info("[UploadClient] polling tick", {
+          requestId: activeUpload.requestId,
+          responseOk: res.ok,
+          activeJobId: activeJob?.id ?? null,
+          activeJobStatus: activeJob?.status ?? null,
+          activeJobStage: activeJob?.stage ?? null,
+          responseSettled: activeUpload.responseSettled,
+        });
+
+        if (activeJob?.id) {
+          setActiveUpload((prev) =>
+            prev && prev.requestId === activeUpload.requestId
+              ? {
+	                  ...prev,
+                  jobId: activeJob.id ? String(activeJob.id) : null,
+                  status: activeJob.status ? String(activeJob.status) : null,
+                  stage: activeJob.stage ? String(activeJob.stage) : null,
+                }
+              : prev,
+          );
+        }
+
+          const normalizedJobStatus = String(activeJob?.status ?? "").toLowerCase();
+          const shouldForceRefresh =
+            !!activeUpload.responseSettled &&
+            (!activeJob || ["finished", "completed", "succeeded"].includes(normalizedJobStatus));
+          const refreshedSnapshot = await refreshActiveUploadFiles(
+            activeUpload,
+            !activeJob ? "active-job-missing" : shouldForceRefresh ? "job-finished" : "processing-reconcile",
+            shouldForceRefresh,
+          );
+          if (refreshedSnapshot && isUploadReadyFromSnapshot(activeUpload, refreshedSnapshot.files, refreshedSnapshot.readinessById)) {
+            if (!cancelled) {
+              const matchedFile = findMatchingUploadFile(activeUpload, refreshedSnapshot.files);
+              console.info("[UploadClient] stopping processing state after readiness refresh", {
+                requestId: activeUpload.requestId,
+                reason: !activeJob ? "active-job-missing" : normalizedJobStatus || "processing",
+              });
+              clearCompletedUploadStatus(activeUpload, matchedFile?.id ?? null);
+              void refreshCompletedUploadFiles(activeUpload, "polling-readiness-refresh", true);
+              setUploadNotice("Materialet er klar nu.");
+              setActiveUpload(null);
+              setUploading(false);
+              dispatchQuotaChanged();
+            }
+            return;
+          }
+
+        if (!activeJob && elapsedMs > UPLOAD_JOB_BOOT_TIMEOUT_MS) {
+          console.info("[UploadClient] waiting for job start", {
+            requestId: activeUpload.requestId,
+            elapsedMs,
+            timeoutMs,
+          });
+        }
+
+        if (normalizedJobStatus === "failed") {
+          stopWithError(activeJob?.error ?? "Uploaden fejlede under behandlingen.", "job-failed");
+          void loadFiles(listFolderIdRef.current ?? uploadFolderId);
+          dispatchImportStatusRefresh();
+          return;
+        }
+
+        if (["finished", "completed", "succeeded"].includes(normalizedJobStatus)) {
+          if (!cancelled) {
+            clearCompletedUploadStatus(activeUpload);
+            void refreshCompletedUploadFiles(activeUpload, "job-finished");
+            setUploadNotice("Materialet er klar nu.");
+            setActiveUpload(null);
+            dispatchQuotaChanged();
+          }
+          return;
+        }
+      } catch (error) {
+        if (!cancelled) {
+          nextDelayMs = UPLOAD_STATUS_BACKOFF_MS;
+          console.warn("[UploadClient] polling error", {
+            requestId: activeUpload.requestId,
+            error,
+            nextDelayMs,
+          });
+        }
+      }
+    };
+
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timeoutId = window.setTimeout(async () => {
+        await poll();
+        scheduleNext();
+      }, nextDelayMs);
+    };
+
+    void poll().finally(() => scheduleNext());
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) window.clearTimeout(timeoutId);
+      console.info("[UploadClient] polling stopped", {
+        requestId: activeUpload.requestId,
+      });
+    };
+  }, [activeUpload, dispatchImportStatusRefresh, dispatchQuotaChanged, loadFiles, refreshActiveUploadFiles, refreshCompletedUploadFiles, uploadFolderId]);
 
   async function doUpload() {
     if (!hasValidUploadFolder) {
@@ -388,27 +902,70 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setUploadError(null);
     setUploadNotice(null);
     setUploadResult(null);
+    uploadAbortReasonRef.current = null;
+    dispatchUploadActivity(true);
+
+    let keepPollingAfterResponse = false;
 
     try {
+      const clientRequestId = createClientRequestId();
       const fd = new FormData();
       fd.append("file", pickedFile);
       fd.append("folder_id", uploadFolderId);
+      fd.append("request_id", clientRequestId);
       if (isAudioFile(pickedFile)) {
         fd.append("audio_note_mode", audioNoteMode);
       }
 
-      const res = await fetch("/api/trainer/upload", { method: "POST", body: fd });
+      const controller = new AbortController();
+      uploadAbortRef.current = controller;
+      setActiveUpload({
+        requestId: clientRequestId,
+        startedAt: Date.now(),
+        fileName: pickedFile.name,
+        folderId: uploadFolderId,
+        jobId: null,
+        fileId: null,
+        responseSettled: false,
+        kind: isAudioFile(pickedFile) ? "audio" : "pdf",
+        status: null,
+        stage: null,
+      });
+      console.info("[UploadClient] upload started", {
+        requestId: clientRequestId,
+        fileName: pickedFile.name,
+        folderId: uploadFolderId,
+        sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+      });
+
+      const res = await fetch("/api/trainer/upload", { method: "POST", body: fd, signal: controller.signal });
+      const responseText = await res.text();
+      const data = safeJson(responseText) ?? {};
+      setActiveUpload((prev) =>
+        prev && prev.requestId === clientRequestId
+          ? {
+              ...prev,
+              responseSettled: true,
+              jobId: asString(data?.jobId) ?? prev.jobId,
+              fileId: asString(data?.fileId) ?? prev.fileId,
+              status: asString(data?.jobStatus) ?? prev.status,
+              stage: asString(data?.stage) ?? prev.stage,
+            }
+          : prev,
+      );
 
       if (res.status === 402 || res.status === 429) {
-        const j = safeJson(await res.text());
-        const msg = String(j?.message ?? j?.error ?? "Du har nået din månedlige upload-kvote.");
+        const msg = resolveUploadErrorMessage(res.status, data, pickedFile, {
+          res,
+          responseText,
+        });
         setQuotaBlocked(msg);
         dispatchQuotaChanged();
         return;
       }
 
       if (res.status === 409) {
-        const j = safeJson(await res.text());
+        const j = data;
         const msg = String(
           j?.message ??
             j?.error ??
@@ -419,34 +976,53 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       }
 
       if (res.status === 401) {
-        const j = safeJson(await res.text());
+        const j = data;
         setUploadError(String(j?.error ?? "Login kræves."));
         return;
       }
 
       if (res.status === 413) {
-        const j = safeJson(await res.text());
-        setUploadError(String(j?.message ?? j?.error ?? "Filen er for stor til din plan."));
+        setUploadError(
+          resolveUploadErrorMessage(res.status, data, pickedFile, {
+            res,
+            responseText,
+          }),
+        );
         return;
       }
 
       if (res.status === 403) {
-        const j = safeJson(await res.text());
+        const j = data;
         setUploadNotice(String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."));
         return;
       }
 
       if (!res.ok) {
-        const j = safeJson(await res.text());
-        setUploadError(String(j?.message ?? j?.error ?? `Upload fejlede (${res.status}).`));
+        setUploadError(
+          resolveUploadErrorMessage(res.status, data, pickedFile, {
+            res,
+            responseText,
+          }),
+        );
         return;
       }
 
-      const data = safeJson(await res.text()) ?? {};
+      console.info("[UploadClient] upload finished", {
+        requestId: clientRequestId,
+        returnedRequestId: data?.requestId ?? null,
+        returnedJobId: data?.jobId ?? null,
+        fileId: data?.fileId ?? null,
+        uploadKind: data?.uploadKind ?? null,
+      });
+      setUploadError(null);
       const uploadKind = data?.uploadKind === "audio" ? "audio" : "pdf";
+      const processingAccepted = uploadKind === "pdf" && (res.status === 202 || data?.processing === true || data?.accepted === true);
       const noteCount = Array.isArray(data?.generatedNotes) ? data.generatedNotes.length : 0;
       const generatedNotes = Array.isArray(data?.generatedNotes) ? (data.generatedNotes as GeneratedUploadNote[]) : [];
       const notesHistoryHref = uploadFolderId ? `/traener/noter/historik?scope=${encodeURIComponent(uploadFolderId)}` : "/traener/noter/historik";
+
+      keepPollingAfterResponse = processingAccepted;
+      setUploading(false);
 
       setPickedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -465,13 +1041,32 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           : {
               kind: "pdf",
               fileName: pickedFile.name,
-              message: "Fil modtaget. Materialet bliver gjort klar til brug i Notely.",
+              message: processingAccepted
+                ? "Fil modtaget. Materialet bliver gjort klar til brug i Notely."
+                : "Fil modtaget og klar til brug i Notely.",
             },
       );
       dispatchQuotaChanged();
 
       await loadFolders();
       await loadFiles(listFolderIdRef.current ?? uploadFolderId);
+
+      if (!processingAccepted) {
+        setActiveUpload(null);
+      } else {
+        setActiveUpload((prev) =>
+          prev && prev.requestId === clientRequestId
+            ? {
+                ...prev,
+                responseSettled: true,
+                jobId: asString(data?.jobId) ?? prev.jobId,
+                fileId: asString(data?.fileId) ?? prev.fileId,
+                status: asString(data?.jobStatus) ?? prev.status ?? "queued",
+                stage: asString(data?.stage) ?? prev.stage ?? "queued",
+              }
+            : prev,
+        );
+      }
 
       if (uploadKind === "audio" && generatedNotes.length > 0) {
         const firstNoteId = String(generatedNotes[0]?.id ?? "").trim();
@@ -483,10 +1078,24 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         return;
       }
     } catch (e) {
-      console.error("[UploadClient] upload error", e);
-      setUploadError("Upload fejlede. Prøv igen.");
+      if ((e as any)?.name === "AbortError") {
+        const reason = uploadAbortReasonRef.current ?? "Uploaden blev afbrudt. Prøv igen.";
+        console.warn("[UploadClient] upload aborted", { reason });
+        if (uploadAbortReasonRef.current) {
+          setUploadError(reason);
+        }
+      } else {
+        console.error("[UploadClient] upload error", e);
+        setUploadError("Upload fejlede. Prøv igen.");
+      }
     } finally {
+      uploadAbortRef.current = null;
+      uploadAbortReasonRef.current = null;
+      if (!keepPollingAfterResponse) {
+        setActiveUpload(null);
+      }
       setUploading(false);
+      dispatchUploadActivity(false);
     }
   }
 
@@ -652,6 +1261,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         >
           <div className="text-sm font-medium text-zinc-900">Træk en PDF eller lydfil herind eller klik for at vælge.</div>
           <div className="mt-1 text-xs text-zinc-500">Understøtter PDF samt almindelige lydfiler som mp3, m4a, wav, webm og ogg.</div>
+          <div className="mt-1 text-xs text-zinc-500">PDF: maks. 50 MB pr. fil.</div>
 
           <div className="mt-4 flex items-center justify-center gap-2">
             <span className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium">Vælg fil</span>
@@ -723,6 +1333,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
         {uploadNotice ? <LimitNotice className="mt-3">{uploadNotice}</LimitNotice> : null}
         {uploadError ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
+        {processingStatusText ? <div className="mt-3 text-xs text-zinc-600">{processingStatusText}</div> : null}
         <div className="mt-4 flex items-center justify-between">
           <button
             type="button"
@@ -800,9 +1411,19 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
               className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3"
             >
               <div>
-                <div className="text-sm font-medium text-zinc-900">{f.name}</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-medium text-zinc-900">{f.name}</div>
+	                  {fileListBadgeLabel(fileReadinessById[f.id] ?? null) ? (
+	                    <span
+	                      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium leading-none ${readinessTone(fileReadinessById[f.id] ?? null)}`}
+	                    >
+	                      {fileListBadgeLabel(fileReadinessById[f.id] ?? null)}
+	                    </span>
+	                  ) : null}
+                </div>
                 <div className="mt-1 text-[11px] text-zinc-500">
                   {humanBytes(f.sizeBytes)} {f.uploadedAt ? `· ${fmtDa(f.uploadedAt)}` : ""}
+                  {fileListStatusDetail(fileReadinessById[f.id] ?? null) ? ` · ${fileListStatusDetail(fileReadinessById[f.id] ?? null)}` : ""}
                 </div>
               </div>
 

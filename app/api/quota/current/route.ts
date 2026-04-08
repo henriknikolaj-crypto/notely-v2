@@ -220,6 +220,11 @@ function safeIso(x: any): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+function isAuthRateLimited(error: any) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return error?.status === 429 || message.includes("over_request_rate_limit") || message.includes("rate limit");
+}
+
 async function tryQuotaCheck(admin: any, ownerId: string, feature: string) {
   const r = await quotaTryConsume({
     admin,
@@ -250,14 +255,16 @@ export async function GET(req: NextRequest) {
     const sb = supabaseServerRouteReadOnly(req);
     const { data: sessionData, error: sessionError } = await sb.auth.getSession();
     const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+    const resolvedUserId = sessionUserId;
 
-    let resolvedUserId = sessionUserId;
-    let getUserError: string | null = null;
-
-    if (!resolvedUserId) {
-      const { data: authData, error: authError } = await sb.auth.getUser();
-      getUserError = authError?.message ?? null;
-      resolvedUserId = authData?.user?.id ? String(authData.user.id) : null;
+    if (sessionError && isAuthRateLimited(sessionError)) {
+      return jsonNoStore(
+        {
+          ok: false,
+          error: "auth_rate_limited",
+        },
+        429,
+      );
     }
 
     if (!resolvedUserId) {
@@ -271,7 +278,6 @@ export async function GET(req: NextRequest) {
                   hasSession: !!sessionData?.session,
                   sessionUserId,
                   sessionError: sessionError?.message ?? null,
-                  getUserError,
                   cookieNames,
                 },
               }
@@ -293,7 +299,6 @@ export async function GET(req: NextRequest) {
                 hasSession: null,
                 sessionUserId: null,
                 sessionError: error?.message ?? null,
-                getUserError: null,
                 cookieNames,
               },
             }
