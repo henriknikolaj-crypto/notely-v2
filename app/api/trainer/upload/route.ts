@@ -488,7 +488,34 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
     let lastError: any = null;
     for (const attempt of attempts) {
       const result = await admin.from("jobs").update(attempt).eq("id", jobId);
-      if (!result.error) return;
+      if (!result.error) {
+        const status = typeof (attempt as any).status === "string" ? String((attempt as any).status) : null;
+        const stage =
+          typeof (attempt as any).payload?.stage === "string"
+            ? String((attempt as any).payload.stage)
+            : typeof (attempt as any).meta?.stage === "string"
+              ? String((attempt as any).meta.stage)
+              : null;
+        if (status === "started" || status === "finished" || status === "failed") {
+          console.info("[trainer/upload] job update committed", {
+            jobId,
+            status,
+            stage,
+            fileId:
+              typeof (attempt as any).file_id === "string"
+                ? String((attempt as any).file_id)
+                : typeof (attempt as any).payload?.file_id === "string"
+                  ? String((attempt as any).payload.file_id)
+                  : typeof (attempt as any).meta?.file_id === "string"
+                    ? String((attempt as any).meta.file_id)
+                    : typeof (attempt as any).result?.fileId === "string"
+                      ? String((attempt as any).result.fileId)
+                      : null,
+            patchKeys: Object.keys(attempt),
+          });
+        }
+        return;
+      }
       lastError = result.error;
     }
     console.warn("[trainer/upload] job update warning:", {
