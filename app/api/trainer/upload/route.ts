@@ -945,7 +945,7 @@ async function processAcceptedPdfUpload(args: {
 export async function POST(req: NextRequest) {
   const fallbackRequestId = randomUUID();
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
-  let requestId = fallbackRequestId;
+  let requestId: string = fallbackRequestId;
   let jobId: string | null = null;
 
   let ownerId = "";
@@ -1264,6 +1264,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    const processingUploadKind = uploadKind;
+
     if (uploadKind === "pdf") {
       let effectivePages = 0;
       try {
@@ -1567,7 +1569,7 @@ export async function POST(req: NextRequest) {
     let extraction: Awaited<ReturnType<typeof extractPdfWithFallback>> | null = null;
     let transcriptText = "";
 
-    if (uploadKind === "pdf") {
+    if (processingUploadKind === "pdf") {
       logUploadStage(requestId, "pdf_extract_started", { jobId, fileName: originalName });
       await safeUpdateJob(admin, jobId, {
         payload: {
@@ -1576,7 +1578,7 @@ export async function POST(req: NextRequest) {
           folder_id: folderId,
           file_name: originalName,
           mime_type: mimeType,
-          upload_kind: uploadKind,
+          upload_kind: processingUploadKind,
           size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
           md5,
           stage: "pdf_extract_started",
@@ -1621,7 +1623,7 @@ export async function POST(req: NextRequest) {
           folder_id: folderId,
           file_name: originalName,
           mime_type: mimeType,
-          upload_kind: uploadKind,
+          upload_kind: processingUploadKind,
           size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
           md5,
           stage: "pdf_extract_finished",
@@ -1662,7 +1664,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const effectivePages = uploadKind === "audio" ? 1 : extraction!.pageCount;
+    const effectivePages = processingUploadKind === "audio" ? 1 : extraction!.pageCount;
 
     const planInfo = await getUploadPlan(admin, ownerId);
     if (!planInfo.resolved) {
@@ -1674,7 +1676,7 @@ export async function POST(req: NextRequest) {
         effectivePages,
       });
     }
-    if (uploadKind === "pdf" && planInfo.resolved && planInfo.plan === "freemium" && effectivePages > FREEMIUM_PDF_PAGE_LIMIT) {
+    if (processingUploadKind === "pdf" && planInfo.resolved && planInfo.plan === "freemium" && effectivePages > FREEMIUM_PDF_PAGE_LIMIT) {
       return NextResponse.json(
         {
           ok: false,
@@ -1718,7 +1720,7 @@ export async function POST(req: NextRequest) {
     // storage
     const fileId = randomUUID();
     const fileExt = getFileExtension(originalName);
-    const storagePath = `${ownerId}/${folderId}/${fileId}${fileExt || (uploadKind === "pdf" ? ".pdf" : ".bin")}`;
+    const storagePath = `${ownerId}/${folderId}/${fileId}${fileExt || (processingUploadKind === "pdf" ? ".pdf" : ".bin")}`;
 
     logUploadStage(requestId, "storage_upload_started", { jobId, fileId, storagePath });
     await safeUpdateJob(admin, jobId, {
@@ -1728,7 +1730,7 @@ export async function POST(req: NextRequest) {
         folder_id: folderId,
         file_name: originalName,
         mime_type: mimeType,
-        upload_kind: uploadKind,
+        upload_kind: processingUploadKind,
         size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
         md5,
         file_id: fileId,
@@ -1767,12 +1769,12 @@ export async function POST(req: NextRequest) {
         md5,
         uploaded_at: uploadedAt,
         page_count: effectivePages,
-        ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-        extraction_method: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
-        extraction_quality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
+        ocr_pages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+        extraction_method: processingUploadKind === "pdf" ? extraction!.extractionMethod : "text",
+        extraction_quality: processingUploadKind === "pdf" ? extraction!.extractionQuality : "high",
         extraction_meta: {
-          ...(uploadKind === "pdf" ? extraction!.extractionMeta : {}),
-          input_kind: uploadKind,
+          ...(processingUploadKind === "pdf" ? extraction!.extractionMeta : {}),
+          input_kind: processingUploadKind,
         },
       },
       },
@@ -1790,10 +1792,10 @@ export async function POST(req: NextRequest) {
         md5,
         uploaded_at: uploadedAt,
         page_count: effectivePages,
-        ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-        extraction_method: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
-        extraction_quality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
-        extraction_meta: uploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: uploadKind },
+        ocr_pages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+        extraction_method: processingUploadKind === "pdf" ? extraction!.extractionMethod : "text",
+        extraction_quality: processingUploadKind === "pdf" ? extraction!.extractionQuality : "high",
+        extraction_meta: processingUploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: processingUploadKind },
       },
       },
       {
@@ -1808,8 +1810,8 @@ export async function POST(req: NextRequest) {
         md5,
         uploaded_at: uploadedAt,
         page_count: effectivePages,
-        ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-        extraction_meta: uploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: uploadKind },
+        ocr_pages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+        extraction_meta: processingUploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: processingUploadKind },
       },
       },
       {
@@ -1844,7 +1846,7 @@ export async function POST(req: NextRequest) {
     try {
       logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind });
       const r =
-        uploadKind === "pdf"
+        processingUploadKind === "pdf"
           ? await rebuildDocChunksForFile(admin, {
               ownerId,
               fileId,
@@ -1870,7 +1872,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (uploadKind === "pdf") {
+    if (processingUploadKind === "pdf") {
       await syncOcrTextsForFile(admin, {
         ownerId,
         fileId,
@@ -1880,7 +1882,7 @@ export async function POST(req: NextRequest) {
     }
 
     let generatedNotes: any[] = [];
-    if (uploadKind === "audio") {
+    if (processingUploadKind === "audio") {
       try {
         logUploadStage(requestId, "audio_notes_started", { jobId, fileId });
         const requestedModes = parseRequestedNoteModes(form.get("audio_note_mode"));
@@ -1975,10 +1977,10 @@ export async function POST(req: NextRequest) {
         md5,
         pages: effectivePages,
         chunkCount,
-        extraction_method: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
-        extraction_quality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
-        ocr_pages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-        dominant_page_type: uploadKind === "pdf" ? extraction!.extractionMeta.dominant_page_type : "audio_transcript",
+        extraction_method: processingUploadKind === "pdf" ? extraction!.extractionMethod : "text",
+        extraction_quality: processingUploadKind === "pdf" ? extraction!.extractionQuality : "high",
+        ocr_pages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+        dominant_page_type: processingUploadKind === "pdf" ? extraction!.extractionMeta.dominant_page_type : "audio_transcript",
         storage_path: storagePath,
         stage: "finished",
       },
@@ -2019,10 +2021,10 @@ export async function POST(req: NextRequest) {
         uploadKind,
         pages: effectivePages,
         chunkCount,
-        extractionMethod: uploadKind === "pdf" ? extraction!.extractionMethod : "text",
-        extractionQuality: uploadKind === "pdf" ? extraction!.extractionQuality : "high",
-        ocrPages: uploadKind === "pdf" ? extraction!.ocrPages : 0,
-        extractionMeta: uploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: uploadKind },
+      extractionMethod: processingUploadKind === "pdf" ? extraction!.extractionMethod : "text",
+      extractionQuality: processingUploadKind === "pdf" ? extraction!.extractionQuality : "high",
+      ocrPages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+      extractionMeta: processingUploadKind === "pdf" ? extraction!.extractionMeta : { input_kind: processingUploadKind },
         generatedNotes: generatedNotes.map((note) => ({
           id: note.id,
           title: note.title,

@@ -414,7 +414,7 @@ export async function GET(req: NextRequest) {
           };
         });
 
-        folderReadinessSummary = folderFiles.reduce(
+        folderReadinessSummary = (folderFiles ?? []).reduce(
           (acc, file) => {
             acc[file.readiness] += 1;
             return acc;

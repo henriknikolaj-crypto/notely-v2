@@ -14,7 +14,12 @@ import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } f
 import { parseQuestionListOutput, type QuestionOutputDiagnostics } from "@/lib/learning/question-output";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
-import { compactWeakPointTargetsForPrompt, truncateContextForQuestionPrompt, type WeakPointTarget } from "@/lib/trainer/generate-question";
+import {
+  calibrateGeneratedQuestionForStudentLevel,
+  compactWeakPointTargetsForPrompt,
+  truncateContextForQuestionPrompt,
+  type WeakPointTarget,
+} from "@/lib/trainer/generate-question";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -427,6 +432,7 @@ export async function POST(req: NextRequest) {
     }
 
     const model = resolveModelForFeature("simulator");
+    const promptTopic = pickedFiles.map((file) => fileTitle(file)).join(" | ");
 
     const avoidBlock =
       avoidQuestions.length > 0
@@ -539,7 +545,10 @@ FORMAT:
         const cleaned: ExamQuestion[] = [];
 
         for (const promptValue of parsedOutput.questions) {
-          const prompt = String(promptValue ?? "").trim();
+          const prompt = calibrateGeneratedQuestionForStudentLevel(String(promptValue ?? ""), {
+            topic: promptTopic,
+            contextText: strategy.contextText,
+          }).trim();
           if (!prompt) continue;
 
           const norm = normalizeQuestion(prompt);

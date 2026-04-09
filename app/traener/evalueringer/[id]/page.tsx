@@ -4,6 +4,7 @@ import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { getCanonicalUserPlan } from "@/lib/plan/limits";
 import { getTrainerSession } from "@/lib/auth/trainer-session";
+import { sanitizeTrainerPlainText } from "@/lib/trainer/plain-text";
 
 export const dynamic = "force-dynamic";
 
@@ -119,7 +120,7 @@ export default async function TraenerEvalueringDetailPage({ params, searchParams
   const createdAt = (data as any).created_at as string | null | undefined;
   const score = (data as any).score as number | null | undefined;
   const question = ((data as any).question ?? "") as string;
-  const answer = ((data as any).answer ?? "") as string;
+  const answer = sanitizeTrainerPlainText((data as any).answer ?? "");
   const feedback = ((data as any).feedback ?? "") as string;
 
   return (

@@ -1,5 +1,7 @@
 import { resolveEvaluatorDefinition, type EvaluatorDefinition, type LearningSourceType } from "@/lib/learning/evaluator-registry";
 import { getDanskIssueDefaults } from "@/lib/dansk/evaluator";
+import { getFysikIssueDefaults } from "@/lib/fysik/evaluator";
+import { getHistoryIssueDefaults } from "@/lib/history/evaluator";
 import { getMatematikIssueDefaults } from "@/lib/matematik/evaluator";
 import { getOkonomiIssueDefaults } from "@/lib/okonomi/evaluator";
 import { getSamfundIssueDefaults } from "@/lib/samfund/evaluator";
@@ -194,6 +196,8 @@ function normalizeLearningIssue(raw: unknown, index: number): LearningIssue | nu
   const defaults =
     getSamfundIssueDefaults(code) ??
     getDanskIssueDefaults(code) ??
+    getHistoryIssueDefaults(code) ??
+    getFysikIssueDefaults(code) ??
     getMatematikIssueDefaults(code) ??
     getOkonomiIssueDefaults(code);
   const title = clampText(asText(obj.title ?? obj.label ?? defaults?.title ?? obj.code), 140);
