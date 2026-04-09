@@ -436,6 +436,10 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
   const meta = (patch as any).meta;
   const errorValue = (patch as any).error;
   const basePatch = { ...patch };
+  const bookkeepingPatch: Record<string, unknown> = {};
+  for (const key of ["status", "file_id", "started_at", "finished_at"]) {
+    if (key in basePatch) bookkeepingPatch[key] = (basePatch as any)[key];
+  }
 
   const seedPatches: Record<string, unknown>[] = [basePatch];
   if (payload && meta) {
@@ -469,11 +473,31 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
   const attempts: Record<string, unknown>[] = [];
   const seen = new Set<string>();
   const pushAttempt = (candidate: Record<string, unknown>) => {
+    if (!candidate || Object.keys(candidate).length === 0) return;
     const key = JSON.stringify(candidate);
     if (seen.has(key)) return;
     seen.add(key);
     attempts.push(candidate);
   };
+  if (Object.keys(bookkeepingPatch).length > 0) {
+    pushAttempt(bookkeepingPatch);
+    if ("file_id" in bookkeepingPatch) {
+      const withoutFileId = { ...bookkeepingPatch };
+      delete (withoutFileId as any).file_id;
+      pushAttempt(withoutFileId);
+    }
+    if ("started_at" in bookkeepingPatch || "finished_at" in bookkeepingPatch) {
+      const withoutTimestamps = { ...bookkeepingPatch };
+      delete (withoutTimestamps as any).started_at;
+      delete (withoutTimestamps as any).finished_at;
+      pushAttempt(withoutTimestamps);
+      if ("file_id" in withoutTimestamps) {
+        const withoutFileIdAndTimestamps = { ...withoutTimestamps };
+        delete (withoutFileIdAndTimestamps as any).file_id;
+        pushAttempt(withoutFileIdAndTimestamps);
+      }
+    }
+  }
   for (const seed of seedPatches) {
     pushAttempt(seed);
     if ("started_at" in seed || "finished_at" in seed) {
@@ -1435,7 +1459,6 @@ export async function POST(req: NextRequest) {
       logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath });
       await safeUpdateJob(admin, jobId, {
         status: "queued",
-        file_id: fileId,
         payload: buildJobTrackingPayload({
           requestId,
           folderId,
@@ -1534,6 +1557,7 @@ export async function POST(req: NextRequest) {
 
       await safeUpdateJob(admin, jobId, {
         status: "queued",
+        file_id: fileId,
         payload: buildJobTrackingPayload({
           requestId,
           folderId,
