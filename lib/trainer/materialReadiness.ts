@@ -113,6 +113,8 @@ export function resolveMaterialReadiness(args: {
 
   const stage = String(jobStage ?? "").toLowerCase();
   const label =
+    stage === "ocr_started" ||
+    stage === "ocr_finished" ||
     stage === "pdf_extract_started" ||
     stage === "pdf_extract_finished" ||
     stage === "chunk_build_started" ||

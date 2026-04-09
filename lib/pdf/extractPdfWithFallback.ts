@@ -71,9 +71,17 @@ export type ExtractedPdfDocument = {
   };
 };
 
+export type PdfExtractionProgress = {
+  stage: "ocr_started" | "ocr_finished";
+  totalPages: number;
+  ocrCandidatePages: number;
+  scanLikeDocument: boolean;
+};
+
 type ExtractOpts = {
   fileName?: string;
   maxPages?: number;
+  onProgress?: (event: PdfExtractionProgress) => void | Promise<void>;
 };
 
 type TextAnalysis = {
@@ -638,7 +646,19 @@ export async function extractPdfWithFallback(
   });
 
   const ocrTexts: Array<{ page: number; text: string; engine: string }> = [];
-  if (raw.pageCount > 0 && canRunOcr()) {
+  const ocrCandidatePages = pages.filter((page) => page.extractionQuality !== "high").length;
+  const initialScanPages = pages.filter((page) => page.extractionMeta.page_type === "scan").length;
+  const scanLikeDocument =
+    raw.pageCount > 0 &&
+    (initialScanPages > 0 || ocrCandidatePages >= Math.max(1, Math.ceil(raw.pageCount / 2)));
+
+  if (raw.pageCount > 0 && canRunOcr() && ocrCandidatePages > 0) {
+    await opts.onProgress?.({
+      stage: "ocr_started",
+      totalPages: raw.pageCount,
+      ocrCandidatePages,
+      scanLikeDocument,
+    });
     for (const page of pages) {
       if (page.extractionQuality === "high") continue;
 
@@ -687,6 +707,13 @@ export async function extractPdfWithFallback(
         console.warn(`[pdf/extract] OCR fallback failed for page ${page.pageNumber}:`, error);
       }
     }
+
+    await opts.onProgress?.({
+      stage: "ocr_finished",
+      totalPages: raw.pageCount,
+      ocrCandidatePages,
+      scanLikeDocument,
+    });
   }
 
   const ocrPages = pages.filter((p) => p.extractionMethod === "ocr").length;

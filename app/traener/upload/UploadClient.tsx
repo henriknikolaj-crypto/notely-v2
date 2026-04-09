@@ -282,8 +282,11 @@ function describeProcessingStage(activeUpload: ActiveUpload | null) {
   if (status === "failed") return "Behandlingen af PDF’en fejlede.";
   if (stage === "queued") return "PDF’en er modtaget. Materialet står i kø til behandling.";
   if (stage === "processing_started") return "PDF’en er modtaget. Materialet bliver klargjort nu.";
+  if (stage === "ocr_started") {
+    return "PDF’en ser ud til at være scannet og kan derfor tage længere tid at behandle. Vi forsøger at læse den med OCR.";
+  }
   if (stage === "pdf_extract_started") return "PDF’en læses og OCR-behandles nu.";
-  if (stage === "pdf_extract_finished" || stage === "chunk_build_started") {
+  if (stage === "ocr_finished" || stage === "pdf_extract_finished" || stage === "chunk_build_started") {
     return "Teksten er hentet. Materialet bliver gjort klar til brug i Notely.";
   }
   if (stage === "chunk_build_finished") return "Materialet færdiggøres nu.";
@@ -1440,9 +1443,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           <button
             type="button"
             onClick={() => void loadFiles(listFolderIdRef.current)}
-            className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium"
+            className="inline-flex items-center gap-2 rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium"
           >
-            Opdater liste
+            <span className="inline-flex h-3.5 w-3.5 items-center justify-center">
+              {filesLoading ? <span className="h-2 w-2 animate-pulse rounded-full bg-zinc-400" /> : null}
+            </span>
+            <span>Opdater liste</span>
           </button>
         </div>
 
@@ -1472,8 +1478,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}
 
         <div className="mt-4 space-y-3">
-          {filesLoading ? <div className="text-xs text-zinc-500">Henter filer…</div> : null}
-
           {!filesLoading && (!listFolderId || files.length === 0) ? (
             <div className="text-xs text-zinc-500">
               {listFolderId ? "Ingen filer i denne mappe endnu." : "Vælg en mappe."}

@@ -6,7 +6,12 @@ import { createClient } from "@supabase/supabase-js";
 import { createHash, randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { PDFDocument } from "pdf-lib";
-import { extractPdfWithFallback, type ExtractedPdfPage } from "@/lib/pdf/extractPdfWithFallback";
+import {
+  extractPdfWithFallback,
+  type ExtractedPdfDocument,
+  type ExtractedPdfPage,
+  type PdfExtractionProgress,
+} from "@/lib/pdf/extractPdfWithFallback";
 import { buildChunksFromExtractedPages } from "@/lib/pdf/chunkStructuredPages";
 import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
 import { quotaTryConsume } from "@/lib/quota/rpc";
@@ -32,6 +37,8 @@ const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "trainer_uploads";
 const MAX_FILE_BYTES = 50 * 1024 * 1024; // hård beskyttelse (ikke quota)
 const FREEMIUM_PDF_PAGE_LIMIT = 15;
 const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".mp4", ".mpeg", ".mpga", ".webm", ".ogg", ".oga", ".flac", ".aac"]);
+const SCAN_PDF_TEXT_UNREADABLE_MESSAGE =
+  "PDF’en kunne åbnes, men teksten kunne ikke læses sikkert. Prøv evt. en anden PDF eller en eksport med bedre tekstlag.";
 
 function logUploadStage(requestId: string, stage: string, meta?: Record<string, unknown>) {
   console.info("[trainer/upload] stage", {
@@ -76,6 +83,41 @@ function detectUploadKind(file: File, originalName: string): "pdf" | "audio" | "
   if (ext === ".pdf") return "pdf";
   if (AUDIO_EXTENSIONS.has(ext)) return "audio";
   return "other";
+}
+
+function getPdfExtractionStats(extraction: ExtractedPdfDocument) {
+  return extraction.pages.reduce(
+    (acc, page) => {
+      acc.totalChars += page.textCharCount;
+      acc.totalWords += page.wordCount;
+      if (page.textCharCount > 0) acc.nonEmptyPages += 1;
+      if (page.extractionQuality !== "low" || page.wordCount >= 20) acc.usablePages += 1;
+      return acc;
+    },
+    { totalChars: 0, totalWords: 0, nonEmptyPages: 0, usablePages: 0 },
+  );
+}
+
+function isScanLikeExtraction(extraction: ExtractedPdfDocument) {
+  const scanPages = Number(extraction.extractionMeta.page_type_counts?.scan ?? 0);
+  return (
+    extraction.pageCount > 0 &&
+    (extraction.ocrPages > 0 ||
+      extraction.extractionMethod !== "text" ||
+      extraction.extractionMeta.dominant_page_type === "scan" ||
+      scanPages >= Math.max(1, Math.ceil(extraction.pageCount / 2)))
+  );
+}
+
+function isPdfTextInsufficientAfterExtraction(extraction: ExtractedPdfDocument) {
+  const stats = getPdfExtractionStats(extraction);
+  return (
+    isScanLikeExtraction(extraction) &&
+    extraction.extractionQuality === "low" &&
+    stats.usablePages === 0 &&
+    stats.totalChars < 120 &&
+    stats.totalWords < 24
+  );
 }
 
 function formatDa(iso: string) {
@@ -607,6 +649,72 @@ function buildJobTrackingPayload(args: {
   return payload;
 }
 
+async function updatePdfJobStage(args: {
+  admin: any;
+  jobId: string | null;
+  requestId: string;
+  folderId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  md5: string;
+  stage: string;
+  fileId?: string;
+  storagePath?: string;
+  pageCount?: number;
+  ocrPages?: number;
+  extractionMethod?: string;
+  extractionQuality?: string;
+  chunkCount?: number;
+  extraPayload?: Record<string, unknown>;
+}) {
+  const {
+    admin,
+    jobId,
+    requestId,
+    folderId,
+    fileName,
+    mimeType,
+    sizeBytes,
+    md5,
+    stage,
+    fileId,
+    storagePath,
+    pageCount,
+    ocrPages,
+    extractionMethod,
+    extractionQuality,
+    chunkCount,
+    extraPayload,
+  } = args;
+  const trackingPayload = {
+    ...buildJobTrackingPayload({
+      requestId,
+      folderId,
+      fileName,
+      mimeType,
+      uploadKind: "pdf",
+      sizeBytes,
+      md5,
+      fileId,
+      storagePath,
+      pageCount,
+      ocrPages,
+      extractionMethod,
+      extractionQuality,
+      chunkCount,
+      stage,
+    }),
+    ...(extraPayload ?? {}),
+  };
+
+  await safeUpdateJob(admin, jobId, {
+    ...(fileId ? { file_id: fileId } : {}),
+    payload: trackingPayload,
+    meta: trackingPayload,
+  });
+}
+
 async function countPdfPagesQuick(buf: Buffer) {
   const doc = await PDFDocument.load(buf);
   return Number(doc.getPageCount() ?? 0) || 0;
@@ -727,7 +835,47 @@ async function processAcceptedPdfUpload(args: {
       }),
     });
 
-    const extraction = await extractPdfWithFallback(buf, { fileName: originalName });
+    const extraction = await extractPdfWithFallback(buf, {
+      fileName: originalName,
+      onProgress: async (progress: PdfExtractionProgress) => {
+        if (progress.stage === "ocr_started") {
+          logUploadStage(requestId, "ocr_started", {
+            jobId,
+            fileId,
+            pageCount: progress.totalPages,
+            ocrCandidatePages: progress.ocrCandidatePages,
+            scanLikeDocument: progress.scanLikeDocument,
+          });
+          await updatePdfJobStage({
+            admin,
+            jobId,
+            requestId,
+            folderId,
+            fileName: originalName,
+            mimeType,
+            sizeBytes,
+            md5,
+            fileId,
+            storagePath,
+            pageCount: effectivePages,
+            stage: "ocr_started",
+            extraPayload: {
+              scan_like_document: progress.scanLikeDocument,
+              ocr_candidate_pages: progress.ocrCandidatePages,
+            },
+          });
+        }
+
+        if (progress.stage === "ocr_finished") {
+          logUploadStage(requestId, "ocr_finished", {
+            jobId,
+            fileId,
+            pageCount: progress.totalPages,
+            ocrCandidatePages: progress.ocrCandidatePages,
+          });
+        }
+      },
+    });
     logUploadStage(requestId, "pdf_extract_finished", {
       jobId,
       fileId,
@@ -747,7 +895,51 @@ async function processAcceptedPdfUpload(args: {
         request_id: requestId,
       },
       });
+    if (isPdfTextInsufficientAfterExtraction(extraction)) {
+      logUploadStage(requestId, "pdf_text_unreadable", {
+        jobId,
+        fileId,
+        pageCount: extraction.pageCount,
+        ocrPages: extraction.ocrPages,
+        extractionMethod: extraction.extractionMethod,
+      });
+      await safeUpdateFileRecord(admin, fileId, {
+        extraction_meta: {
+          ...extraction.extractionMeta,
+          input_kind: "pdf",
+          processing_status: "failed",
+          failure_reason: "text_unreadable_after_ocr",
+          request_id: requestId,
+        },
+      });
       await safeUpdateJob(admin, jobId, {
+        status: "failed",
+        file_id: fileId,
+        finished_at: new Date().toISOString(),
+        error: { message: SCAN_PDF_TEXT_UNREADABLE_MESSAGE },
+        payload: {
+          ...buildJobTrackingPayload({
+            requestId,
+            folderId,
+            fileName: originalName,
+            mimeType,
+            uploadKind: "pdf",
+            sizeBytes,
+            md5,
+            fileId,
+            storagePath,
+            pageCount: extraction.pageCount,
+            ocrPages: extraction.ocrPages,
+            extractionMethod: extraction.extractionMethod,
+            extractionQuality: extraction.extractionQuality,
+            stage: "failed",
+          }),
+          failure_reason: "text_unreadable_after_ocr",
+        },
+      });
+      return;
+    }
+    await safeUpdateJob(admin, jobId, {
         file_id: fileId,
         payload: buildJobTrackingPayload({
         requestId,
@@ -1958,7 +2150,42 @@ export async function POST(req: NextRequest) {
         },
       });
       try {
-        extraction = await extractPdfWithFallback(buf, { fileName: originalName });
+        extraction = await extractPdfWithFallback(buf, {
+          fileName: originalName,
+          onProgress: async (progress: PdfExtractionProgress) => {
+            if (progress.stage === "ocr_started") {
+              logUploadStage(requestId, "ocr_started", {
+                jobId,
+                pageCount: progress.totalPages,
+                ocrCandidatePages: progress.ocrCandidatePages,
+                scanLikeDocument: progress.scanLikeDocument,
+              });
+              await safeUpdateJob(admin, jobId, {
+                payload: {
+                  source: "trainer_upload",
+                  request_id: requestId,
+                  folder_id: folderId,
+                  file_name: originalName,
+                  mime_type: mimeType,
+                  upload_kind: processingUploadKind,
+                  size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+                  md5,
+                  stage: "ocr_started",
+                  scan_like_document: progress.scanLikeDocument,
+                  ocr_candidate_pages: progress.ocrCandidatePages,
+                },
+              });
+            }
+
+            if (progress.stage === "ocr_finished") {
+              logUploadStage(requestId, "ocr_finished", {
+                jobId,
+                pageCount: progress.totalPages,
+                ocrCandidatePages: progress.ocrCandidatePages,
+              });
+            }
+          },
+        });
       } catch (e) {
         const extractionError = errInfo(e);
         const pdfDebug = {
@@ -2005,6 +2232,45 @@ export async function POST(req: NextRequest) {
           extraction_method: extraction.extractionMethod,
         },
       });
+
+      if (isPdfTextInsufficientAfterExtraction(extraction)) {
+        logUploadStage(requestId, "pdf_text_unreadable", {
+          jobId,
+          pageCount: extraction.pageCount,
+          ocrPages: extraction.ocrPages,
+          extractionMethod: extraction.extractionMethod,
+        });
+        await safeUpdateJob(admin, jobId, {
+          status: "failed",
+          finished_at: new Date().toISOString(),
+          error: { message: SCAN_PDF_TEXT_UNREADABLE_MESSAGE },
+          payload: {
+            source: "trainer_upload",
+            request_id: requestId,
+            folder_id: folderId,
+            file_name: originalName,
+            mime_type: mimeType,
+            upload_kind: processingUploadKind,
+            size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+            md5,
+            stage: "failed",
+            page_count: extraction.pageCount,
+            ocr_pages: extraction.ocrPages,
+            extraction_method: extraction.extractionMethod,
+            extraction_quality: extraction.extractionQuality,
+            failure_reason: "text_unreadable_after_ocr",
+          },
+        });
+        return NextResponse.json(
+          {
+            ok: false,
+            code: "PDF_TEXT_UNREADABLE",
+            error: SCAN_PDF_TEXT_UNREADABLE_MESSAGE,
+            requestId,
+          },
+          { status: 422 },
+        );
+      }
 
       if (!extraction.pageCount || extraction.pageCount < 1) {
         return NextResponse.json(
