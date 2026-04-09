@@ -438,6 +438,11 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
   const basePatch = { ...patch };
 
   const seedPatches: Record<string, unknown>[] = [basePatch];
+  if (payload && meta) {
+    const next = { ...basePatch };
+    delete (next as any).meta;
+    seedPatches.push(next);
+  }
   if (payload && !meta) {
     const next = { ...basePatch };
     delete (next as any).payload;
@@ -592,10 +597,11 @@ async function processAcceptedPdfUpload(args: {
 
   try {
     logUploadStage(requestId, "processing_started", { jobId, fileId, storagePath });
-    await safeUpdateJob(admin, jobId, {
-      status: "started",
-      started_at: new Date().toISOString(),
-      payload: buildJobTrackingPayload({
+      await safeUpdateJob(admin, jobId, {
+        status: "started",
+        file_id: fileId,
+        started_at: new Date().toISOString(),
+        payload: buildJobTrackingPayload({
         requestId,
         folderId,
         fileName: originalName,
@@ -624,9 +630,10 @@ async function processAcceptedPdfUpload(args: {
     });
 
     logUploadStage(requestId, "pdf_extract_started", { jobId, fileName: originalName, fileId });
-    await safeUpdateJob(admin, jobId, {
-      status: "started",
-      payload: buildJobTrackingPayload({
+      await safeUpdateJob(admin, jobId, {
+        status: "started",
+        file_id: fileId,
+        payload: buildJobTrackingPayload({
         requestId,
         folderId,
         fileName: originalName,
@@ -674,9 +681,10 @@ async function processAcceptedPdfUpload(args: {
         request_id: requestId,
       },
     });
-    await safeUpdateJob(admin, jobId, {
-      status: "started",
-      payload: buildJobTrackingPayload({
+      await safeUpdateJob(admin, jobId, {
+        status: "started",
+        file_id: fileId,
+        payload: buildJobTrackingPayload({
         requestId,
         folderId,
         fileName: originalName,
@@ -711,9 +719,10 @@ async function processAcceptedPdfUpload(args: {
     });
 
     logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind: "pdf" });
-    await safeUpdateJob(admin, jobId, {
-      status: "started",
-      payload: buildJobTrackingPayload({
+      await safeUpdateJob(admin, jobId, {
+        status: "started",
+        file_id: fileId,
+        payload: buildJobTrackingPayload({
         requestId,
         folderId,
         fileName: originalName,
@@ -760,9 +769,10 @@ async function processAcceptedPdfUpload(args: {
       ocrTexts: extraction.ocrTexts,
     });
     logUploadStage(requestId, "chunk_build_finished", { jobId, fileId, chunkCount: chunkBuild.chunkCount });
-    await safeUpdateJob(admin, jobId, {
-      status: "started",
-      payload: buildJobTrackingPayload({
+      await safeUpdateJob(admin, jobId, {
+        status: "started",
+        file_id: fileId,
+        payload: buildJobTrackingPayload({
         requestId,
         folderId,
         fileName: originalName,
@@ -810,6 +820,7 @@ async function processAcceptedPdfUpload(args: {
       await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
       await safeUpdateJob(admin, jobId, {
         status: "failed",
+        file_id: fileId,
         finished_at: new Date().toISOString(),
         error: {
           message:
@@ -851,6 +862,7 @@ async function processAcceptedPdfUpload(args: {
     });
     await safeUpdateJob(admin, jobId, {
       status: "finished",
+      file_id: fileId,
       finished_at: new Date().toISOString(),
       payload: {
         ...buildJobTrackingPayload({
@@ -909,6 +921,7 @@ async function processAcceptedPdfUpload(args: {
     await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
     await safeUpdateJob(admin, jobId, {
       status: "failed",
+      file_id: fileId,
       finished_at: new Date().toISOString(),
       error: { message: e?.message ?? "PDF-behandling fejlede." },
       payload: buildJobTrackingPayload({
@@ -1395,6 +1408,7 @@ export async function POST(req: NextRequest) {
       logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath });
       await safeUpdateJob(admin, jobId, {
         status: "queued",
+        file_id: fileId,
         payload: buildJobTrackingPayload({
           requestId,
           folderId,
@@ -1724,6 +1738,7 @@ export async function POST(req: NextRequest) {
 
     logUploadStage(requestId, "storage_upload_started", { jobId, fileId, storagePath });
     await safeUpdateJob(admin, jobId, {
+      file_id: fileId,
       payload: {
         source: "trainer_upload",
         request_id: requestId,
@@ -1967,6 +1982,7 @@ export async function POST(req: NextRequest) {
 
     await safeUpdateJob(admin, jobId, {
       status: "finished",
+      file_id: fileId,
       finished_at: new Date().toISOString(),
       payload: {
         source: "trainer_upload",
