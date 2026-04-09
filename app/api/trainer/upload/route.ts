@@ -441,6 +441,38 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
     if (key in basePatch) bookkeepingPatch[key] = (basePatch as any)[key];
   }
 
+  const seen = new Set<string>();
+  const pushAttempt = (list: Record<string, unknown>[], candidate: Record<string, unknown>) => {
+    if (!candidate || Object.keys(candidate).length === 0) return;
+    const key = JSON.stringify(candidate);
+    if (seen.has(key)) return;
+    seen.add(key);
+    list.push(candidate);
+  };
+
+  const bookkeepingAttempts: Record<string, unknown>[] = [];
+  const payloadAttempts: Record<string, unknown>[] = [];
+
+  if (Object.keys(bookkeepingPatch).length > 0) {
+    pushAttempt(bookkeepingAttempts, bookkeepingPatch);
+    if ("file_id" in bookkeepingPatch) {
+      const withoutFileId = { ...bookkeepingPatch };
+      delete (withoutFileId as any).file_id;
+      pushAttempt(bookkeepingAttempts, withoutFileId);
+    }
+    if ("started_at" in bookkeepingPatch || "finished_at" in bookkeepingPatch) {
+      const withoutTimestamps = { ...bookkeepingPatch };
+      delete (withoutTimestamps as any).started_at;
+      delete (withoutTimestamps as any).finished_at;
+      pushAttempt(bookkeepingAttempts, withoutTimestamps);
+      if ("file_id" in withoutTimestamps) {
+        const withoutFileIdAndTimestamps = { ...withoutTimestamps };
+        delete (withoutFileIdAndTimestamps as any).file_id;
+        pushAttempt(bookkeepingAttempts, withoutFileIdAndTimestamps);
+      }
+    }
+  }
+
   const seedPatches: Record<string, unknown>[] = [basePatch];
   if (payload && meta) {
     const next = { ...basePatch };
@@ -470,78 +502,63 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
     seedPatches.push(next);
   }
 
-  const attempts: Record<string, unknown>[] = [];
-  const seen = new Set<string>();
-  const pushAttempt = (candidate: Record<string, unknown>) => {
-    if (!candidate || Object.keys(candidate).length === 0) return;
-    const key = JSON.stringify(candidate);
-    if (seen.has(key)) return;
-    seen.add(key);
-    attempts.push(candidate);
-  };
-  if (Object.keys(bookkeepingPatch).length > 0) {
-    pushAttempt(bookkeepingPatch);
-    if ("file_id" in bookkeepingPatch) {
-      const withoutFileId = { ...bookkeepingPatch };
-      delete (withoutFileId as any).file_id;
-      pushAttempt(withoutFileId);
-    }
-    if ("started_at" in bookkeepingPatch || "finished_at" in bookkeepingPatch) {
-      const withoutTimestamps = { ...bookkeepingPatch };
-      delete (withoutTimestamps as any).started_at;
-      delete (withoutTimestamps as any).finished_at;
-      pushAttempt(withoutTimestamps);
-      if ("file_id" in withoutTimestamps) {
-        const withoutFileIdAndTimestamps = { ...withoutTimestamps };
-        delete (withoutFileIdAndTimestamps as any).file_id;
-        pushAttempt(withoutFileIdAndTimestamps);
-      }
-    }
-  }
   for (const seed of seedPatches) {
-    pushAttempt(seed);
+    pushAttempt(payloadAttempts, seed);
     if ("started_at" in seed || "finished_at" in seed) {
       const withoutTimestamps = { ...seed };
       delete (withoutTimestamps as any).started_at;
       delete (withoutTimestamps as any).finished_at;
-      pushAttempt(withoutTimestamps);
+      pushAttempt(payloadAttempts, withoutTimestamps);
     }
   }
 
   try {
     let lastError: any = null;
-    for (const attempt of attempts) {
-      const result = await admin.from("jobs").update(attempt).eq("id", jobId);
-      if (!result.error) {
-        const status = typeof (attempt as any).status === "string" ? String((attempt as any).status) : null;
-        const stage =
-          typeof (attempt as any).payload?.stage === "string"
-            ? String((attempt as any).payload.stage)
-            : typeof (attempt as any).meta?.stage === "string"
-              ? String((attempt as any).meta.stage)
-              : null;
-        if (status === "started" || status === "finished" || status === "succeeded" || status === "failed") {
-          console.info("[trainer/upload] job update committed", {
-            jobId,
-            status,
-            stage,
-            fileId:
-              typeof (attempt as any).file_id === "string"
-                ? String((attempt as any).file_id)
-                : typeof (attempt as any).payload?.file_id === "string"
-                  ? String((attempt as any).payload.file_id)
-                  : typeof (attempt as any).meta?.file_id === "string"
-                    ? String((attempt as any).meta.file_id)
-                    : typeof (attempt as any).result?.fileId === "string"
-                      ? String((attempt as any).result.fileId)
-                      : null,
-            patchKeys: Object.keys(attempt),
-          });
+    const tryAttempts = async (attempts: Record<string, unknown>[], mode: "bookkeeping" | "payload") => {
+      let succeeded = false;
+      for (const attempt of attempts) {
+        const result = await admin.from("jobs").update(attempt).eq("id", jobId);
+        if (!result.error) {
+          const status = typeof (attempt as any).status === "string" ? String((attempt as any).status) : null;
+          const stage =
+            typeof (attempt as any).payload?.stage === "string"
+              ? String((attempt as any).payload.stage)
+              : typeof (attempt as any).meta?.stage === "string"
+                ? String((attempt as any).meta.stage)
+                : null;
+          if (status === "started" || status === "finished" || status === "succeeded" || status === "failed") {
+            console.info("[trainer/upload] job update committed", {
+              jobId,
+              mode,
+              status,
+              stage,
+              fileId:
+                typeof (attempt as any).file_id === "string"
+                  ? String((attempt as any).file_id)
+                  : typeof (attempt as any).payload?.file_id === "string"
+                    ? String((attempt as any).payload.file_id)
+                    : typeof (attempt as any).meta?.file_id === "string"
+                      ? String((attempt as any).meta.file_id)
+                      : typeof (attempt as any).result?.fileId === "string"
+                        ? String((attempt as any).result.fileId)
+                        : null,
+              patchKeys: Object.keys(attempt),
+            });
+          }
+          succeeded = true;
+          break;
         }
-        return;
+        lastError = result.error;
       }
-      lastError = result.error;
-    }
+      return succeeded;
+    };
+
+    const bookkeepingSucceeded = await tryAttempts(bookkeepingAttempts, "bookkeeping");
+    const payloadSucceeded =
+      payloadAttempts.length > 0 ? await tryAttempts(payloadAttempts, "payload") : bookkeepingSucceeded;
+
+    if (bookkeepingSucceeded || payloadSucceeded) return;
+
     console.warn("[trainer/upload] job update warning:", {
       jobId,
       error: errInfo(lastError),
@@ -1001,6 +1018,566 @@ async function processAcceptedPdfUpload(args: {
   }
 }
 
+async function ensureTrainerImportJob(args: {
+  admin: any;
+  ownerId: string;
+  requestId: string;
+  folderId: string;
+  originalName: string;
+  mimeType: string;
+  uploadKind: "pdf" | "audio" | "other";
+  sizeBytes: number | null;
+}) {
+  const { admin, ownerId, requestId, folderId, originalName, mimeType, uploadKind, sizeBytes } = args;
+  let jobId: string | null = null;
+
+  try {
+    const jobQueuedAt = new Date().toISOString();
+    const jobRowId = randomUUID();
+    const jobTracking = {
+      source: "trainer_upload",
+      request_id: requestId,
+      folder_id: folderId,
+      file_name: originalName,
+      mime_type: mimeType,
+      upload_kind: uploadKind,
+      size_bytes: sizeBytes,
+      stage: "queued",
+    };
+    console.info("[trainer/upload] job create payload", {
+      requestId,
+      ownerId,
+      kind: "import",
+      status: "queued",
+      payload: jobTracking,
+      meta: jobTracking,
+    });
+    const jobInsert = await tryInsertJob(admin, [
+      {
+        label: "full_payload_meta_result_error",
+        row: {
+          id: jobRowId,
+          owner_id: ownerId,
+          kind: "import",
+          status: "queued",
+          queued_at: jobQueuedAt,
+          payload: jobTracking,
+          meta: jobTracking,
+          result: null,
+          error: null,
+        },
+      },
+      {
+        label: "payload_meta_only",
+        row: {
+          id: jobRowId,
+          owner_id: ownerId,
+          kind: "import",
+          status: "queued",
+          queued_at: jobQueuedAt,
+          payload: jobTracking,
+          meta: jobTracking,
+        },
+      },
+      {
+        label: "payload_only",
+        row: {
+          id: jobRowId,
+          owner_id: ownerId,
+          kind: "import",
+          status: "queued",
+          queued_at: jobQueuedAt,
+          payload: jobTracking,
+        },
+      },
+      {
+        label: "meta_only",
+        row: {
+          id: jobRowId,
+          owner_id: ownerId,
+          kind: "import",
+          status: "queued",
+          queued_at: jobQueuedAt,
+          meta: jobTracking,
+        },
+      },
+      {
+        label: "minimal_without_payload",
+        row: {
+          id: jobRowId,
+          owner_id: ownerId,
+          kind: "import",
+          status: "queued",
+          queued_at: jobQueuedAt,
+        },
+      },
+    ]);
+
+    if (jobInsert.ok && jobInsert.id) {
+      jobId = String(jobInsert.id);
+      logUploadStage(requestId, "job_created", { jobId, strategy: jobInsert.label });
+    } else {
+      const lookup = await admin
+        .from("jobs")
+        .select("id,payload,meta,queued_at")
+        .eq("owner_id", ownerId)
+        .eq("kind", "import")
+        .gte("queued_at", new Date(new Date(jobQueuedAt).getTime() - 5000).toISOString())
+        .lte("queued_at", new Date(new Date(jobQueuedAt).getTime() + 5000).toISOString())
+        .order("queued_at", { ascending: false, nullsFirst: false })
+        .limit(25);
+
+      if (!lookup.error && Array.isArray(lookup.data)) {
+        const matched = lookup.data.find((row: any) => {
+          const payloadRequestId = String(row?.payload?.request_id ?? "").trim();
+          const metaRequestId = String(row?.meta?.request_id ?? "").trim();
+          return payloadRequestId === requestId || metaRequestId === requestId;
+        });
+        if (matched?.id) {
+          jobId = String(matched.id);
+          logUploadStage(requestId, "job_linked_from_lookup", { jobId });
+        } else if (lookup.data.length === 1 && (lookup.data[0] as any)?.id) {
+          jobId = String((lookup.data[0] as any).id);
+          logUploadStage(requestId, "job_linked_from_time_window", { jobId });
+          await safeUpdateJob(admin, jobId, {
+            payload: jobTracking,
+            meta: jobTracking,
+          });
+        }
+      }
+
+      if (!jobId) {
+        console.warn("[trainer/upload] job create warning:", errInfo(jobInsert.error));
+      }
+    }
+    await safeUpdateJob(admin, jobId, {
+      status: "queued",
+      payload: jobTracking,
+      meta: jobTracking,
+    });
+  } catch (jobCreateError) {
+    console.warn("[trainer/upload] job create warning:", errInfo(jobCreateError));
+  }
+
+  return jobId;
+}
+
+async function finalizeAcceptedPdfUpload(args: {
+  admin: any;
+  requestId: string;
+  jobId: string | null;
+  ownerId: string;
+  folderId: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  md5: string;
+  buf: Buffer;
+  fileId: string;
+  storagePath: string;
+  effectivePages: number;
+  quotaResetAt: string;
+}) {
+  const {
+    admin,
+    requestId,
+    jobId,
+    ownerId,
+    folderId,
+    originalName,
+    mimeType,
+    sizeBytes,
+    md5,
+    buf,
+    fileId,
+    storagePath,
+    effectivePages,
+    quotaResetAt,
+  } = args;
+
+  const uploadedAt = new Date().toISOString();
+  const placeholderExtractionMeta = {
+    input_kind: "pdf",
+    processing_status: "queued",
+    request_id: requestId,
+  };
+  const insertAttempts = [
+    {
+      label: "pdf_processing_full",
+      row: {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        original_name: originalName,
+        mime_type: mimeType,
+        size_bytes: sizeBytes,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+        page_count: effectivePages,
+        ocr_pages: 0,
+        extraction_method: null,
+        extraction_quality: null,
+        extraction_meta: placeholderExtractionMeta,
+      },
+    },
+    {
+      label: "pdf_processing_compact",
+      row: {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        original_name: originalName,
+        mime_type: mimeType,
+        size_bytes: sizeBytes,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+        page_count: effectivePages,
+        extraction_meta: placeholderExtractionMeta,
+      },
+    },
+    {
+      label: "pdf_processing_legacy",
+      row: {
+        id: fileId,
+        owner_id: ownerId,
+        folder_id: folderId,
+        name: originalName,
+        original_name: originalName,
+        storage_path: storagePath,
+        md5,
+        uploaded_at: uploadedAt,
+      },
+    },
+  ];
+
+  const ins = await tryInsertFile(admin, insertAttempts);
+  if (!ins.ok) {
+    console.error("[trainer/upload] files insert error:", errInfo(ins.error));
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return NextResponse.json({ ok: false, error: "Kunne ikke gemme fil i databasen.", requestId }, { status: 500 });
+  }
+
+  await safeUpdateJob(admin, jobId, {
+    status: "queued",
+    file_id: fileId,
+    payload: buildJobTrackingPayload({
+      requestId,
+      folderId,
+      fileName: originalName,
+      mimeType,
+      uploadKind: "pdf",
+      sizeBytes,
+      md5,
+      fileId,
+      storagePath,
+      pageCount: effectivePages,
+      stage: "storage_upload_finished",
+    }),
+    meta: buildJobTrackingPayload({
+      requestId,
+      folderId,
+      fileName: originalName,
+      mimeType,
+      uploadKind: "pdf",
+      sizeBytes,
+      md5,
+      fileId,
+      storagePath,
+      pageCount: effectivePages,
+      stage: "storage_upload_finished",
+    }),
+  });
+  logUploadStage(requestId, "response_ready", {
+    jobId,
+    fileId,
+    uploadKind: "pdf",
+    pages: effectivePages,
+    accepted: true,
+  });
+
+  after(async () => {
+    await processAcceptedPdfUpload({
+      requestId,
+      jobId,
+      ownerId,
+      folderId,
+      originalName,
+      mimeType,
+      sizeBytes,
+      md5,
+      buf,
+      fileId,
+      storagePath,
+      effectivePages,
+      quotaResetAt,
+    });
+  });
+
+  return NextResponse.json(
+    {
+      ok: true,
+      accepted: true,
+      processing: true,
+      requestId,
+      jobId,
+      fileId,
+      folderId,
+      uploadKind: "pdf",
+      pages: effectivePages,
+      stage: "queued",
+      jobStatus: "queued",
+      storage: { bucket: UPLOAD_BUCKET, path: storagePath },
+    },
+    { status: 202 },
+  );
+}
+
+async function handleDirectPdfUploadComplete(args: {
+  admin: any;
+  ownerId: string;
+  requestId: string;
+  body: any;
+}) {
+  const { admin, ownerId, requestId, body } = args;
+
+  const folderId = String(body?.folder_id ?? body?.folderId ?? "").trim() || null;
+  const originalName = stripPathy(String(body?.file_name ?? body?.fileName ?? "upload.pdf"));
+  const mimeType = String(body?.mime_type ?? body?.mimeType ?? "application/pdf").trim() || "application/pdf";
+  const sizeBytes = typeof body?.size_bytes === "number" ? Number(body.size_bytes) : typeof body?.sizeBytes === "number" ? Number(body.sizeBytes) : null;
+  const storagePath = String(body?.storage_path ?? body?.storagePath ?? "").trim();
+  const fileId = String(body?.file_id ?? body?.fileId ?? "").trim();
+  const uploadKind = detectUploadKind({ name: originalName, type: mimeType } as File, originalName);
+
+  if (!folderId) return NextResponse.json({ ok: false, error: "Manglende folder_id.", requestId }, { status: 400 });
+  if (!storagePath || !fileId) {
+    return NextResponse.json({ ok: false, error: "Manglende storage-reference.", requestId }, { status: 400 });
+  }
+  if (uploadKind !== "pdf") {
+    return NextResponse.json({ ok: false, error: "Direct upload understøtter kun PDF lige nu.", requestId }, { status: 400 });
+  }
+  if (sizeBytes != null && sizeBytes > MAX_FILE_BYTES) {
+    return NextResponse.json(
+      {
+        ok: false,
+        code: "FILE_TOO_LARGE",
+        error: "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer.",
+        requestId,
+      },
+      { status: 413 },
+    );
+  }
+
+  const expectedPrefix = `${ownerId}/${folderId}/`;
+  if (!storagePath.startsWith(expectedPrefix)) {
+    return NextResponse.json({ ok: false, error: "Ugyldig storage_path for valgt mappe.", requestId }, { status: 400 });
+  }
+  if (!storagePath.includes(fileId)) {
+    return NextResponse.json({ ok: false, error: "Ugyldig file_id for storage_path.", requestId }, { status: 400 });
+  }
+
+  const { data: folderRow, error: folderErr } = await admin
+    .from("folders")
+    .select("id")
+    .eq("owner_id", ownerId)
+    .eq("id", folderId)
+    .is("archived_at", null)
+    .maybeSingle();
+
+  if (folderErr) console.error("[trainer/upload] folder lookup error:", errInfo(folderErr));
+  if (!folderRow) return NextResponse.json({ ok: false, error: "Ugyldig mappe (folder_id).", requestId }, { status: 400 });
+
+  const dl = await admin.storage.from(UPLOAD_BUCKET).download(storagePath);
+  if (dl.error || !dl.data) {
+    console.error("[trainer/upload] direct storage download error:", errInfo(dl.error));
+    return NextResponse.json({ ok: false, error: "Kunne ikke læse den uploadede fil fra storage.", requestId }, { status: 500 });
+  }
+
+  const buf = Buffer.from(await dl.data.arrayBuffer());
+  const md5 = createHash("md5").update(buf).digest("hex");
+  const { removedIds: orphanedDuplicateIds } = await purgeInactiveDuplicateFiles(admin, { ownerId, md5 });
+  if (orphanedDuplicateIds.length > 0) {
+    console.warn("[trainer/upload] purged inactive duplicate rows before insert:", {
+      ownerId,
+      md5,
+      removedIds: orphanedDuplicateIds,
+    });
+  }
+
+  const { duplicate: existing, error: existingErr } = await findActiveDuplicateUpload(admin, { ownerId, md5 });
+  if (existingErr) console.error("[trainer/upload] duplicate lookup error:", errInfo(existingErr));
+  if (existing?.id) {
+    const existingStoragePath = String(existing.storage_path ?? "").trim();
+    const storageStillExists = existingStoragePath ? await uploadStorageObjectExists(admin, existingStoragePath) : false;
+    if (storageStillExists) {
+      try {
+        await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+      } catch {}
+      return NextResponse.json(
+        {
+          ok: false,
+          code: "DUPLICATE_FILE",
+          message: "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+          existingFileId: existing.id,
+          requestId,
+        },
+        { status: 409 },
+      );
+    }
+
+    await purgeFileArtifacts(admin, {
+      ownerId,
+      fileId: String(existing.id),
+      storagePath: existingStoragePath,
+      fileMd5: md5,
+    });
+  }
+
+  let effectivePages = 0;
+  try {
+    effectivePages = await countPdfPagesQuick(buf);
+  } catch (e) {
+    const extractionError = errInfo(e);
+    console.error("[trainer/upload] pdf page count error", {
+      requestId,
+      filename: originalName,
+      contentType: mimeType || null,
+      size: sizeBytes ?? buf.length,
+      errorMessage: extractionError.message ?? "Unknown error",
+    });
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return NextResponse.json(
+      {
+        ok: false,
+        code: "PDF_UNREADABLE",
+        error: "PDF kunne ikke læses.",
+        requestId,
+      },
+      { status: 400 },
+    );
+  }
+
+  if (!effectivePages || effectivePages < 1) {
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return NextResponse.json(
+      { ok: false, code: "PDF_NO_PAGES", error: "PDF har ingen sider.", requestId },
+      { status: 400 },
+    );
+  }
+
+  const planInfo = await getUploadPlan(admin, ownerId);
+  if (!planInfo.resolved) {
+    console.warn("[trainer/upload] skipping freemium page gate because plan lookup was not resolved", {
+      ownerId,
+      requestId,
+      rawPlan: planInfo.rawPlan,
+      normalizedPlan: planInfo.plan,
+      effectivePages,
+    });
+  }
+  if (planInfo.resolved && planInfo.plan === "freemium" && effectivePages > FREEMIUM_PDF_PAGE_LIMIT) {
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return NextResponse.json(
+      {
+        ok: false,
+        code: "FILE_TOO_LONG",
+        message: `Denne PDF har ${effectivePages} sider, men Freemium-planen tillader maks. ${FREEMIUM_PDF_PAGE_LIMIT} sider pr. fil.`,
+        pages: effectivePages,
+        pageLimit: FREEMIUM_PDF_PAGE_LIMIT,
+        plan: planInfo.plan,
+        requestId,
+      },
+      { status: 413 },
+    );
+  }
+
+  let quotaBefore;
+  try {
+    quotaBefore = await getImportQuotaSnapshot({ admin, ownerId });
+  } catch (e) {
+    console.error("[trainer/upload] import quota snapshot error:", errInfo(e));
+    return NextResponse.json(
+      {
+        ok: false,
+        code: "QUOTA_CHECK_FAILED",
+        message: "Kunne ikke tjekke din grænse lige nu. Prøv igen om lidt.",
+        requestId,
+      },
+      { status: 503 },
+    );
+  }
+
+  if (quotaBefore.monthlyLimit != null && quotaBefore.usedThisMonth + effectivePages > quotaBefore.monthlyLimit) {
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return buildQuotaExceededResponse({
+      requestId,
+      pages: effectivePages,
+      usedThisMonth: quotaBefore.usedThisMonth,
+      monthlyLimit: quotaBefore.monthlyLimit,
+      resetAt: quotaBefore.resetAt,
+    });
+  }
+
+  const jobId = await ensureTrainerImportJob({
+    admin,
+    ownerId,
+    requestId,
+    folderId,
+    originalName,
+    mimeType,
+    uploadKind: "pdf",
+    sizeBytes: sizeBytes ?? buf.length,
+  });
+
+  logUploadStage(requestId, "file_buffered", { jobId, bytes: buf.length, md5, storagePath, directUpload: true });
+  await safeUpdateJob(admin, jobId, {
+    payload: {
+      source: "trainer_upload",
+      request_id: requestId,
+      folder_id: folderId,
+      file_name: originalName,
+      mime_type: mimeType,
+      upload_kind: "pdf",
+      size_bytes: sizeBytes ?? buf.length,
+      md5,
+      file_id: fileId,
+      storage_path: storagePath,
+      stage: "file_buffered",
+    },
+  });
+
+  logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath, directUpload: true });
+  return finalizeAcceptedPdfUpload({
+    admin,
+    requestId,
+    jobId,
+    ownerId,
+    folderId,
+    originalName,
+    mimeType,
+    sizeBytes: sizeBytes ?? buf.length,
+    md5,
+    buf,
+    fileId,
+    storagePath,
+    effectivePages,
+    quotaResetAt: quotaBefore.resetAt,
+  });
+}
+
 export async function POST(req: NextRequest) {
   const fallbackRequestId = randomUUID();
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
@@ -1073,6 +1650,15 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const contentType = String(req.headers.get("content-type") ?? "").toLowerCase();
+    if (contentType.includes("application/json")) {
+      const body = await req.json().catch(() => null);
+      requestId = String(body?.request_id ?? body?.requestId ?? fallbackRequestId).trim() || fallbackRequestId;
+      logUploadStage(requestId, "upload_started", { cookieCount: cookieNames.length, mode: "storage_complete" });
+      await ensureProfile(admin, ownerId);
+      return await handleDirectPdfUploadComplete({ admin, ownerId, requestId, body });
+    }
+
     const form = await req.formData();
 
     requestId = String(form.get("request_id") ?? form.get("requestId") ?? fallbackRequestId).trim() || fallbackRequestId;
@@ -1133,133 +1719,16 @@ export async function POST(req: NextRequest) {
       sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
     });
 
-    try {
-      const jobQueuedAt = new Date().toISOString();
-      const jobRowId = randomUUID();
-      const jobTracking = {
-        source: "trainer_upload",
-        request_id: requestId,
-        folder_id: folderId,
-        file_name: originalName,
-        mime_type: mimeType,
-        upload_kind: uploadKind,
-        size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-        stage: "queued",
-      };
-      console.info("[trainer/upload] job create payload", {
-        requestId,
-        ownerId,
-        kind: "import",
-        status: "queued",
-        payload: jobTracking,
-        meta: jobTracking,
-      });
-      const jobInsert = await tryInsertJob(admin, [
-        {
-          label: "full_payload_meta_result_error",
-          row: {
-            id: jobRowId,
-            owner_id: ownerId,
-            kind: "import",
-            status: "queued",
-            queued_at: jobQueuedAt,
-            payload: jobTracking,
-            meta: jobTracking,
-            result: null,
-            error: null,
-          },
-        },
-        {
-          label: "payload_meta_only",
-          row: {
-            id: jobRowId,
-            owner_id: ownerId,
-            kind: "import",
-            status: "queued",
-            queued_at: jobQueuedAt,
-            payload: jobTracking,
-            meta: jobTracking,
-          },
-        },
-        {
-          label: "payload_only",
-          row: {
-            id: jobRowId,
-            owner_id: ownerId,
-            kind: "import",
-            status: "queued",
-            queued_at: jobQueuedAt,
-            payload: jobTracking,
-          },
-        },
-        {
-          label: "meta_only",
-          row: {
-            id: jobRowId,
-            owner_id: ownerId,
-            kind: "import",
-            status: "queued",
-            queued_at: jobQueuedAt,
-            meta: jobTracking,
-          },
-        },
-        {
-          label: "minimal_without_payload",
-          row: {
-            id: jobRowId,
-            owner_id: ownerId,
-            kind: "import",
-            status: "queued",
-            queued_at: jobQueuedAt,
-          },
-        },
-      ]);
-
-      if (jobInsert.ok && jobInsert.id) {
-        jobId = String(jobInsert.id);
-        logUploadStage(requestId, "job_created", { jobId, strategy: jobInsert.label });
-      } else {
-        const lookup = await admin
-          .from("jobs")
-          .select("id,payload,meta,queued_at")
-          .eq("owner_id", ownerId)
-          .eq("kind", "import")
-          .gte("queued_at", new Date(new Date(jobQueuedAt).getTime() - 5000).toISOString())
-          .lte("queued_at", new Date(new Date(jobQueuedAt).getTime() + 5000).toISOString())
-          .order("queued_at", { ascending: false, nullsFirst: false })
-          .limit(25);
-
-        if (!lookup.error && Array.isArray(lookup.data)) {
-          const matched = lookup.data.find((row: any) => {
-            const payloadRequestId = String(row?.payload?.request_id ?? "").trim();
-            const metaRequestId = String(row?.meta?.request_id ?? "").trim();
-            return payloadRequestId === requestId || metaRequestId === requestId;
-          });
-          if (matched?.id) {
-            jobId = String(matched.id);
-            logUploadStage(requestId, "job_linked_from_lookup", { jobId });
-          } else if (lookup.data.length === 1 && (lookup.data[0] as any)?.id) {
-            jobId = String((lookup.data[0] as any).id);
-            logUploadStage(requestId, "job_linked_from_time_window", { jobId });
-            await safeUpdateJob(admin, jobId, {
-              payload: jobTracking,
-              meta: jobTracking,
-            });
-          }
-        }
-
-        if (!jobId) {
-          console.warn("[trainer/upload] job create warning:", errInfo(jobInsert.error));
-        }
-      }
-      await safeUpdateJob(admin, jobId, {
-        status: "queued",
-        payload: jobTracking,
-        meta: jobTracking,
-      });
-    } catch (jobCreateError) {
-      console.warn("[trainer/upload] job create warning:", errInfo(jobCreateError));
-    }
+    jobId = await ensureTrainerImportJob({
+      admin,
+      ownerId,
+      requestId,
+      folderId,
+      originalName,
+      mimeType,
+      uploadKind,
+      sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+    });
 
     const ab = await file.arrayBuffer();
     const buf = Buffer.from(ab);
@@ -1452,178 +1921,22 @@ export async function POST(req: NextRequest) {
       }
 
       logUploadStage(requestId, "storage_upload_finished", { jobId, fileId, storagePath });
-      await safeUpdateJob(admin, jobId, {
-        status: "queued",
-        payload: buildJobTrackingPayload({
-          requestId,
-          folderId,
-          fileName: originalName,
-          mimeType,
-          uploadKind,
-          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-          md5,
-          fileId,
-          storagePath,
-          pageCount: effectivePages,
-          stage: "storage_upload_finished",
-        }),
-        meta: buildJobTrackingPayload({
-          requestId,
-          folderId,
-          fileName: originalName,
-          mimeType,
-          uploadKind,
-          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-          md5,
-          fileId,
-          storagePath,
-          pageCount: effectivePages,
-          stage: "storage_upload_finished",
-        }),
-      });
-
-      const uploadedAt = new Date().toISOString();
-      const placeholderExtractionMeta = {
-        input_kind: uploadKind,
-        processing_status: "queued",
-        request_id: requestId,
-      };
-      const insertAttempts = [
-        {
-          label: "pdf_processing_full",
-          row: {
-            id: fileId,
-            owner_id: ownerId,
-            folder_id: folderId,
-            name: originalName,
-            original_name: originalName,
-            mime_type: mimeType,
-            size_bytes: (file as any).size ?? null,
-            storage_path: storagePath,
-            md5,
-            uploaded_at: uploadedAt,
-            page_count: effectivePages,
-            ocr_pages: 0,
-            extraction_method: null,
-            extraction_quality: null,
-            extraction_meta: placeholderExtractionMeta,
-          },
-        },
-        {
-          label: "pdf_processing_compact",
-          row: {
-            id: fileId,
-            owner_id: ownerId,
-            folder_id: folderId,
-            name: originalName,
-            original_name: originalName,
-            mime_type: mimeType,
-            size_bytes: (file as any).size ?? null,
-            storage_path: storagePath,
-            md5,
-            uploaded_at: uploadedAt,
-            page_count: effectivePages,
-            extraction_meta: placeholderExtractionMeta,
-          },
-        },
-        {
-          label: "pdf_processing_legacy",
-          row: {
-            id: fileId,
-            owner_id: ownerId,
-            folder_id: folderId,
-            name: originalName,
-            original_name: originalName,
-            storage_path: storagePath,
-            md5,
-            uploaded_at: uploadedAt,
-          },
-        },
-      ];
-
-      const ins = await tryInsertFile(admin, insertAttempts);
-      if (!ins.ok) {
-        console.error("[trainer/upload] files insert error:", errInfo(ins.error));
-        try {
-          await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
-        } catch {}
-        return NextResponse.json({ ok: false, error: "Kunne ikke gemme fil i databasen.", requestId }, { status: 500 });
-      }
-
-      await safeUpdateJob(admin, jobId, {
-        status: "queued",
-        file_id: fileId,
-        payload: buildJobTrackingPayload({
-          requestId,
-          folderId,
-          fileName: originalName,
-          mimeType,
-          uploadKind,
-          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-          md5,
-          fileId,
-          storagePath,
-          pageCount: effectivePages,
-          stage: "queued",
-        }),
-        meta: buildJobTrackingPayload({
-          requestId,
-          folderId,
-          fileName: originalName,
-          mimeType,
-          uploadKind,
-          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-          md5,
-          fileId,
-          storagePath,
-          pageCount: effectivePages,
-          stage: "queued",
-        }),
-      });
-      logUploadStage(requestId, "response_ready", {
+      return finalizeAcceptedPdfUpload({
+        admin,
+        requestId,
         jobId,
+        ownerId,
+        folderId,
+        originalName,
+        mimeType,
+        sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+        md5,
+        buf,
         fileId,
-        uploadKind,
-        pages: effectivePages,
-        accepted: true,
+        storagePath,
+        effectivePages,
+        quotaResetAt: quotaBefore.resetAt,
       });
-
-      after(async () => {
-        await processAcceptedPdfUpload({
-          requestId,
-          jobId,
-          ownerId,
-          folderId,
-          originalName,
-          mimeType,
-          sizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
-          md5,
-          buf,
-          fileId,
-          storagePath,
-          effectivePages,
-          quotaResetAt: quotaBefore.resetAt,
-        });
-      });
-
-      return NextResponse.json(
-        {
-          ok: true,
-          accepted: true,
-          processing: true,
-          requestId,
-          jobId,
-          fileId,
-          folderId,
-          md5,
-          uploadKind,
-          pages: effectivePages,
-          stage: "queued",
-          jobStatus: "queued",
-          storage: { bucket: UPLOAD_BUCKET, path: storagePath },
-        },
-        { status: 202 },
-      );
     }
 
     let extraction: Awaited<ReturnType<typeof extractPdfWithFallback>> | null = null;

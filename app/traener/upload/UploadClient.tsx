@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
+import { createBrowserClient } from "@/lib/supabase/client";
 
 type Folder = {
   id: string;
@@ -909,13 +910,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     try {
       const clientRequestId = createClientRequestId();
-      const fd = new FormData();
-      fd.append("file", pickedFile);
-      fd.append("folder_id", uploadFolderId);
-      fd.append("request_id", clientRequestId);
-      if (isAudioFile(pickedFile)) {
-        fd.append("audio_note_mode", audioNoteMode);
-      }
+      const selectedUploadKind = isAudioFile(pickedFile) ? "audio" : "pdf";
 
       const controller = new AbortController();
       uploadAbortRef.current = controller;
@@ -927,7 +922,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         jobId: null,
         fileId: null,
         responseSettled: false,
-        kind: isAudioFile(pickedFile) ? "audio" : "pdf",
+        kind: selectedUploadKind,
         status: null,
         stage: null,
       });
@@ -938,9 +933,89 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
       });
 
-      const res = await fetch("/api/trainer/upload", { method: "POST", body: fd, signal: controller.signal });
-      const responseText = await res.text();
-      const data = safeJson(responseText) ?? {};
+      let res: Response;
+      let responseText = "";
+      let data: any = {};
+
+      if (selectedUploadKind === "pdf") {
+        const initRes = await fetch("/api/trainer/upload/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            request_id: clientRequestId,
+            folder_id: uploadFolderId,
+            file_name: pickedFile.name,
+            mime_type: pickedFile.type || "application/pdf",
+            size_bytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          }),
+        });
+        const initResponseText = await initRes.text();
+        const initData = safeJson(initResponseText) ?? {};
+
+        if (!initRes.ok) {
+          setUploadError(
+            resolveUploadErrorMessage(initRes.status, initData, pickedFile, {
+              res: initRes,
+              responseText: initResponseText,
+            }),
+          );
+          return;
+        }
+
+        const bucket = asString(initData?.storage?.bucket);
+        const storagePath = asString(initData?.storage?.path);
+        const uploadToken = asString(initData?.storage?.token);
+        const initFileId = asString(initData?.fileId);
+
+        if (!bucket || !storagePath || !uploadToken || !initFileId) {
+          setUploadError("Kunne ikke starte storage-uploaden. Prøv igen.");
+          return;
+        }
+
+        setActiveUpload((prev) =>
+          prev && prev.requestId === clientRequestId
+            ? {
+                ...prev,
+                fileId: initFileId,
+              }
+            : prev,
+        );
+
+        const supabase = createBrowserClient();
+        const storageUpload = await supabase.storage.from(bucket).uploadToSignedUrl(storagePath, uploadToken, pickedFile, {
+          upsert: false,
+          contentType: pickedFile.type || "application/pdf",
+        });
+
+        if (storageUpload.error) {
+          setUploadError(storageUpload.error.message || "Kunne ikke sende filen direkte til storage.");
+          return;
+        }
+
+        res = await fetch("/api/trainer/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            request_id: clientRequestId,
+            folder_id: uploadFolderId,
+            file_id: initFileId,
+            storage_path: storagePath,
+            file_name: pickedFile.name,
+            mime_type: pickedFile.type || "application/pdf",
+            size_bytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          }),
+          signal: controller.signal,
+        });
+      } else {
+        const fd = new FormData();
+        fd.append("file", pickedFile);
+        fd.append("folder_id", uploadFolderId);
+        fd.append("request_id", clientRequestId);
+        fd.append("audio_note_mode", audioNoteMode);
+        res = await fetch("/api/trainer/upload", { method: "POST", body: fd, signal: controller.signal });
+      }
+      responseText = await res.text();
+      data = safeJson(responseText) ?? {};
       setActiveUpload((prev) =>
         prev && prev.requestId === clientRequestId
           ? {
