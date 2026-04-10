@@ -39,6 +39,11 @@ const FREEMIUM_PDF_PAGE_LIMIT = 15;
 const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".mp4", ".mpeg", ".mpga", ".webm", ".ogg", ".oga", ".flac", ".aac"]);
 const SCAN_PDF_TEXT_UNREADABLE_MESSAGE =
   "PDF’en kunne åbnes, men teksten kunne ikke læses sikkert. Prøv evt. en anden PDF eller en eksport med bedre tekstlag.";
+const DOC_CHUNKS_DB_TIMEOUT_MS = (() => {
+  const fallback = process.env.NODE_ENV === "production" ? 60_000 : 15_000;
+  const value = Number(process.env.DOC_CHUNKS_DB_TIMEOUT_MS ?? fallback);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+})();
 
 function logUploadStage(requestId: string, stage: string, meta?: Record<string, unknown>) {
   console.info("[trainer/upload] stage", {
@@ -59,6 +64,24 @@ function errInfo(e: any) {
     hint: e.hint,
     status: e.status,
   };
+}
+
+async function withOperationTimeout<T>(label: string, timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const error: any = new Error(`${label} timed out after ${timeoutMs}ms`);
+          error.code = "OPERATION_TIMEOUT";
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 function stripPathy(name: string) {
@@ -251,35 +274,105 @@ async function rebuildDocChunksForFile(
   },
 ) {
   const { ownerId, fileId, folderId, originalName, pages } = args;
+  let rowCount = 0;
 
-  // ryd først (idempotent)
-  {
-    const del = await admin.from("doc_chunks").delete().eq("owner_id", ownerId).eq("file_id", fileId);
-    if (del.error) throw del.error;
+  console.info("[trainer/upload] rebuildDocChunksForFile enter", {
+    fileId,
+    ownerId,
+    folderId,
+    pageCount: pages.length,
+    timeoutMs: DOC_CHUNKS_DB_TIMEOUT_MS,
+  });
+
+  try {
+    console.info("[trainer/upload] rebuildDocChunksForFile before_delete", {
+      fileId,
+      ownerId,
+    });
+    const del: any = await withOperationTimeout("doc_chunks delete", DOC_CHUNKS_DB_TIMEOUT_MS, () =>
+      admin.from("doc_chunks").delete().eq("owner_id", ownerId).eq("file_id", fileId),
+    );
+    if (del.error) {
+      console.error("[trainer/upload] rebuildDocChunksForFile delete error", {
+        fileId,
+        ownerId,
+        error: errInfo(del.error),
+      });
+      throw del.error;
+    }
+    console.info("[trainer/upload] rebuildDocChunksForFile after_delete", {
+      fileId,
+      ownerId,
+    });
+
+    const chunkCandidates = buildChunksFromExtractedPages(pages);
+    const rows = chunkCandidates
+      .map((chunk) => ({
+        owner_id: ownerId,
+        file_id: fileId,
+        folder_id: folderId,
+        content: chunk.content || "",
+        source: originalName,
+        source_type: "user_upload",
+        allow_in_answer: true,
+        page_from: chunk.pageNumber,
+        page_to: chunk.pageNumber,
+        source_page: chunk.pageNumber,
+        extraction_method: chunk.extractionMethod,
+        extraction_quality: chunk.extractionQuality,
+      }))
+      .filter((row) => row.content.trim().length > 0);
+    rowCount = rows.length;
+
+    console.info("[trainer/upload] rebuildDocChunksForFile rows_built", {
+      fileId,
+      ownerId,
+      pageCount: pages.length,
+      chunkCandidateCount: chunkCandidates.length,
+      rowCount,
+    });
+
+    if (!rows.length) throw new Error("Ingen chunks dannet fra PDF.");
+
+    console.info("[trainer/upload] rebuildDocChunksForFile before_insert", {
+      fileId,
+      ownerId,
+      rowCount,
+    });
+    const ins: any = await withOperationTimeout("doc_chunks insert", DOC_CHUNKS_DB_TIMEOUT_MS, () =>
+      admin.from("doc_chunks").insert(rows),
+    );
+    if (ins.error) {
+      console.error("[trainer/upload] rebuildDocChunksForFile insert error", {
+        fileId,
+        ownerId,
+        rowCount,
+        error: errInfo(ins.error),
+      });
+      throw ins.error;
+    }
+    console.info("[trainer/upload] rebuildDocChunksForFile after_insert", {
+      fileId,
+      ownerId,
+      rowCount,
+    });
+    console.info("[trainer/upload] rebuildDocChunksForFile exit", {
+      fileId,
+      ownerId,
+      rowCount,
+    });
+    return { chunkCount: rows.length };
+  } catch (error) {
+    console.error("[trainer/upload] rebuildDocChunksForFile failed", {
+      fileId,
+      ownerId,
+      folderId,
+      pageCount: pages.length,
+      rowCount,
+      error: errInfo(error),
+    });
+    throw error;
   }
-
-  const rows = buildChunksFromExtractedPages(pages)
-    .map((chunk) => ({
-    owner_id: ownerId,
-    file_id: fileId,
-    folder_id: folderId,
-    content: chunk.content || "",
-    source: originalName,
-    source_type: "user_upload",
-    allow_in_answer: true,
-    page_from: chunk.pageNumber,
-    page_to: chunk.pageNumber,
-    source_page: chunk.pageNumber,
-    extraction_method: chunk.extractionMethod,
-    extraction_quality: chunk.extractionQuality,
-  }))
-    .filter((row) => row.content.trim().length > 0);
-
-  if (!rows.length) throw new Error("Ingen chunks dannet fra PDF.");
-
-  const ins = await admin.from("doc_chunks").insert(rows);
-  if (ins.error) throw ins.error;
-  return { chunkCount: rows.length };
 }
 
 async function syncOcrTextsForFile(
@@ -1011,6 +1104,14 @@ async function processAcceptedPdfUpload(args: {
         stage: "chunk_build_started",
       }),
     });
+    console.info("[trainer/upload] rebuildDocChunksForFile call", {
+      requestId,
+      jobId,
+      fileId,
+      ownerId,
+      folderId,
+      pageCount: extraction.pages.length,
+    });
     const chunkBuild = await rebuildDocChunksForFile(admin, {
       ownerId,
       fileId,
@@ -1172,11 +1273,10 @@ async function processAcceptedPdfUpload(args: {
         upload_kind: "pdf",
       },
     });
-  } catch (e: any) {
-    await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
-    await safeUpdateJob(admin, jobId, {
-      status: "failed",
-      file_id: fileId,
+	  } catch (e: any) {
+	    await safeUpdateJob(admin, jobId, {
+	      status: "failed",
+	      file_id: fileId,
       finished_at: new Date().toISOString(),
       error: { message: e?.message ?? "PDF-behandling fejlede." },
       payload: buildJobTrackingPayload({
@@ -1192,9 +1292,9 @@ async function processAcceptedPdfUpload(args: {
         pageCount: effectivePages,
         stage: "failed",
       }),
-      meta: buildJobTrackingPayload({
-        requestId,
-        folderId,
+	      meta: buildJobTrackingPayload({
+	        requestId,
+	        folderId,
         fileName: originalName,
         mimeType,
         uploadKind: "pdf",
@@ -1203,11 +1303,20 @@ async function processAcceptedPdfUpload(args: {
         fileId,
         storagePath,
         pageCount: effectivePages,
-        stage: "failed",
-      }),
-    });
-    console.error("[trainer/upload] accepted pdf processing error:", errInfo(e));
-  }
+	        stage: "failed",
+	      }),
+	    });
+	    try {
+	      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+	    } catch (purgeError) {
+	      console.warn("[trainer/upload] purge after accepted pdf failure warning:", {
+	        fileId,
+	        ownerId,
+	        error: errInfo(purgeError),
+	      });
+	    }
+	    console.error("[trainer/upload] accepted pdf processing error:", errInfo(e));
+	  }
 }
 
 async function ensureTrainerImportJob(args: {
@@ -2483,11 +2592,21 @@ export async function POST(req: NextRequest) {
 
     // ✅ lav chunks nu (så du ikke ender i 0-chunks igen)
     let chunkCount = 0;
-    try {
-      logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind });
-      const r =
-        processingUploadKind === "pdf"
-          ? await rebuildDocChunksForFile(admin, {
+	    try {
+	      logUploadStage(requestId, "chunk_build_started", { jobId, fileId, uploadKind });
+	      if (processingUploadKind === "pdf") {
+	        console.info("[trainer/upload] rebuildDocChunksForFile call", {
+	          requestId,
+	          jobId,
+	          fileId,
+	          ownerId,
+	          folderId,
+	          pageCount: extraction!.pages.length,
+	        });
+	      }
+	      const r =
+	        processingUploadKind === "pdf"
+	          ? await rebuildDocChunksForFile(admin, {
               ownerId,
               fileId,
               folderId,
@@ -2501,13 +2620,36 @@ export async function POST(req: NextRequest) {
               originalName,
               transcriptText,
             });
-      chunkCount = r.chunkCount;
-      logUploadStage(requestId, "chunk_build_finished", { jobId, fileId, chunkCount });
-    } catch (e) {
-      console.error("[trainer/upload] rebuildDocChunks error:", errInfo(e));
-      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
-      return NextResponse.json(
-        { ok: false, code: "CHUNK_BUILD_FAILED", error: "Kunne ikke bygge tekstgrundlag for filen.", requestId, fileId },
+	      chunkCount = r.chunkCount;
+	      logUploadStage(requestId, "chunk_build_finished", { jobId, fileId, chunkCount });
+	    } catch (e) {
+	      console.error("[trainer/upload] rebuildDocChunks error:", errInfo(e));
+	      await safeUpdateJob(admin, jobId, {
+	        status: "failed",
+	        file_id: fileId,
+	        finished_at: new Date().toISOString(),
+	        error: { message: (e as any)?.message ?? "Kunne ikke bygge tekstgrundlag for filen." },
+	        payload: {
+	          source: "trainer_upload",
+	          request_id: requestId,
+	          folder_id: folderId,
+	          file_name: originalName,
+	          mime_type: mimeType,
+	          upload_kind: processingUploadKind,
+	          size_bytes: typeof (file as any).size === "number" ? Number((file as any).size) : null,
+	          md5,
+	          file_id: fileId,
+	          storage_path: storagePath,
+	          page_count: processingUploadKind === "pdf" ? extraction!.pageCount : 1,
+	          ocr_pages: processingUploadKind === "pdf" ? extraction!.ocrPages : 0,
+	          extraction_method: processingUploadKind === "pdf" ? extraction!.extractionMethod : "text",
+	          extraction_quality: processingUploadKind === "pdf" ? extraction!.extractionQuality : "high",
+	          stage: "failed",
+	        },
+	      });
+	      await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
+	      return NextResponse.json(
+	        { ok: false, code: "CHUNK_BUILD_FAILED", error: "Kunne ikke bygge tekstgrundlag for filen.", requestId, fileId },
         { status: 500 },
       );
     }

@@ -109,7 +109,10 @@ type PdfPageSource = {
 
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
-const OCR_TIMEOUT_MS = 45_000;
+const OCR_TIMEOUT_MS = (() => {
+  const value = Number(process.env.OPENAI_OCR_TIMEOUT_MS ?? 10_000);
+  return Number.isFinite(value) && value > 0 ? value : 10_000;
+})();
 const require = createRequire(import.meta.url);
 
 function normalizePageText(input: string) {
@@ -512,39 +515,67 @@ async function runOpenAIOcrForPage(args: {
 }): Promise<string> {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: OCR_TIMEOUT_MS });
   const base64 = args.pagePdfBuffer.toString("base64");
+  const abortController = new AbortController();
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
   console.info("[pdf/extract] OCR request started", {
     fileName: args.fileName,
     pageNumber: args.pageNumber,
     timeoutMs: OCR_TIMEOUT_MS,
   });
-  const response: any = await (openai as any).responses.create({
-    model: OCR_MODEL,
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_file",
-            filename: `${args.fileName.replace(/\.pdf$/i, "")}-page-${args.pageNumber}.pdf`,
-            file_data: `data:application/pdf;base64,${base64}`,
-          },
-          {
-            type: "input_text",
-            text:
-              "Transcribe all readable text from this single PDF page. Return only plain text. " +
-              "Keep line breaks when helpful. If no useful text is readable, return an empty string.",
-          },
-        ],
-      },
-    ],
-  });
-  console.info("[pdf/extract] OCR request finished", {
-    fileName: args.fileName,
-    pageNumber: args.pageNumber,
-  });
+  try {
+    const response: any = await Promise.race([
+      (openai as any).responses.create(
+        {
+          model: OCR_MODEL,
+          input: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_file",
+                  filename: `${args.fileName.replace(/\.pdf$/i, "")}-page-${args.pageNumber}.pdf`,
+                  file_data: `data:application/pdf;base64,${base64}`,
+                },
+                {
+                  type: "input_text",
+                  text:
+                    "Transcribe all readable text from this single PDF page. Return only plain text. " +
+                    "Keep line breaks when helpful. If no useful text is readable, return an empty string.",
+                },
+              ],
+            },
+          ],
+        },
+        { signal: abortController.signal },
+      ),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          abortController.abort();
+          const error: any = new Error(`OCR request timed out after ${OCR_TIMEOUT_MS}ms`);
+          error.code = "OCR_REQUEST_TIMEOUT";
+          error.fileName = args.fileName;
+          error.pageNumber = args.pageNumber;
+          error.timeoutMs = OCR_TIMEOUT_MS;
+          console.warn("[pdf/extract] OCR request timed out", {
+            fileName: args.fileName,
+            pageNumber: args.pageNumber,
+            timeoutMs: OCR_TIMEOUT_MS,
+          });
+          reject(error);
+        }, OCR_TIMEOUT_MS);
+      }),
+    ]);
 
-  return normalizePageText(getResponseText(response));
+    console.info("[pdf/extract] OCR request finished", {
+      fileName: args.fileName,
+      pageNumber: args.pageNumber,
+    });
+
+    return normalizePageText(getResponseText(response));
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 function summarizeDocumentMeta(pages: ExtractedPdfPage[]) {
