@@ -22,7 +22,7 @@ type FileRow = {
 
 type FileReadiness = {
   id: string;
-  readiness: "ready" | "processing" | "failed";
+  readiness: "ready" | "processing" | "background" | "failed";
   readinessLabel: string;
   readinessDetail: string | null;
   ready: boolean;
@@ -31,7 +31,7 @@ type FileReadiness = {
   jobStage: string | null;
 };
 
-type UserFileStatusKind = "uploaded" | "preparing" | "ready" | "failed";
+type UserFileStatusKind = "uploaded" | "preparing" | "enhancing" | "ready" | "failed";
 
 type LocalFileStatus = {
   fileId: string;
@@ -117,9 +117,11 @@ const PDF_UPLOAD_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 const ACTIVE_UPLOAD_REFRESH_MS = 15_000;
 const UPLOAD_READY_FOLLOWUP_REFRESH_MS = 1_500;
 const PREPARING_STATUS_TOKENS = new Set([
+  "started",
   "preparing",
   "processing",
   "queued",
+  "first_processing",
   "ocr_started",
   "ocr_finished",
   "processing_started",
@@ -131,7 +133,8 @@ const PREPARING_STATUS_TOKENS = new Set([
   "file_buffered",
   "storage_upload_finished",
 ]);
-const READY_STATUS_TOKENS = new Set(["ready", "succeeded", "finished", "completed"]);
+const READY_STATUS_TOKENS = new Set(["ready", "succeeded", "finished", "completed", "first_ready"]);
+const BACKGROUND_STATUS_TOKENS = new Set(["deep_processing"]);
 
 function createClientRequestId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -280,6 +283,9 @@ function buildUserFileStatus(kind: UserFileStatusKind, error?: string | null): U
   if (kind === "preparing") {
     return { kind, label: "Klargøres", detail: null };
   }
+  if (kind === "enhancing") {
+    return { kind, label: "Forbedres", detail: error ?? "Materialet er klar og forbedres i baggrunden" };
+  }
   if (kind === "ready") {
     return { kind, label: "Klar", detail: null };
   }
@@ -290,11 +296,14 @@ function statusPriority(kind: UserFileStatusKind) {
   if (kind === "uploaded") return 1;
   if (kind === "preparing") return 2;
   if (kind === "ready") return 3;
+  if (kind === "enhancing") return 4;
   return 0;
 }
 
 function mergeLocalFileStatus(current: LocalFileStatus | null, next: LocalFileStatus) {
   if (!current) return next;
+  if (next.status === "enhancing") return { ...current, ...next };
+  if (current.status === "enhancing" && next.status !== "failed") return current;
   if (next.status === "ready") return { ...current, ...next };
   if (current.status === "ready") return current;
   if (next.status === "failed") return { ...current, ...next };
@@ -317,8 +326,16 @@ function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStat
   const jobStatus = normalizeStatusToken(readiness.jobStatus);
   const jobStage = normalizeStatusToken(readiness.jobStage);
 
-  if (readiness.readiness === "failed" || jobStatus === "failed" || jobStage === "failed") {
+  if (readiness.readiness === "failed") {
     return buildUserFileStatus("failed", readiness.readinessDetail);
+  }
+
+  if (
+    readiness.readiness === "background" ||
+    BACKGROUND_STATUS_TOKENS.has(jobStatus) ||
+    BACKGROUND_STATUS_TOKENS.has(jobStage)
+  ) {
+    return buildUserFileStatus("enhancing", readiness.readinessDetail);
   }
 
   if (
@@ -328,6 +345,10 @@ function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStat
     READY_STATUS_TOKENS.has(jobStage)
   ) {
     return buildUserFileStatus("ready");
+  }
+
+  if (jobStatus === "failed" || jobStage === "failed") {
+    return buildUserFileStatus("failed", readiness.readinessDetail);
   }
 
   if (
@@ -344,6 +365,9 @@ function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStat
 function pickDisplayStatus(localStatus: UserFileStatus | null, serverStatus: UserFileStatus | null) {
   if (!localStatus) return serverStatus;
   if (!serverStatus) return localStatus;
+  if (serverStatus.kind === "enhancing" || localStatus.kind === "enhancing") {
+    return serverStatus.kind === "enhancing" ? serverStatus : localStatus;
+  }
   if (serverStatus.kind === "ready" || localStatus.kind === "ready") {
     return serverStatus.kind === "ready" ? serverStatus : localStatus;
   }
@@ -444,6 +468,9 @@ function describeProcessingStage(activeUpload: ActiveUpload | null) {
   const status = normalizeStatusToken(activeUpload.status);
   const stage = normalizeStatusToken(activeUpload.stage);
   if (status === "failed" || stage === "failed") return null;
+  if (BACKGROUND_STATUS_TOKENS.has(status) || BACKGROUND_STATUS_TOKENS.has(stage)) {
+    return "Status: Materialet er klar og forbedres i baggrunden";
+  }
   if (READY_STATUS_TOKENS.has(status) || READY_STATUS_TOKENS.has(stage)) return null;
   return "Status: Klargøres";
 }
@@ -1012,6 +1039,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   function readinessTone(status: UserFileStatus | null) {
     if (!status) return "border-transparent bg-transparent text-transparent";
     if (status.kind === "failed") return "border-red-200 bg-red-50 text-red-700";
+    if (status.kind === "enhancing") return "border-sky-200 bg-sky-50 text-sky-700";
     if (status.kind === "ready") return "border-emerald-200 bg-emerald-50 text-emerald-700";
     return "border-zinc-200 bg-zinc-50 text-zinc-700";
   }
@@ -1022,7 +1050,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   }
 
   function fileListStatusDetail(status: UserFileStatus | null) {
-    return status?.kind === "failed" ? status.detail : null;
+    return status?.kind === "failed" || status?.kind === "enhancing" ? status.detail : null;
   }
 
   useEffect(() => {
@@ -1111,7 +1139,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         const text = await res.text();
         const json = (safeJson(text) ?? {}) as ImportStatusPayload;
         const activeJob = json?.activeJob ?? null;
-        nextDelayMs = getUploadPollDelayMs(elapsedMs);
 
         console.info("[UploadClient] polling tick", {
           requestId: activeUpload.requestId,
@@ -1137,9 +1164,42 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         }
 
         const normalizedJobStatus = String(activeJob?.status ?? "").toLowerCase();
+        const normalizedJobStage = String(activeJob?.stage ?? "").toLowerCase();
+        nextDelayMs = getUploadPollDelayMs(elapsedMs);
+
+        if (
+          activeUpload.fileId &&
+          (READY_STATUS_TOKENS.has(normalizedJobStatus) ||
+            READY_STATUS_TOKENS.has(normalizedJobStage) ||
+            BACKGROUND_STATUS_TOKENS.has(normalizedJobStatus) ||
+            BACKGROUND_STATUS_TOKENS.has(normalizedJobStage))
+        ) {
+          if (!cancelled) {
+            const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
+            upsertLocalFileStatus({
+              fileId: activeUpload.fileId,
+              fileName: matchedFile?.name ?? activeUpload.fileName,
+              folderId: activeUpload.folderId,
+              sizeBytes: matchedFile?.sizeBytes ?? null,
+              uploadedAt: matchedFile?.uploadedAt ?? null,
+              status: "ready",
+              error: null,
+              updatedAt: Date.now(),
+            });
+            void refreshCompletedUploadFiles(activeUpload, "job-first-ready");
+            setUploadNotice("Materialet er klar nu.");
+            setActiveUpload(null);
+            setUploading(false);
+            dispatchQuotaChanged();
+          }
+          return;
+        }
+
         const shouldForceRefresh =
           !!activeUpload.responseSettled &&
-          (!activeJob || ["finished", "completed", "succeeded"].includes(normalizedJobStatus));
+          (!activeJob ||
+            READY_STATUS_TOKENS.has(normalizedJobStatus) ||
+            READY_STATUS_TOKENS.has(normalizedJobStage));
         const refreshedSnapshot = await refreshActiveUploadFiles(
           activeUpload,
           !activeJob ? "active-job-missing" : shouldForceRefresh ? "job-finished" : "processing-reconcile",
@@ -1189,7 +1249,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           return;
         }
 
-        if (["finished", "completed", "succeeded"].includes(normalizedJobStatus)) {
+        if (READY_STATUS_TOKENS.has(normalizedJobStatus) || READY_STATUS_TOKENS.has(normalizedJobStage)) {
           if (!cancelled) {
             if (activeUpload.fileId) {
               const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);

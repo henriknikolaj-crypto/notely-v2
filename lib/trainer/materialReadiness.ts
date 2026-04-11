@@ -16,7 +16,7 @@ export type NormalizedImportJob = {
   updatedAt: string | null;
 };
 
-export type MaterialReadinessState = "ready" | "processing" | "failed";
+export type MaterialReadinessState = "ready" | "processing" | "background" | "failed";
 
 export type MaterialReadiness = {
   ready: boolean;
@@ -43,6 +43,14 @@ function parseTimeMs(value: string | null | undefined) {
 
 function normalizeStatus(status: string | null | undefined) {
   return String(status ?? "").trim().toLowerCase();
+}
+
+function isFirstReadyStage(stage: string | null | undefined) {
+  return normalizeStatus(stage) === "first_ready";
+}
+
+function isDeepProcessingStage(stage: string | null | undefined) {
+  return normalizeStatus(stage) === "deep_processing";
 }
 
 export function isImportJobFinishedStatus(status: string | null | undefined) {
@@ -142,12 +150,25 @@ export function resolveMaterialReadiness(args: {
   const jobStatus = latestJob?.status ?? null;
   const jobStage = latestJob?.stage ?? null;
 
-  if (chunkCount > 0 || isImportJobFinishedStatus(jobStatus)) {
+  if ((chunkCount > 0 || isFirstReadyStage(jobStage)) && isDeepProcessingStage(jobStage)) {
+    return {
+      ready: true,
+      state: "background",
+      label: "Forbedres",
+      detail: "Materialet er klar og forbedres i baggrunden",
+      chunkCount,
+      jobStatus,
+      jobStage,
+      jobId: latestJob?.id ?? null,
+    };
+  }
+
+  if (chunkCount > 0 || isImportJobFinishedStatus(jobStatus) || isFirstReadyStage(jobStage)) {
     return {
       ready: true,
       state: "ready",
       label: "Klar",
-      detail: chunkCount > 0 ? "Materialet er klar" : "Behandling afsluttet",
+      detail: chunkCount > 0 || isFirstReadyStage(jobStage) ? "Materialet er klar" : "Behandling afsluttet",
       chunkCount,
       jobStatus,
       jobStage,

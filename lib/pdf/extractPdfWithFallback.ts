@@ -91,6 +91,7 @@ type ExtractOpts = {
   fileName?: string;
   fileSizeBytes?: number;
   maxPages?: number;
+  allowOcr?: boolean;
   onProgress?: (event: PdfExtractionProgress) => void | Promise<void>;
 };
 
@@ -773,6 +774,7 @@ export async function extractPdfWithFallback(
   opts: ExtractOpts = {},
 ): Promise<ExtractedPdfDocument> {
   const maxPages = Math.max(1, Math.min(opts.maxPages ?? 500, 2000));
+  const allowOcr = opts.allowOcr !== false;
   const fileName = (opts.fileName ?? "document.pdf").trim() || "document.pdf";
   const fileSizeBytes = Math.max(0, Number(opts.fileSizeBytes ?? buf.length) || 0);
   const raw = await extractPdfPagesViaPdfjs(buf, maxPages);
@@ -868,7 +870,7 @@ export async function extractPdfWithFallback(
     diagnostics.failureReason = "scan_heavy_pdf_rejected";
   }
 
-  if (raw.pageCount > 0 && !diagnostics.failureReason && canRunOcr() && ocrCandidatePages > 0) {
+  if (raw.pageCount > 0 && !diagnostics.failureReason && allowOcr && canRunOcr() && ocrCandidatePages > 0) {
     await opts.onProgress?.({
       stage: "ocr_started",
       totalPages: raw.pageCount,

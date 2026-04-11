@@ -229,7 +229,7 @@ export async function GET(req: NextRequest) {
     | Array<{
         id: string;
         name: string;
-        readiness: "ready" | "processing" | "failed";
+        readiness: "ready" | "processing" | "background" | "failed";
         readinessLabel: string;
         readinessDetail: string | null;
         ready: boolean;
@@ -242,6 +242,7 @@ export async function GET(req: NextRequest) {
     | {
         ready: number;
         processing: number;
+        background: number;
         failed: number;
       }
     | null = null;
@@ -438,11 +439,11 @@ export async function GET(req: NextRequest) {
             acc[file.readiness] += 1;
             return acc;
           },
-          { ready: 0, processing: 0, failed: 0 },
+          { ready: 0, processing: 0, background: 0, failed: 0 },
         );
       } else {
         folderFiles = [];
-        folderReadinessSummary = { ready: 0, processing: 0, failed: 0 };
+        folderReadinessSummary = { ready: 0, processing: 0, background: 0, failed: 0 };
       }
     } catch (folderReadinessError) {
       console.warn("[import-status] folder readiness warning", {
