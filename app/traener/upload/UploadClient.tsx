@@ -79,6 +79,10 @@ type ImportStatusPayload = {
     status?: string | null;
     stage?: string | null;
     error?: string | null;
+    requestId?: string | null;
+    fileId?: string | null;
+    folderId?: string | null;
+    uploadKind?: string | null;
   } | null;
   folderFiles?: FileReadiness[] | null;
 };
@@ -439,8 +443,8 @@ function describeProcessingStage(activeUpload: ActiveUpload | null) {
 
   const status = normalizeStatusToken(activeUpload.status);
   const stage = normalizeStatusToken(activeUpload.stage);
-  if (status === "failed" || stage === "failed") return "Status: Fejl";
-  if (READY_STATUS_TOKENS.has(status) || READY_STATUS_TOKENS.has(stage)) return "Status: Klar";
+  if (status === "failed" || stage === "failed") return null;
+  if (READY_STATUS_TOKENS.has(status) || READY_STATUS_TOKENS.has(stage)) return null;
   return "Status: Klargøres";
 }
 
@@ -448,6 +452,23 @@ function getUploadPollDelayMs(elapsedMs: number) {
   if (elapsedMs < 15_000) return UPLOAD_STATUS_POLL_INITIAL_MS;
   if (elapsedMs < 60_000) return UPLOAD_STATUS_POLL_MS;
   return UPLOAD_STATUS_POLL_SLOW_MS;
+}
+
+function mergeActiveUploadState(current: ActiveUpload | null, patch: Partial<ActiveUpload>) {
+  if (!current) return current;
+  return {
+    ...current,
+    requestId: patch.requestId ?? current.requestId,
+    startedAt: patch.startedAt ?? current.startedAt,
+    fileName: patch.fileName ?? current.fileName,
+    folderId: patch.folderId ?? current.folderId,
+    jobId: patch.jobId ?? current.jobId,
+    fileId: patch.fileId ?? current.fileId,
+    responseSettled: patch.responseSettled ?? current.responseSettled,
+    kind: patch.kind ?? current.kind,
+    status: patch.status ?? current.status,
+    stage: patch.stage ?? current.stage,
+  };
 }
 
 export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId, onFoldersChange }: Props) {
@@ -494,10 +515,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const uploadAbortReasonRef = useRef<string | null>(null);
   const lastActiveUploadRefreshRef = useRef(0);
   const uploadReadyRefreshTimeoutRef = useRef<number | null>(null);
+  const loadFoldersRequestRef = useRef(0);
+  const loadFilesRequestRef = useRef(0);
 
   // delete
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteErrorsById, setDeleteErrorsById] = useState<Record<string, string>>({});
 
   // move
   const [movingId, setMovingId] = useState<string | null>(null);
@@ -530,6 +553,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
   const folderOptions = useMemo(() => folders, [folders]);
 
+  const clearPickedFileSelection = useCallback((targetFileName?: string | null) => {
+    if (targetFileName && pickedFile && pickedFile.name !== targetFileName) return;
+    setPickedFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, [pickedFile]);
+
   useEffect(() => {
     const nextFolders = Array.isArray(initialFolders) ? initialFolders : [];
     setFolders(nextFolders);
@@ -554,7 +583,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     });
   }, [initialFolders, initialFolderId]);
 
+  useEffect(() => {
+    setDeleteErrorsById({});
+  }, [listFolderId]);
+
   const loadFolders = useCallback(async () => {
+    const requestSeq = ++loadFoldersRequestRef.current;
     setFoldersLoading(true);
     setFoldersError(null);
 
@@ -569,26 +603,20 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const json = safeJson(text);
 
       if (res.status === 401) {
-        setFolders([]);
+        if (requestSeq !== loadFoldersRequestRef.current) return;
         setFoldersError("Mapper opdateres lige nu.");
-        setUploadFolderId(null);
-        setListFolderId(null);
         return;
       }
 
       if (!res.ok) {
-        setFolders([]);
+        if (requestSeq !== loadFoldersRequestRef.current) return;
         setFoldersError("Mapper opdateres lige nu.");
-        setUploadFolderId(null);
-        setListFolderId(null);
         return;
       }
 
       if (!json || json.ok === false) {
-        setFolders([]);
+        if (requestSeq !== loadFoldersRequestRef.current) return;
         setFoldersError("Mapper opdateres lige nu.");
-        setUploadFolderId(null);
-        setListFolderId(null);
         return;
       }
 
@@ -601,6 +629,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             : [];
 
       const normalized = raw.map(normalizeFolderRow).filter(Boolean) as Folder[];
+      if (requestSeq !== loadFoldersRequestRef.current) return;
       setFolders(normalized);
       onFoldersChange?.(normalized);
 
@@ -627,19 +656,22 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       }
     } catch (e) {
       console.error("[UploadClient] loadFolders error", e);
-      setFolders([]);
-      setUploadFolderId(null);
-      setListFolderId(null);
+      if (requestSeq !== loadFoldersRequestRef.current) return;
       setFoldersError("Mapper opdateres lige nu.");
     } finally {
-      setFoldersLoading(false);
+      if (requestSeq === loadFoldersRequestRef.current) {
+        setFoldersLoading(false);
+      }
     }
   }, [initialFolderId, onFoldersChange]);
 
   const loadFiles = useCallback(async (folderId: string | null) => {
+    const requestSeq = ++loadFilesRequestRef.current;
     if (!folderId) {
       setFiles([]);
       setFileReadinessById({});
+      setFilesLoading(false);
+      setFilesError(null);
       return { files: [] as FileRow[], readinessById: {} as Record<string, FileReadiness> };
     }
 
@@ -662,19 +694,19 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const readinessJson = (safeJson(readinessText) ?? {}) as ImportStatusPayload;
 
       if (res.status === 401) {
-        setFiles([]);
+        if (requestSeq !== loadFilesRequestRef.current) return null;
         setFilesError("Filer opdateres lige nu.");
         return null;
       }
 
       if (!res.ok) {
-        setFiles([]);
+        if (requestSeq !== loadFilesRequestRef.current) return null;
         setFilesError("Filer opdateres lige nu.");
         return null;
       }
 
       if (!json || json.ok === false) {
-        setFiles([]);
+        if (requestSeq !== loadFilesRequestRef.current) return null;
         setFilesError("Filer opdateres lige nu.");
         return null;
       }
@@ -682,21 +714,25 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const raw = Array.isArray(json.files) ? json.files : Array.isArray(json.items) ? json.items : [];
       const normalized = raw.map(normalizeFileRow).filter(Boolean) as FileRow[];
       const visibleRows = omitSuppressedFiles(normalized, suppressedFileIdsRef.current);
-      setFiles(visibleRows);
       const readinessRows = Array.isArray(readinessJson.folderFiles) ? readinessJson.folderFiles : [];
       const readinessById = buildReadinessMap(
         readinessRows.filter((row) => row?.id && !suppressedFileIdsRef.current[String(row.id)]),
       );
+      if (requestSeq !== loadFilesRequestRef.current) {
+        return { files: visibleRows, readinessById };
+      }
+      setFiles(visibleRows);
       setFileReadinessById(readinessById);
       return { files: visibleRows, readinessById };
     } catch (e) {
       console.error("[UploadClient] loadFiles error", e);
-      setFiles([]);
-      setFileReadinessById({});
+      if (requestSeq !== loadFilesRequestRef.current) return null;
       setFilesError("Filer opdateres lige nu.");
       return null;
     } finally {
-      setFilesLoading(false);
+      if (requestSeq === loadFilesRequestRef.current) {
+        setFilesLoading(false);
+      }
     }
   }, []);
 
@@ -720,6 +756,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setUploadError(null);
     setUploadNotice(null);
     setUploadResult(null);
+    setDeleteErrorsById({});
 
     if (f && isPdfFile(f) && typeof f.size === "number" && f.size > MAX_FILE_BYTES) {
       setPickedFile(null);
@@ -788,6 +825,21 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     });
   }, []);
 
+  const setRowDeleteError = useCallback((fileId: string | null | undefined, message: string) => {
+    if (!fileId) return;
+    setDeleteErrorsById((prev) => ({ ...prev, [fileId]: message }));
+  }, []);
+
+  const clearRowDeleteError = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return;
+    setDeleteErrorsById((prev) => {
+      if (!(fileId in prev)) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  }, []);
+
   const removeFileReadiness = useCallback((fileId: string | null | undefined) => {
     if (!fileId) return;
     setFileReadinessById((prev) => {
@@ -823,6 +875,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     if (!fileId) return false;
     return !!suppressedFileIdsRef.current[fileId];
   }, []);
+
+  const isPersistedFileRow = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return false;
+    return files.some((file) => file.id === fileId);
+  }, [files]);
 
   const resolveFileStatus = useCallback(
     (file: FileRow) => {
@@ -997,7 +1054,10 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       }
       uploadAbortReasonRef.current = message;
       uploadAbortRef.current?.abort(reason);
-      setUploadError(message);
+      clearPickedFileSelection(activeUpload.fileName);
+      if (!activeUpload.fileId) {
+        setUploadError(message);
+      }
       setUploading(false);
       setActiveUpload(null);
       console.warn("[UploadClient] polling stopped with error", {
@@ -1011,12 +1071,20 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const elapsedMs = Date.now() - activeUpload.startedAt;
       const timeoutMs = activeUpload.kind === "pdf" ? PDF_UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS;
       if (elapsedMs > timeoutMs) {
-        stopWithError(
-          activeUpload.kind === "pdf"
-            ? "Uploaden tager længere tid end forventet. PDF’en behandles muligvis stadig. Prøv at opdatere listen om lidt."
-            : "Uploaden tog for lang tid og blev afbrudt. Prøv igen.",
-          "upload-timeout",
-        );
+        if (!cancelled) {
+          setUploadNotice(
+            activeUpload.kind === "pdf"
+              ? "Uploaden tager længere tid end forventet. Materialet kan stadig være på vej."
+              : "Uploaden tog længere tid end forventet. Prøv at opdatere om lidt.",
+          );
+          setUploading(false);
+          setActiveUpload(null);
+          console.warn("[UploadClient] polling stopped after timeout", {
+            requestId: activeUpload.requestId,
+            elapsedMs,
+            timeoutMs,
+          });
+        }
         return;
       }
 
@@ -1057,12 +1125,13 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (activeJob?.id) {
           setActiveUpload((prev) =>
             prev && prev.requestId === activeUpload.requestId
-              ? {
-                  ...prev,
-                  jobId: activeJob.id ? String(activeJob.id) : null,
-                  status: activeJob.status ? String(activeJob.status) : null,
-                  stage: activeJob.stage ? String(activeJob.stage) : null,
-                }
+              ? mergeActiveUploadState(prev, {
+                  jobId: asString(activeJob.id),
+                  fileId: asString(activeJob.fileId),
+                  folderId: asString(activeJob.folderId) ?? prev.folderId,
+                  status: asString(activeJob.status),
+                  stage: asString(activeJob.stage),
+                })
               : prev,
           );
         }
@@ -1114,8 +1183,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
         if (normalizedJobStatus === "failed") {
           stopWithError(activeJob?.error ?? "Uploaden fejlede under behandlingen.", "job-failed");
-          void loadFiles(listFolderIdRef.current ?? uploadFolderId);
-          dispatchImportStatusRefresh();
+          if (listFolderIdRef.current === activeUpload.folderId) {
+            void loadFiles(activeUpload.folderId);
+          }
           return;
         }
 
@@ -1172,7 +1242,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     };
   }, [
     activeUpload,
-    dispatchImportStatusRefresh,
     dispatchQuotaChanged,
     isFileSuppressed,
     loadFiles,
@@ -1198,6 +1267,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setUploadError(null);
     setUploadNotice(null);
     setUploadResult(null);
+    setDeleteErrorsById({});
     uploadAbortReasonRef.current = null;
     dispatchUploadActivity(true);
 
@@ -1250,6 +1320,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         const initData = safeJson(initResponseText) ?? {};
 
         if (!initRes.ok) {
+          clearPickedFileSelection(pickedFile.name);
           setUploadError(
             resolveUploadErrorMessage(initRes.status, initData, pickedFile, {
               res: initRes,
@@ -1265,16 +1336,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         const initFileId = asString(initData?.fileId);
 
         if (!bucket || !storagePath || !uploadToken || !initFileId) {
+          clearPickedFileSelection(pickedFile.name);
           setUploadError("Kunne ikke starte storage-uploaden. Prøv igen.");
           return;
         }
 
         setActiveUpload((prev) =>
           prev && prev.requestId === clientRequestId
-            ? {
-                ...prev,
-                fileId: initFileId,
-              }
+            ? mergeActiveUploadState(prev, { fileId: initFileId })
             : prev,
         );
         pendingFileId = initFileId;
@@ -1286,6 +1355,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         });
 
         if (storageUpload.error) {
+          clearPickedFileSelection(pickedFile.name);
           setUploadError(storageUpload.error.message || "Kunne ikke sende filen direkte til storage.");
           return;
         }
@@ -1330,14 +1400,13 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       data = safeJson(responseText) ?? {};
       setActiveUpload((prev) =>
         prev && prev.requestId === clientRequestId
-          ? {
-              ...prev,
+          ? mergeActiveUploadState(prev, {
               responseSettled: true,
-              jobId: asString(data?.jobId) ?? prev.jobId,
-              fileId: asString(data?.fileId) ?? prev.fileId,
-              status: asString(data?.jobStatus) ?? prev.status,
-              stage: asString(data?.stage) ?? prev.stage,
-            }
+              jobId: asString(data?.jobId),
+              fileId: asString(data?.fileId),
+              status: asString(data?.jobStatus),
+              stage: asString(data?.stage),
+            })
           : prev,
       );
 
@@ -1358,6 +1427,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile.name);
         setQuotaBlocked(msg);
         dispatchQuotaChanged();
         return;
@@ -1371,6 +1441,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
         );
         removeLocalFileStatus(pendingFileId);
+        clearPickedFileSelection(pickedFile.name);
         setUploadNotice(msg);
         return;
       }
@@ -1389,6 +1460,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile.name);
         setUploadError(String(j?.error ?? "Login kræves."));
         return;
       }
@@ -1410,6 +1482,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile.name);
         setUploadError(message);
         return;
       }
@@ -1428,6 +1501,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile.name);
         setUploadNotice(String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."));
         return;
       }
@@ -1449,6 +1523,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile.name);
         setUploadError(message);
         return;
       }
@@ -1506,22 +1581,22 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       );
       dispatchQuotaChanged();
 
-      await loadFolders();
-      await loadFiles(listFolderIdRef.current ?? uploadFolderId);
+      if (listFolderIdRef.current === uploadFolderId) {
+        await loadFiles(uploadFolderId);
+      }
 
       if (!processingAccepted) {
         setActiveUpload(null);
       } else {
         setActiveUpload((prev) =>
           prev && prev.requestId === clientRequestId
-            ? {
-                ...prev,
+            ? mergeActiveUploadState(prev, {
                 responseSettled: true,
-                jobId: asString(data?.jobId) ?? prev.jobId,
-                fileId: asString(data?.fileId) ?? prev.fileId,
-                status: asString(data?.jobStatus) ?? prev.status ?? "queued",
-                stage: asString(data?.stage) ?? prev.stage ?? "queued",
-              }
+                jobId: asString(data?.jobId),
+                fileId: asString(data?.fileId),
+                status: asString(data?.jobStatus) ?? "queued",
+                stage: asString(data?.stage) ?? "queued",
+              })
             : prev,
         );
       }
@@ -1552,6 +1627,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           });
         }
         if (uploadAbortReasonRef.current) {
+          clearPickedFileSelection(pickedFile?.name ?? activeUpload?.fileName ?? null);
           setUploadError(reason);
         }
       } else {
@@ -1568,6 +1644,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             updatedAt: Date.now(),
           });
         }
+        clearPickedFileSelection(pickedFile?.name ?? activeUpload?.fileName ?? null);
         setUploadError("Upload fejlede. Prøv igen.");
       }
     } finally {
@@ -1641,17 +1718,24 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     if (!ok) return;
 
-    setDeleteError(null);
+    const isLocalOnlyRow = !isPersistedFileRow(fileId);
+    clearRowDeleteError(fileId);
     setDeletingId(fileId);
     suppressFile(fileId);
     setFiles((prev) => prev.filter((f) => f.id !== fileId));
     removeFileReadiness(fileId);
     removeLocalFileStatus(fileId);
+    clearPickedFileSelection(name);
 
     if (activeUpload?.fileId === fileId) {
       uploadAbortRef.current?.abort("delete-file");
       setActiveUpload(null);
       setUploading(false);
+    }
+
+    if (isLocalOnlyRow) {
+      setDeletingId(null);
+      return;
     }
 
     let res: Response | null = null;
@@ -1674,11 +1758,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       const j = res ? safeJson(await res.text()) : null;
       unsuppressFile(fileId);
       await loadFiles(currentList);
-      setDeleteError(String(j?.error ?? j?.message ?? "Kunne ikke slette filen. Prøv igen."));
+      setRowDeleteError(fileId, String(j?.error ?? j?.message ?? "Kunne ikke slette filen. Prøv igen."));
       setDeletingId(null);
       return;
     }
 
+    clearRowDeleteError(fileId);
     setDeletingId(null);
     dispatchImportStatusRefresh();
   }
@@ -1826,7 +1911,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
         {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
         {uploadNotice ? <LimitNotice className="mt-3">{uploadNotice}</LimitNotice> : null}
-        {uploadError ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
+        {uploadError && !activeUpload ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
         {processingStatusText ? <div className="mt-3 text-xs text-zinc-600">{processingStatusText}</div> : null}
         <div className="mt-4 flex items-center justify-between">
           <button
@@ -1877,8 +1962,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           </select>
         </div>
 
-        {filesError ? <div className="mt-3 text-xs text-zinc-600">{filesError}</div> : null}
-        {deleteError ? <div className="mt-3 text-xs text-red-600">{deleteError}</div> : null}
+        <div className="mt-3 min-h-[16px] text-xs text-zinc-600">{filesError ?? ""}</div>
         {moveError ? <div className="mt-3 text-xs text-red-600">{moveError}</div> : null}
         {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}
 
@@ -1893,6 +1977,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             const status = resolveFileStatus(f);
             const badgeLabel = fileListBadgeLabel(status);
             const statusDetail = fileListStatusDetail(status);
+            const rowDeleteError = deleteErrorsById[f.id] ?? null;
+            const isLocalOnlyRow = !isPersistedFileRow(f.id);
             const isTransientUpload = status?.kind === "uploaded" || status?.kind === "preparing";
 
             return (
@@ -1913,6 +1999,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                   {humanBytes(f.sizeBytes)} {f.uploadedAt ? `· ${fmtDa(f.uploadedAt)}` : ""}
                   {statusDetail ? ` · ${statusDetail}` : ""}
                 </div>
+                {rowDeleteError ? <div className="mt-1 text-[11px] text-red-600">{rowDeleteError}</div> : null}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1924,7 +2011,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                     if (!v) return;
                     void moveFile(f.id, v);
                   }}
-                  disabled={folderOptions.length === 0 || deletingId === f.id || movingId === f.id || isTransientUpload}
+                  disabled={
+                    folderOptions.length === 0 || deletingId === f.id || movingId === f.id || isTransientUpload || isLocalOnlyRow
+                  }
                   title="Flyt til anden mappe"
                 >
                   {folderOptions.map((fo) => (
