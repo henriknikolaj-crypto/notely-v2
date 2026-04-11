@@ -311,13 +311,61 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  if (folderId) {
+  let effectiveFolderId = folderId;
+  if (!effectiveFolderId && activeJob?.folderId && isUuidLike(activeJob.folderId)) {
+    try {
+      const folderRes = await admin
+        .from("folders")
+        .select("id")
+        .eq("owner_id", ownerId)
+        .eq("id", activeJob.folderId)
+        .maybeSingle();
+      if (!folderRes.error && folderRes.data?.id) {
+        effectiveFolderId = String(folderRes.data.id);
+      }
+    } catch (folderLookupError) {
+      console.warn("[import-status] active folder lookup warning", {
+        requestId,
+        ownerId,
+        activeJobId: activeJob?.id ?? null,
+        folderId: activeJob?.folderId ?? null,
+        error: String((folderLookupError as any)?.message ?? folderLookupError),
+      });
+    }
+  }
+
+  if (activeJob?.fileId && isUuidLike(activeJob.fileId)) {
+    try {
+      const activeFileRes = await admin
+        .from("files")
+        .select("id, name, folder_id, updated_at, uploaded_at, created_at")
+        .eq("owner_id", ownerId)
+        .eq("id", activeJob.fileId)
+        .maybeSingle();
+      if (!activeFileRes.error && activeFileRes.data) {
+        latest = activeFileRes.data;
+        if (!effectiveFolderId && activeFileRes.data.folder_id) {
+          effectiveFolderId = String(activeFileRes.data.folder_id);
+        }
+      }
+    } catch (activeFileLookupError) {
+      console.warn("[import-status] active file lookup warning", {
+        requestId,
+        ownerId,
+        activeJobId: activeJob?.id ?? null,
+        fileId: activeJob?.fileId ?? null,
+        error: String((activeFileLookupError as any)?.message ?? activeFileLookupError),
+      });
+    }
+  }
+
+  if (effectiveFolderId) {
     try {
       const folderFilesRes = await admin
         .from("files")
         .select("id,name,original_name")
         .eq("owner_id", ownerId)
-        .eq("folder_id", folderId)
+        .eq("folder_id", effectiveFolderId)
         .order("created_at", { ascending: false })
         .limit(80);
 
@@ -400,7 +448,7 @@ export async function GET(req: NextRequest) {
       console.warn("[import-status] folder readiness warning", {
         requestId,
         ownerId,
-        folderId,
+        folderId: effectiveFolderId,
         error: String((folderReadinessError as any)?.message ?? folderReadinessError),
       });
     }
@@ -410,7 +458,7 @@ export async function GET(req: NextRequest) {
     ok: true,
     requestId,
 
-    folderId,
+    folderId: effectiveFolderId,
     plan,
 
     usedThisMonth,
@@ -445,7 +493,7 @@ export async function GET(req: NextRequest) {
         ? {
             id: String(latest.id),
             name: String(latest.name ?? ""),
-            folder_id: latest.folder_id ? String(latest.folder_id) : null,
+            folder_id: latest.folder_id ? String(latest.folder_id) : effectiveFolderId,
             updated_at: latestUploadedAt,
           }
         : null,
