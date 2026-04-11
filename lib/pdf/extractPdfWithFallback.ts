@@ -140,6 +140,7 @@ type OcrDiagnostics = {
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
 const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
+const SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT = 3;
 const SCAN_HEAVY_PREFLIGHT_MIN_BYTES = 10 * 1024 * 1024;
 const OCR_TIMEOUT_MS = (() => {
   const value = Number(process.env.OPENAI_OCR_TIMEOUT_MS ?? 10_000);
@@ -529,6 +530,147 @@ function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[]; fi
   );
 }
 
+function pickRepresentativeOcrSamplePages(pages: ExtractedPdfPage[]) {
+  const previewPages = pages.slice(0, Math.min(SCAN_HEAVY_PREFLIGHT_PAGE_COUNT, pages.length));
+  const candidates = previewPages.filter(
+    (page) =>
+      page.extractionMeta.ocr_decision === "scan_like_candidate" ||
+      page.extractionMeta.ocr_decision === "hopeless_candidate",
+  );
+  if (candidates.length <= SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT) return candidates;
+
+  const selected: ExtractedPdfPage[] = [];
+  const seen = new Set<number>();
+  const indices = [0, Math.floor((candidates.length - 1) / 2), candidates.length - 1];
+  for (const index of indices) {
+    const page = candidates[index];
+    if (!page || seen.has(page.pageNumber)) continue;
+    selected.push(page);
+    seen.add(page.pageNumber);
+  }
+  return selected;
+}
+
+function applyOcrTextToPage(page: ExtractedPdfPage, ocrText: string) {
+  if (!ocrText) return { applied: false, readable: false };
+
+  const originalAnalysis = analyzeText(page.text);
+  const ocrStructured = structurePageText({
+    pageType: page.extractionMeta.page_type,
+    text: ocrText,
+  });
+  const ocrAnalysis = analyzeText(ocrStructured.text || ocrText);
+  const ocrLooksReadable =
+    ocrAnalysis.looksUsable ||
+    (ocrAnalysis.quality !== "low" && ocrAnalysis.wordCount >= 12 && ocrAnalysis.alphaNumRatio >= 0.45);
+  if (ocrAnalysis.score <= originalAnalysis.score && originalAnalysis.looksUsable) {
+    return { applied: false, readable: false };
+  }
+
+  page.text = ocrAnalysis.normalizedText;
+  page.extractionMethod = "ocr";
+  page.extractionQuality = ocrAnalysis.quality;
+  page.textCharCount = ocrAnalysis.charCount;
+  page.wordCount = ocrAnalysis.wordCount;
+  page.alphaNumRatio = ocrAnalysis.alphaNumRatio;
+  page.brokenTokenRatio = ocrAnalysis.brokenTokenRatio;
+  const ocrClassification = classifyPage({
+    text: ocrAnalysis.normalizedText,
+    extractionMethod: "ocr",
+    quality: ocrAnalysis.quality,
+    charCount: ocrAnalysis.charCount,
+    wordCount: ocrAnalysis.wordCount,
+    alphaNumRatio: ocrAnalysis.alphaNumRatio,
+    brokenTokenRatio: ocrAnalysis.brokenTokenRatio,
+  });
+  page.extractionMeta = {
+    ...ocrClassification,
+    ocr_decision: classifyOcrDecision({
+      ...page,
+      extractionMeta: {
+        ...page.extractionMeta,
+        ...ocrClassification,
+      },
+    }),
+    table_blocks: ocrStructured.tableBlocks,
+    formula_blocks: ocrStructured.formulaBlocks,
+    structured_preview: ocrAnalysis.normalizedText.slice(0, 220),
+  };
+
+  return { applied: true, readable: ocrLooksReadable };
+}
+
+async function runScanHeavyOcrSample(args: {
+  buf: Buffer;
+  fileName: string;
+  pages: ExtractedPdfPage[];
+}) {
+  const samplePages = pickRepresentativeOcrSamplePages(args.pages);
+  if (samplePages.length === 0) {
+    return {
+      attemptedPages: 0,
+      succeededPages: 0,
+      timeoutCount: 0,
+      promising: false,
+      ocrTexts: [] as Array<{ page: number; text: string; engine: string }>,
+    };
+  }
+
+  let attemptedPages = 0;
+  let succeededPages = 0;
+  let timeoutCount = 0;
+  const ocrTexts: Array<{ page: number; text: string; engine: string }> = [];
+
+  for (let index = 0; index < samplePages.length; index += 2) {
+    const batch = samplePages.slice(index, index + 2);
+    const results = await Promise.all(
+      batch.map(async (page) => {
+        try {
+          const pagePdfBuffer = await extractSinglePagePdf(args.buf, page.pageNumber - 1);
+          const ocrText = await runOpenAIOcrForPage({
+            fileName: args.fileName,
+            pageNumber: page.pageNumber,
+            pagePdfBuffer,
+          });
+          return { page, ocrText, error: null as unknown };
+        } catch (error) {
+          return { page, ocrText: "", error };
+        }
+      }),
+    );
+
+    for (const result of results) {
+      attemptedPages += 1;
+      if (result.error) {
+        const code = String((result.error as any)?.code ?? "").trim();
+        if (code === "OCR_REQUEST_TIMEOUT") timeoutCount += 1;
+        console.warn(`[pdf/extract] OCR sample failed for page ${result.page.pageNumber}:`, result.error);
+        continue;
+      }
+
+      const applied = applyOcrTextToPage(result.page, result.ocrText);
+      if (!applied.applied) continue;
+      if (applied.readable) succeededPages += 1;
+      ocrTexts.push({ page: result.page.pageNumber, text: result.page.text, engine: OCR_ENGINE });
+    }
+  }
+
+  const sampleReadable = summarizeReadableText(samplePages);
+  const promising =
+    sampleReadable.pagesWithGoodText >= 1 ||
+    sampleReadable.totalChars >= 180 ||
+    sampleReadable.totalWords >= 36 ||
+    succeededPages >= 1;
+
+  return {
+    attemptedPages,
+    succeededPages,
+    timeoutCount,
+    promising,
+    ocrTexts,
+  };
+}
+
 function groupItemsIntoLines(items: PositionedTextItem[]) {
   const sorted = [...items].sort((a, b) => {
     if (Math.abs(b.y - a.y) > 2) return b.y - a.y;
@@ -830,13 +972,13 @@ export async function extractPdfWithFallback(
   }
 
   const initialReadable = summarizeReadableText(pages);
-  const ocrCandidates = pages.filter(
+  let ocrCandidates = pages.filter(
     (page) =>
       page.extractionMeta.ocr_decision === "low_text_candidate" ||
       page.extractionMeta.ocr_decision === "scan_like_candidate",
   );
   const hopelessCandidatePages = pages.filter((page) => page.extractionMeta.ocr_decision === "hopeless_candidate").length;
-  const ocrCandidatePages = ocrCandidates.length;
+  let ocrCandidatePages = ocrCandidates.length;
   const initialScanPages = pages.filter((page) => page.extractionMeta.page_type === "scan").length;
   const scanLikeDocument =
     raw.pageCount > 0 &&
@@ -866,8 +1008,35 @@ export async function extractPdfWithFallback(
     diagnostics.pagesWithGoodText === 0 &&
     shouldRejectScanHeavyPdfPreflight({ pages, fileSizeBytes })
   ) {
-    diagnostics.earlyExitTriggered = true;
-    diagnostics.failureReason = "scan_heavy_pdf_rejected";
+    if (allowOcr && canRunOcr()) {
+      const sample = await runScanHeavyOcrSample({
+        buf,
+        fileName,
+        pages,
+      });
+      diagnostics.ocrAttemptedPages += sample.attemptedPages;
+      diagnostics.ocrSucceededPages += sample.succeededPages;
+      ocrTexts.push(...sample.ocrTexts);
+      diagnostics.pagesWithGoodText = countPagesWithGoodText(pages);
+      ocrCandidates = pages.filter(
+        (page) =>
+          page.extractionMeta.ocr_decision === "low_text_candidate" ||
+          page.extractionMeta.ocr_decision === "scan_like_candidate",
+      );
+      ocrCandidatePages = ocrCandidates.length;
+      diagnostics.ocrCandidatePages = ocrCandidatePages;
+
+      if (!sample.promising) {
+        diagnostics.earlyExitTriggered = true;
+        diagnostics.failureReason =
+          sample.timeoutCount >= sample.attemptedPages && sample.attemptedPages > 0
+            ? "ocr_timeout"
+            : "scan_heavy_pdf_rejected";
+      }
+    } else {
+      diagnostics.earlyExitTriggered = true;
+      diagnostics.failureReason = "scan_heavy_pdf_rejected";
+    }
   }
 
   if (raw.pageCount > 0 && !diagnostics.failureReason && allowOcr && canRunOcr() && ocrCandidatePages > 0) {
@@ -911,47 +1080,9 @@ export async function extractPdfWithFallback(
 
         if (!ocrText) continue;
 
-        const originalAnalysis = analyzeText(page.text);
-        const ocrStructured = structurePageText({
-          pageType: page.extractionMeta.page_type,
-          text: ocrText,
-        });
-        const ocrAnalysis = analyzeText(ocrStructured.text || ocrText);
-        const ocrLooksReadable =
-          ocrAnalysis.looksUsable ||
-          (ocrAnalysis.quality !== "low" && ocrAnalysis.wordCount >= 12 && ocrAnalysis.alphaNumRatio >= 0.45);
-        if (ocrAnalysis.score <= originalAnalysis.score && originalAnalysis.looksUsable) continue;
-
-        page.text = ocrAnalysis.normalizedText;
-        page.extractionMethod = "ocr";
-        page.extractionQuality = ocrAnalysis.quality;
-        page.textCharCount = ocrAnalysis.charCount;
-        page.wordCount = ocrAnalysis.wordCount;
-        page.alphaNumRatio = ocrAnalysis.alphaNumRatio;
-        page.brokenTokenRatio = ocrAnalysis.brokenTokenRatio;
-        const ocrClassification = classifyPage({
-          text: ocrAnalysis.normalizedText,
-          extractionMethod: "ocr",
-          quality: ocrAnalysis.quality,
-          charCount: ocrAnalysis.charCount,
-          wordCount: ocrAnalysis.wordCount,
-          alphaNumRatio: ocrAnalysis.alphaNumRatio,
-          brokenTokenRatio: ocrAnalysis.brokenTokenRatio,
-        });
-        page.extractionMeta = {
-          ...ocrClassification,
-          ocr_decision: classifyOcrDecision({
-            ...page,
-            extractionMeta: {
-              ...page.extractionMeta,
-              ...ocrClassification,
-            },
-          }),
-          table_blocks: ocrStructured.tableBlocks,
-          formula_blocks: ocrStructured.formulaBlocks,
-          structured_preview: ocrAnalysis.normalizedText.slice(0, 220),
-        };
-        if (ocrLooksReadable) {
+        const applied = applyOcrTextToPage(page, ocrText);
+        if (!applied.applied) continue;
+        if (applied.readable) {
           diagnostics.ocrSucceededPages += 1;
         }
         ocrTexts.push({ page: page.pageNumber, text: page.text, engine: OCR_ENGINE });
