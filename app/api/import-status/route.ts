@@ -64,6 +64,8 @@ function toActiveJobResponse(job: ReturnType<typeof normalizeImportJobRow>) {
   };
 }
 
+type ImportJobRow = NonNullable<ReturnType<typeof normalizeImportJobRow>>;
+
 export async function GET(req: NextRequest) {
   const requestId = crypto.randomUUID();
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
@@ -267,12 +269,12 @@ export async function GET(req: NextRequest) {
           .limit(100);
 
         if (!jobsRes.error && Array.isArray(jobsRes.data)) {
-          const matchingJobs = jobsRes.data
+          const matchingJobs: ImportJobRow[] = jobsRes.data
             .map((row: any) => normalizeImportJobRow(row))
-            .filter((job) => {
-              if (!job) return false;
-              return job.requestId === uploadRequestIdParam;
-            });
+            .filter(
+              (job: ReturnType<typeof normalizeImportJobRow>): job is ImportJobRow =>
+                !!job && job.requestId === uploadRequestIdParam,
+            );
 
           candidateMatches = matchingJobs.map((job) => ({
             id: job.id,
