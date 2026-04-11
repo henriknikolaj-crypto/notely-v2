@@ -1,6 +1,6 @@
 import "server-only";
 
-import { after, NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
 import { createHash, randomUUID } from "node:crypto";
@@ -906,6 +906,17 @@ async function safeUpdateFileRecord(admin: any, fileId: string, patch: Record<st
   }
 }
 
+type AcceptedPdfProcessResult = {
+  ok: boolean;
+  stage: string;
+  jobStatus: string;
+  processing: boolean;
+  ready: boolean;
+  failureMessage: string | null;
+  pageCount: number;
+  chunkCount: number | null;
+};
+
 async function processAcceptedPdfUpload(args: {
   requestId: string;
   jobId: string | null;
@@ -920,7 +931,7 @@ async function processAcceptedPdfUpload(args: {
   storagePath: string;
   effectivePages: number;
   quotaResetAt: string;
-}) {
+}): Promise<AcceptedPdfProcessResult> {
   const {
     requestId,
     jobId,
@@ -984,7 +995,7 @@ async function processAcceptedPdfUpload(args: {
       failureReason: string,
       extraction?: ExtractedPdfDocument | null,
       extraPayload?: Record<string, unknown>,
-    ) => {
+    ): Promise<AcceptedPdfProcessResult> => {
       if (extraction) {
         await persistExtraction(extraction, "failed", {
           failure_reason: failureReason,
@@ -1015,18 +1026,29 @@ async function processAcceptedPdfUpload(args: {
         payload: trackingPayload,
         meta: trackingPayload,
       });
+      return {
+        ok: false,
+        stage: "failed",
+        jobStatus: "failed",
+        processing: false,
+        ready: false,
+        failureMessage: message,
+        pageCount: extraction?.pageCount ?? effectivePages,
+        chunkCount: typeof extraPayload?.chunk_count === "number" ? Number(extraPayload.chunk_count) : null,
+      };
     };
 
     const finalizeSuccess = async (args: {
       extraction: ExtractedPdfDocument;
       chunkCount: number;
+      jobStage?: string;
       processingStatus?: string;
       extraMeta?: Record<string, unknown>;
-    }) => {
-      const { extraction, chunkCount, processingStatus = "finished", extraMeta } = args;
+    }): Promise<AcceptedPdfProcessResult> => {
+      const { extraction, chunkCount, jobStage = "finished", processingStatus = "finished", extraMeta } = args;
       await persistExtraction(extraction, processingStatus, extraMeta);
       const finishedAt = new Date().toISOString();
-      const trackingPayload = buildStageTrackingPayload("finished", extraction, chunkCount, {
+      const trackingPayload = buildStageTrackingPayload(jobStage, extraction, chunkCount, {
         dominant_page_type: extraction.extractionMeta.dominant_page_type,
         pages: extraction.pageCount,
         ...(extraMeta ?? {}),
@@ -1070,6 +1092,16 @@ async function processAcceptedPdfUpload(args: {
           upload_kind: "pdf",
         },
       });
+      return {
+        ok: true,
+        stage: jobStage,
+        jobStatus: "succeeded",
+        processing: false,
+        ready: true,
+        failureMessage: null,
+        pageCount: extraction.pageCount,
+        chunkCount,
+      };
     };
 
     const buildChunksAndSync = async (extraction: ExtractedPdfDocument) => {
@@ -1109,46 +1141,17 @@ async function processAcceptedPdfUpload(args: {
         exceededMessage: `Grænse nået. Du kan uploade igen efter nulstilling (${quotaResetAt ? formatDa(quotaResetAt) : "snart"}).`,
       });
 
-      if (quotaConsume.ok) return true;
+      if (quotaConsume.ok) return { ok: true as const, failure: null };
 
       await purgeFileArtifacts(admin, { ownerId, fileId, storagePath, fileMd5: md5 });
-      await failBeforeReady(
+      const failure = await failBeforeReady(
         quotaConsume.message ??
           "Uploaden kunne ikke færdiggøres, fordi din upload-kvote blev nået under behandlingen.",
         "quota_reached_during_processing",
         extraction,
         { chunk_count: chunkCount },
       );
-      return false;
-    };
-
-    const runDeepExtraction = async () => {
-      logUploadStage(requestId, "deep_processing_started", { jobId, fileId });
-      return extractPdfWithFallback(buf, {
-        fileName: originalName,
-        fileSizeBytes: sizeBytes ?? buf.length,
-        allowOcr: true,
-        onProgress: async (progress: PdfExtractionProgress) => {
-          if (progress.stage === "ocr_started") {
-            logUploadStage(requestId, "ocr_started", {
-              jobId,
-              fileId,
-              pageCount: progress.totalPages,
-              ocrCandidatePages: progress.ocrCandidatePages,
-              scanLikeDocument: progress.scanLikeDocument,
-            });
-          }
-
-          if (progress.stage === "ocr_finished") {
-            logUploadStage(requestId, "ocr_finished", {
-              jobId,
-              fileId,
-              pageCount: progress.totalPages,
-              ocrCandidatePages: progress.ocrCandidatePages,
-            });
-          }
-        },
-      });
+      return { ok: false as const, failure };
     };
 
     logUploadStage(requestId, "processing_started", { jobId, fileId, storagePath });
@@ -1212,7 +1215,32 @@ async function processAcceptedPdfUpload(args: {
     });
 
     if (!fastPathCandidate) {
-      const extraction = await runDeepExtraction();
+      logUploadStage(requestId, "deep_processing_started", { jobId, fileId });
+      const extraction = await extractPdfWithFallback(buf, {
+        fileName: originalName,
+        fileSizeBytes: sizeBytes ?? buf.length,
+        allowOcr: true,
+        onProgress: async (progress: PdfExtractionProgress) => {
+          if (progress.stage === "ocr_started") {
+            logUploadStage(requestId, "ocr_started", {
+              jobId,
+              fileId,
+              pageCount: progress.totalPages,
+              ocrCandidatePages: progress.ocrCandidatePages,
+              scanLikeDocument: progress.scanLikeDocument,
+            });
+          }
+
+          if (progress.stage === "ocr_finished") {
+            logUploadStage(requestId, "ocr_finished", {
+              jobId,
+              fileId,
+              pageCount: progress.totalPages,
+              ocrCandidatePages: progress.ocrCandidatePages,
+            });
+          }
+        },
+      });
       logUploadStage(requestId, "pdf_extract_finished", {
         jobId,
         fileId,
@@ -1237,15 +1265,14 @@ async function processAcceptedPdfUpload(args: {
           extractionMethod: extraction.extractionMethod,
           failureReason,
         });
-        await failBeforeReady(failureMessage, failureReason, extraction);
-        return;
+        return await failBeforeReady(failureMessage, failureReason, extraction);
       }
 
       const chunkBuild = await buildChunksAndSync(extraction);
-      const quotaOk = await ensureQuota(extraction.pageCount, chunkBuild.chunkCount, extraction);
-      if (!quotaOk) return;
+      const quotaResult = await ensureQuota(extraction.pageCount, chunkBuild.chunkCount, extraction);
+      if (!quotaResult.ok) return quotaResult.failure;
 
-      await finalizeSuccess({
+      return await finalizeSuccess({
         extraction,
         chunkCount: chunkBuild.chunkCount,
         extraMeta: {
@@ -1253,18 +1280,18 @@ async function processAcceptedPdfUpload(args: {
           deep_path_completed: true,
         },
       });
-      return;
     }
 
     const fastChunkBuild = await buildChunksAndSync(fastExtraction);
-    const quotaOk = await ensureQuota(fastExtraction.pageCount, fastChunkBuild.chunkCount, fastExtraction);
-    if (!quotaOk) return;
+    const quotaResult = await ensureQuota(fastExtraction.pageCount, fastChunkBuild.chunkCount, fastExtraction);
+    if (!quotaResult.ok) return quotaResult.failure;
 
     const firstReadyAt = new Date().toISOString();
+    const deepProcessingNeeded = shouldRunPdfDeepProcessing(fastExtraction);
     await persistExtraction(fastExtraction, "first_ready", {
       fast_path: true,
       first_ready_at: firstReadyAt,
-      deep_processing_needed: shouldRunPdfDeepProcessing(fastExtraction),
+      deep_processing_needed: deepProcessingNeeded,
     });
     await updatePdfJobStage({
       admin,
@@ -1286,7 +1313,7 @@ async function processAcceptedPdfUpload(args: {
       extraPayload: {
         fast_path: true,
         first_ready_at: firstReadyAt,
-        deep_processing_needed: shouldRunPdfDeepProcessing(fastExtraction),
+        deep_processing_needed: deepProcessingNeeded,
       },
     });
     logUploadStage(requestId, "first_ready", {
@@ -1296,120 +1323,18 @@ async function processAcceptedPdfUpload(args: {
       chunkCount: fastChunkBuild.chunkCount,
     });
 
-    if (!shouldRunPdfDeepProcessing(fastExtraction)) {
-      await finalizeSuccess({
-        extraction: fastExtraction,
-        chunkCount: fastChunkBuild.chunkCount,
-        extraMeta: {
-          fast_path: true,
-          first_ready_at: firstReadyAt,
-          deep_path_completed: false,
-        },
-      });
-      return;
-    }
-
-    await persistExtraction(fastExtraction, "deep_processing", {
-      fast_path: true,
-      first_ready_at: firstReadyAt,
-      deep_processing_needed: true,
-    });
-    await updatePdfJobStage({
-      admin,
-      jobId,
-      requestId,
-      folderId,
-      fileName: originalName,
-      mimeType,
-      sizeBytes,
-      md5,
-      fileId,
-      storagePath,
-      pageCount: fastExtraction.pageCount,
-      ocrPages: fastExtraction.ocrPages,
-      extractionMethod: fastExtraction.extractionMethod,
-      extractionQuality: fastExtraction.extractionQuality,
+    return await finalizeSuccess({
+      extraction: fastExtraction,
       chunkCount: fastChunkBuild.chunkCount,
-      stage: "deep_processing",
-      extraPayload: {
+      jobStage: "first_ready",
+      processingStatus: "first_ready",
+      extraMeta: {
         fast_path: true,
         first_ready_at: firstReadyAt,
-        deep_processing_needed: true,
-        ocr_candidate_pages: fastExtraction.extractionMeta.ocr_candidate_pages,
+        deep_processing_needed: deepProcessingNeeded,
+        deep_path_completed: false,
       },
     });
-
-    try {
-      const deepExtraction = await runDeepExtraction();
-      logUploadStage(requestId, "pdf_extract_finished", {
-        jobId,
-        fileId,
-        pageCount: deepExtraction.pageCount,
-        ocrPages: deepExtraction.ocrPages,
-        extractionMethod: deepExtraction.extractionMethod,
-        phase: "deep_after_ready",
-      });
-
-      if (isPdfTextInsufficientAfterExtraction(deepExtraction)) {
-        const failureReason = getPdfUnreadableFailureReason(deepExtraction);
-        logUploadStage(requestId, "deep_processing_kept_first_ready", {
-          jobId,
-          fileId,
-          failureReason,
-        });
-        await finalizeSuccess({
-          extraction: fastExtraction,
-          chunkCount: fastChunkBuild.chunkCount,
-          extraMeta: {
-            fast_path: true,
-            first_ready_at: firstReadyAt,
-            deep_path_completed: false,
-            deep_path_failed: true,
-            deep_failure_reason: failureReason,
-          },
-        });
-        return;
-      }
-
-      const shouldRewriteChunks =
-        deepExtraction.ocrTexts.length > 0 ||
-        deepExtraction.ocrPages > fastExtraction.ocrPages ||
-        deepExtraction.extractionMethod !== fastExtraction.extractionMethod ||
-        deepExtraction.extractionQuality !== fastExtraction.extractionQuality;
-
-      let finalChunkCount = fastChunkBuild.chunkCount;
-      if (shouldRewriteChunks) {
-        const deepChunkBuild = await buildChunksAndSync(deepExtraction);
-        finalChunkCount = deepChunkBuild.chunkCount;
-      }
-
-      await finalizeSuccess({
-        extraction: deepExtraction,
-        chunkCount: finalChunkCount,
-        extraMeta: {
-          fast_path: true,
-          first_ready_at: firstReadyAt,
-          deep_path_completed: true,
-        },
-      });
-    } catch (deepError: any) {
-      console.warn("[trainer/upload] deep processing fallback after first_ready", {
-        requestId,
-        fileId,
-        error: errInfo(deepError),
-      });
-      await finalizeSuccess({
-        extraction: fastExtraction,
-        chunkCount: fastChunkBuild.chunkCount,
-        extraMeta: {
-          fast_path: true,
-          first_ready_at: firstReadyAt,
-          deep_path_completed: false,
-          deep_path_failed: true,
-          deep_failure_reason: String(deepError?.message ?? deepError ?? "deep_processing_failed"),
-        },
-      });
-    }
   } catch (e: any) {
     const failurePayload = {
       ...buildJobTrackingPayload({
@@ -1445,6 +1370,16 @@ async function processAcceptedPdfUpload(args: {
       });
     }
     console.error("[trainer/upload] accepted pdf processing error:", errInfo(e));
+    return {
+      ok: false,
+      stage: "failed",
+      jobStatus: "failed",
+      processing: false,
+      ready: false,
+      failureMessage: e?.message ?? "PDF-behandling fejlede.",
+      pageCount: effectivePages,
+      chunkCount: null,
+    };
   }
 }
 
@@ -1730,41 +1665,62 @@ async function finalizeAcceptedPdfUpload(args: {
     pages: effectivePages,
     accepted: true,
   });
-
-  after(async () => {
-    await processAcceptedPdfUpload({
-      requestId,
-      jobId,
-      ownerId,
-      folderId,
-      originalName,
-      mimeType,
-      sizeBytes,
-      md5,
-      buf,
-      fileId,
-      storagePath,
-      effectivePages,
-      quotaResetAt,
-    });
+  const processingResult = await processAcceptedPdfUpload({
+    requestId,
+    jobId,
+    ownerId,
+    folderId,
+    originalName,
+    mimeType,
+    sizeBytes,
+    md5,
+    buf,
+    fileId,
+    storagePath,
+    effectivePages,
+    quotaResetAt,
   });
+
+  if (!processingResult.ok) {
+    return NextResponse.json(
+      {
+        ok: false,
+        accepted: false,
+        processing: false,
+        requestId,
+        jobId,
+        fileId,
+        folderId,
+        uploadKind: "pdf",
+        pages: processingResult.pageCount || effectivePages,
+        chunkCount: processingResult.chunkCount,
+        stage: processingResult.stage,
+        jobStatus: processingResult.jobStatus,
+        message: processingResult.failureMessage ?? "PDF-behandling fejlede.",
+        error: processingResult.failureMessage ?? "PDF-behandling fejlede.",
+        storage: { bucket: UPLOAD_BUCKET, path: storagePath },
+      },
+      { status: 422 },
+    );
+  }
 
   return NextResponse.json(
     {
       ok: true,
       accepted: true,
-      processing: true,
+      processing: processingResult.processing,
       requestId,
       jobId,
       fileId,
       folderId,
       uploadKind: "pdf",
-      pages: effectivePages,
-      stage: "queued",
-      jobStatus: "queued",
+      pages: processingResult.pageCount || effectivePages,
+      chunkCount: processingResult.chunkCount,
+      stage: processingResult.stage,
+      jobStatus: processingResult.jobStatus,
       storage: { bucket: UPLOAD_BUCKET, path: storagePath },
     },
-    { status: 202 },
+    { status: processingResult.processing ? 202 : 200 },
   );
 }
 

@@ -1597,7 +1597,17 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       });
       setUploadError(null);
       const uploadKind = data?.uploadKind === "audio" ? "audio" : "pdf";
-      const processingAccepted = uploadKind === "pdf" && (res.status === 202 || data?.processing === true || data?.accepted === true);
+      const responseStage = normalizeStatusToken(asString(data?.stage));
+      const responseJobStatus = normalizeStatusToken(asString(data?.jobStatus));
+      const responseAlreadyReady =
+        READY_STATUS_TOKENS.has(responseStage) ||
+        READY_STATUS_TOKENS.has(responseJobStatus) ||
+        BACKGROUND_STATUS_TOKENS.has(responseStage) ||
+        BACKGROUND_STATUS_TOKENS.has(responseJobStatus);
+      const processingAccepted =
+        uploadKind === "pdf" &&
+        !responseAlreadyReady &&
+        (res.status === 202 || data?.processing === true || data?.accepted === true);
       const noteCount = Array.isArray(data?.generatedNotes) ? data.generatedNotes.length : 0;
       const generatedNotes = Array.isArray(data?.generatedNotes) ? (data.generatedNotes as GeneratedUploadNote[]) : [];
       const notesHistoryHref = uploadFolderId ? `/traener/noter/historik?scope=${encodeURIComponent(uploadFolderId)}` : "/traener/noter/historik";
