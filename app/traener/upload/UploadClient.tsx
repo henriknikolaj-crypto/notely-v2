@@ -1421,18 +1421,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         }
 
         optimisticUploadedAt = new Date().toISOString();
-        if (!isFileSuppressed(initFileId)) {
-          upsertLocalFileStatus({
-            fileId: initFileId,
-            fileName: pickedFile.name,
-            folderId: uploadFolderId,
-            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
-            uploadedAt: optimisticUploadedAt,
-            status: "uploaded",
-            error: null,
-            updatedAt: Date.now(),
-          });
-        }
 
         res = await fetch("/api/trainer/upload", {
           method: "POST",

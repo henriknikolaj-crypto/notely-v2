@@ -39,7 +39,7 @@ const MAX_PDF_PAGES = 100;
 const FREEMIUM_PDF_PAGE_LIMIT = 15;
 const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".mp4", ".mpeg", ".mpga", ".webm", ".ogg", ".oga", ".flac", ".aac"]);
 const SCAN_PDF_TEXT_UNREADABLE_MESSAGE =
-  "PDF’en kunne åbnes, men der kunne ikke udtrækkes nok læsbar tekst. Filen ser ud til at være en scan-/billed-PDF i for lav kvalitet til sikker behandling.";
+  "PDF’en kunne åbnes, men teksten ligger som billeder, og OCR-prøven gav ikke nok læsbar tekst til sikker behandling.";
 const SCAN_HEAVY_PDF_REJECTED_MESSAGE =
   "PDF’en kunne åbnes, men den indeholder for meget scan-/billedindhold til sikker behandling. Del filen op eller brug en mere tekstbaseret PDF.";
 const PDF_TOO_MANY_PAGES_MESSAGE =
