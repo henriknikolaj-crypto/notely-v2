@@ -204,6 +204,19 @@ function safeJson(text: string) {
   }
 }
 
+function getUploadUiMessage(value: unknown, fallback = "Noget gik galt under uploaden.") {
+  const direct = asString(value);
+  if (direct) return direct;
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const nestedMessage = asString(record.message) ?? asString(record.error);
+    if (nestedMessage) return nestedMessage;
+  }
+
+  return fallback;
+}
+
 function isVercelPayloadTooLarge(status: number, res: Response | null, responseText: string, data: any) {
   if (status !== 413) return false;
   const headerSignal = String(res?.headers.get("x-vercel-error") ?? "")
@@ -226,7 +239,9 @@ function resolveUploadErrorMessage(
 ) {
   const res = options?.res ?? null;
   const responseText = String(options?.responseText ?? "");
-  const serverMessage = asString(data?.message) ?? asString(data?.error);
+  const serverMessage =
+    getUploadUiMessage(data?.message, "") ||
+    getUploadUiMessage(data?.error, "");
   if (serverMessage) return serverMessage;
 
   const code = String(data?.code ?? "").trim().toUpperCase();
@@ -1483,10 +1498,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       if (res.status === 409) {
         const j = data;
-        const msg = String(
-          j?.message ??
-            j?.error ??
-            "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+        const msg = getUploadUiMessage(
+          j?.message ?? j?.error,
+          "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
         );
         removeLocalFileStatus(pendingFileId);
         clearPickedFileSelection(pickedFile.name);
@@ -1504,12 +1518,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
             uploadedAt: optimisticUploadedAt,
             status: "failed",
-            error: String(j?.error ?? "Login kræves."),
+            error: getUploadUiMessage(j?.error, "Login kræves."),
             updatedAt: Date.now(),
           });
         }
         clearPickedFileSelection(pickedFile.name);
-        setUploadError(String(j?.error ?? "Login kræves."));
+        setUploadError(getUploadUiMessage(j?.error, "Login kræves."));
         return;
       }
 
@@ -1545,12 +1559,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
             uploadedAt: optimisticUploadedAt,
             status: "failed",
-            error: String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."),
+            error: getUploadUiMessage(j?.message ?? j?.error, "Handlingen er ikke tilgængelig lige nu."),
             updatedAt: Date.now(),
           });
         }
         clearPickedFileSelection(pickedFile.name);
-        setUploadNotice(String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."));
+        setUploadNotice(getUploadUiMessage(j?.message ?? j?.error, "Handlingen er ikke tilgængelig lige nu."));
         return;
       }
 

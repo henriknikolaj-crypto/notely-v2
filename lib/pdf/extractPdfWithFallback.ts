@@ -141,7 +141,7 @@ const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
 const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
 const SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT = 3;
-const SCAN_HEAVY_PREFLIGHT_MIN_BYTES = 10 * 1024 * 1024;
+const SCAN_HEAVY_OCR_SAMPLE_BUDGET_MS = 20_000;
 const OCR_TIMEOUT_MS = (() => {
   const value = Number(process.env.OPENAI_OCR_TIMEOUT_MS ?? 10_000);
   return Number.isFinite(value) && value > 0 ? value : 10_000;
@@ -506,9 +506,8 @@ function shouldEarlyExitAfterOcr(args: {
   return noUsefulRecovery;
 }
 
-function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[]; fileSizeBytes: number }) {
-  const { pages, fileSizeBytes } = args;
-  if (fileSizeBytes < SCAN_HEAVY_PREFLIGHT_MIN_BYTES) return false;
+function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[] }) {
+  const { pages } = args;
 
   const previewPages = pages.slice(0, Math.min(SCAN_HEAVY_PREFLIGHT_PAGE_COUNT, pages.length));
   if (previewPages.length < 3) return false;
@@ -619,9 +618,15 @@ async function runScanHeavyOcrSample(args: {
   let attemptedPages = 0;
   let succeededPages = 0;
   let timeoutCount = 0;
+  let budgetExceeded = false;
   const ocrTexts: Array<{ page: number; text: string; engine: string }> = [];
+  const startedAt = Date.now();
 
   for (let index = 0; index < samplePages.length; index += 2) {
+    if (Date.now() - startedAt >= SCAN_HEAVY_OCR_SAMPLE_BUDGET_MS) {
+      budgetExceeded = true;
+      break;
+    }
     const batch = samplePages.slice(index, index + 2);
     const results = await Promise.all(
       batch.map(async (page) => {
@@ -666,6 +671,7 @@ async function runScanHeavyOcrSample(args: {
     attemptedPages,
     succeededPages,
     timeoutCount,
+    budgetExceeded,
     promising,
     ocrTexts,
   };
@@ -1006,7 +1012,7 @@ export async function extractPdfWithFallback(
     raw.pageCount > 0 &&
     scanLikeDocument &&
     diagnostics.pagesWithGoodText === 0 &&
-    shouldRejectScanHeavyPdfPreflight({ pages, fileSizeBytes })
+    shouldRejectScanHeavyPdfPreflight({ pages })
   ) {
     if (allowOcr && canRunOcr()) {
       const sample = await runScanHeavyOcrSample({
@@ -1029,7 +1035,7 @@ export async function extractPdfWithFallback(
       if (!sample.promising) {
         diagnostics.earlyExitTriggered = true;
         diagnostics.failureReason =
-          sample.timeoutCount >= sample.attemptedPages && sample.attemptedPages > 0
+          (sample.timeoutCount >= sample.attemptedPages && sample.attemptedPages > 0) || sample.budgetExceeded
             ? "ocr_timeout"
             : "scan_heavy_pdf_rejected";
       }
