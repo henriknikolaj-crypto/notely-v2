@@ -12,6 +12,8 @@ export type NormalizedImportJob = {
   queuedAt: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 };
 
 export type MaterialReadinessState = "ready" | "processing" | "failed";
@@ -33,13 +35,66 @@ function strOrNull(value: unknown) {
   return text.length > 0 ? text : null;
 }
 
+function parseTimeMs(value: string | null | undefined) {
+  if (!value) return 0;
+  const ms = Date.parse(String(value));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function normalizeStatus(status: string | null | undefined) {
+  return String(status ?? "").trim().toLowerCase();
+}
+
 export function isImportJobFinishedStatus(status: string | null | undefined) {
-  const normalized = String(status ?? "").trim().toLowerCase();
+  const normalized = normalizeStatus(status);
   return normalized === "finished" || normalized === "completed" || normalized === "succeeded";
 }
 
 export function isImportJobFailedStatus(status: string | null | undefined) {
-  return String(status ?? "").trim().toLowerCase() === "failed";
+  return normalizeStatus(status) === "failed";
+}
+
+export function isImportJobTerminalStatus(status: string | null | undefined) {
+  return isImportJobFinishedStatus(status) || isImportJobFailedStatus(status);
+}
+
+export function getImportJobRelevantTime(job: NormalizedImportJob | null | undefined) {
+  if (!job) return 0;
+  return (
+    parseTimeMs(job.updatedAt) ||
+    parseTimeMs(job.finishedAt) ||
+    parseTimeMs(job.startedAt) ||
+    parseTimeMs(job.queuedAt) ||
+    parseTimeMs(job.createdAt)
+  );
+}
+
+function getImportJobPriority(job: NormalizedImportJob) {
+  if (isImportJobFinishedStatus(job.status)) return 3;
+  if (isImportJobFailedStatus(job.status)) return 2;
+  return 1;
+}
+
+function compareImportJobs(a: NormalizedImportJob, b: NormalizedImportJob) {
+  const relevantTimeDiff = getImportJobRelevantTime(b) - getImportJobRelevantTime(a);
+  if (relevantTimeDiff !== 0) return relevantTimeDiff;
+
+  const updatedTimeDiff = parseTimeMs(b.updatedAt) - parseTimeMs(a.updatedAt);
+  if (updatedTimeDiff !== 0) return updatedTimeDiff;
+
+  const createdTimeDiff = parseTimeMs(b.createdAt) - parseTimeMs(a.createdAt);
+  if (createdTimeDiff !== 0) return createdTimeDiff;
+
+  const priorityDiff = getImportJobPriority(b) - getImportJobPriority(a);
+  if (priorityDiff !== 0) return priorityDiff;
+
+  return b.id.localeCompare(a.id);
+}
+
+export function pickBestImportJob(jobs: Array<NormalizedImportJob | null | undefined>) {
+  return jobs
+    .filter((job): job is NormalizedImportJob => !!job)
+    .sort(compareImportJobs)[0] ?? null;
 }
 
 export function normalizeImportJobRow(row: any): NormalizedImportJob | null {
@@ -73,6 +128,8 @@ export function normalizeImportJobRow(row: any): NormalizedImportJob | null {
     queuedAt: strOrNull(row?.queued_at),
     startedAt: strOrNull(row?.started_at),
     finishedAt: strOrNull(row?.finished_at),
+    createdAt: strOrNull(row?.created_at),
+    updatedAt: strOrNull(row?.updated_at),
   };
 }
 
@@ -90,7 +147,7 @@ export function resolveMaterialReadiness(args: {
       ready: true,
       state: "ready",
       label: "Klar",
-      detail: chunkCount > 0 ? "Klar til Træner" : "Behandling afsluttet",
+      detail: chunkCount > 0 ? "Materialet er klar" : "Behandling afsluttet",
       chunkCount,
       jobStatus,
       jobStage,
@@ -111,23 +168,11 @@ export function resolveMaterialReadiness(args: {
     };
   }
 
-  const stage = String(jobStage ?? "").toLowerCase();
-  const label =
-    stage === "ocr_started" ||
-    stage === "ocr_finished" ||
-    stage === "pdf_extract_started" ||
-    stage === "pdf_extract_finished" ||
-    stage === "chunk_build_started" ||
-    stage === "chunk_build_finished" ||
-    stage === "processing_started"
-      ? "OCR/klargøring i gang"
-      : "Behandles...";
-
   return {
     ready: false,
     state: "processing",
-    label,
-    detail: label === "Behandles..." ? "Materialet gøres klar" : "Materialet klargøres til Træner",
+    label: "Klargøres",
+    detail: "Materialet klargøres",
     chunkCount,
     jobStatus,
     jobStage,

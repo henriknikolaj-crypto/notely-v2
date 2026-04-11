@@ -34,11 +34,16 @@ export const dynamic = "force-dynamic";
 
 // Hold denne i sync med DELETE-route (din /api/files/[id] bruger trainer_uploads)
 const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "trainer_uploads";
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // hård beskyttelse (ikke quota)
+const MAX_FILE_BYTES = 25 * 1024 * 1024; // hård beskyttelse (ikke quota)
+const MAX_PDF_PAGES = 100;
 const FREEMIUM_PDF_PAGE_LIMIT = 15;
 const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".mp4", ".mpeg", ".mpga", ".webm", ".ogg", ".oga", ".flac", ".aac"]);
 const SCAN_PDF_TEXT_UNREADABLE_MESSAGE =
-  "PDF’en kunne åbnes, men teksten kunne ikke læses sikkert. Prøv evt. en anden PDF eller en eksport med bedre tekstlag.";
+  "PDF’en kunne åbnes, men der kunne ikke udtrækkes nok læsbar tekst. Filen ser ud til at være en scan-/billed-PDF i for lav kvalitet til sikker behandling.";
+const SCAN_HEAVY_PDF_REJECTED_MESSAGE =
+  "PDF’en kunne åbnes, men den indeholder for meget scan-/billedindhold til sikker behandling. Del filen op eller brug en mere tekstbaseret PDF.";
+const PDF_TOO_MANY_PAGES_MESSAGE =
+  "PDF’en har for mange sider til hurtig og sikker behandling. Del den op i mindre filer på højst 100 sider.";
 const DOC_CHUNKS_DB_TIMEOUT_MS = (() => {
   const fallback = process.env.NODE_ENV === "production" ? 60_000 : 15_000;
   const value = Number(process.env.DOC_CHUNKS_DB_TIMEOUT_MS ?? fallback);
@@ -133,6 +138,7 @@ function isScanLikeExtraction(extraction: ExtractedPdfDocument) {
 }
 
 function isPdfTextInsufficientAfterExtraction(extraction: ExtractedPdfDocument) {
+  if (extraction.extractionMeta.failure_reason) return true;
   const stats = getPdfExtractionStats(extraction);
   return (
     isScanLikeExtraction(extraction) &&
@@ -140,6 +146,31 @@ function isPdfTextInsufficientAfterExtraction(extraction: ExtractedPdfDocument) 
     stats.usablePages === 0 &&
     stats.totalChars < 120 &&
     stats.totalWords < 24
+  );
+}
+
+function getPdfUnreadableFailureReason(extraction: ExtractedPdfDocument) {
+  return extraction.extractionMeta.failure_reason ?? "text_unreadable_after_ocr";
+}
+
+function getPdfUnreadableMessage(extraction: ExtractedPdfDocument) {
+  return getPdfUnreadableFailureReason(extraction) === "scan_heavy_pdf_rejected"
+    ? SCAN_HEAVY_PDF_REJECTED_MESSAGE
+    : SCAN_PDF_TEXT_UNREADABLE_MESSAGE;
+}
+
+function buildPdfTooManyPagesResponse(args: { requestId: string; pages: number }) {
+  return NextResponse.json(
+    {
+      ok: false,
+      code: "FILE_TOO_LONG",
+      message: PDF_TOO_MANY_PAGES_MESSAGE,
+      pages: args.pages,
+      pageLimit: MAX_PDF_PAGES,
+      failureReason: "pdf_too_many_pages",
+      requestId: args.requestId,
+    },
+    { status: 413 },
   );
 }
 
@@ -930,6 +961,7 @@ async function processAcceptedPdfUpload(args: {
 
     const extraction = await extractPdfWithFallback(buf, {
       fileName: originalName,
+      fileSizeBytes: sizeBytes ?? buf.length,
       onProgress: async (progress: PdfExtractionProgress) => {
         if (progress.stage === "ocr_started") {
           logUploadStage(requestId, "ocr_started", {
@@ -989,19 +1021,22 @@ async function processAcceptedPdfUpload(args: {
       },
       });
     if (isPdfTextInsufficientAfterExtraction(extraction)) {
+      const failureReason = getPdfUnreadableFailureReason(extraction);
+      const failureMessage = getPdfUnreadableMessage(extraction);
       logUploadStage(requestId, "pdf_text_unreadable", {
         jobId,
         fileId,
         pageCount: extraction.pageCount,
         ocrPages: extraction.ocrPages,
         extractionMethod: extraction.extractionMethod,
+        failureReason,
       });
       await safeUpdateFileRecord(admin, fileId, {
         extraction_meta: {
           ...extraction.extractionMeta,
           input_kind: "pdf",
           processing_status: "failed",
-          failure_reason: "text_unreadable_after_ocr",
+          failure_reason: failureReason,
           request_id: requestId,
         },
       });
@@ -1009,7 +1044,7 @@ async function processAcceptedPdfUpload(args: {
         status: "failed",
         file_id: fileId,
         finished_at: new Date().toISOString(),
-        error: { message: SCAN_PDF_TEXT_UNREADABLE_MESSAGE },
+        error: { message: failureMessage },
         payload: {
           ...buildJobTrackingPayload({
             requestId,
@@ -1027,7 +1062,7 @@ async function processAcceptedPdfUpload(args: {
             extractionQuality: extraction.extractionQuality,
             stage: "failed",
           }),
-          failure_reason: "text_unreadable_after_ocr",
+          failure_reason: failureReason,
         },
       });
       return;
@@ -1667,7 +1702,7 @@ async function handleDirectPdfUploadComplete(args: {
       {
         ok: false,
         code: "FILE_TOO_LARGE",
-        error: "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer.",
+          error: "Filen er større end 25 MB. Prøv at komprimere PDF’en eller del den i to filer.",
         requestId,
       },
       { status: 413 },
@@ -1773,6 +1808,13 @@ async function handleDirectPdfUploadComplete(args: {
       { ok: false, code: "PDF_NO_PAGES", error: "PDF har ingen sider.", requestId },
       { status: 400 },
     );
+  }
+
+  if (effectivePages > MAX_PDF_PAGES) {
+    try {
+      await admin.storage.from(UPLOAD_BUCKET).remove([storagePath]);
+    } catch {}
+    return buildPdfTooManyPagesResponse({ requestId, pages: effectivePages });
   }
 
   const planInfo = await getUploadPlan(admin, ownerId);
@@ -1984,7 +2026,7 @@ export async function POST(req: NextRequest) {
           code: "FILE_TOO_LARGE",
           error:
             uploadKind === "pdf"
-              ? "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer."
+              ? "Filen er større end 25 MB. Prøv at komprimere PDF’en eller del den i to filer."
               : `Filen er for stor. Maks. ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB pr. fil.`,
           requestId,
         },
@@ -2126,6 +2168,10 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      if (effectivePages > MAX_PDF_PAGES) {
+        return buildPdfTooManyPagesResponse({ requestId, pages: effectivePages });
+      }
+
       const planInfo = await getUploadPlan(admin, ownerId);
       if (!planInfo.resolved) {
         console.warn("[trainer/upload] skipping freemium page gate because plan lookup was not resolved", {
@@ -2261,6 +2307,7 @@ export async function POST(req: NextRequest) {
       try {
         extraction = await extractPdfWithFallback(buf, {
           fileName: originalName,
+          fileSizeBytes: typeof (file as any).size === "number" ? Number((file as any).size) : buf.length,
           onProgress: async (progress: PdfExtractionProgress) => {
             if (progress.stage === "ocr_started") {
               logUploadStage(requestId, "ocr_started", {
@@ -2343,16 +2390,19 @@ export async function POST(req: NextRequest) {
       });
 
       if (isPdfTextInsufficientAfterExtraction(extraction)) {
+        const failureReason = getPdfUnreadableFailureReason(extraction);
+        const failureMessage = getPdfUnreadableMessage(extraction);
         logUploadStage(requestId, "pdf_text_unreadable", {
           jobId,
           pageCount: extraction.pageCount,
           ocrPages: extraction.ocrPages,
           extractionMethod: extraction.extractionMethod,
+          failureReason,
         });
         await safeUpdateJob(admin, jobId, {
           status: "failed",
           finished_at: new Date().toISOString(),
-          error: { message: SCAN_PDF_TEXT_UNREADABLE_MESSAGE },
+          error: { message: failureMessage },
           payload: {
             source: "trainer_upload",
             request_id: requestId,
@@ -2367,14 +2417,14 @@ export async function POST(req: NextRequest) {
             ocr_pages: extraction.ocrPages,
             extraction_method: extraction.extractionMethod,
             extraction_quality: extraction.extractionQuality,
-            failure_reason: "text_unreadable_after_ocr",
+            failure_reason: failureReason,
           },
         });
         return NextResponse.json(
           {
             ok: false,
             code: "PDF_TEXT_UNREADABLE",
-            error: SCAN_PDF_TEXT_UNREADABLE_MESSAGE,
+            error: failureMessage,
             requestId,
           },
           { status: 422 },

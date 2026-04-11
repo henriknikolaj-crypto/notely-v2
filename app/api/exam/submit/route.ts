@@ -10,6 +10,16 @@ import { calcSessionGrade } from "@/lib/grading/sessionGrade";
 import { danish7ToScore100, type Danish7Grade } from "@/lib/grading/danish7";
 import { buildFeedbackV2, deriveWeakPointTargetsFromFeedbackV2 } from "@/lib/learning/feedback";
 import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
+import {
+  hasInternationalOkonomiSubjectHintFromCandidates,
+  hasVirksomhedsokonomiSubjectHintFromCandidates,
+  resolveTrainerSubjectFamilyFromCandidates,
+} from "@/lib/learning/subjects/families";
+import {
+  inferTrainerEvaluateSharedSubjectFamily,
+  resolveTrainerEvaluateSharedSubjectConfig,
+} from "@/lib/learning/subjects/evaluate/registry";
+import type { TrainerSubjectFamily } from "@/lib/learning/subjects/types";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { ensureProfile } from "@/lib/server/ensureProfile";
@@ -181,6 +191,22 @@ function buildWrittenFeedbackText(opts: {
   return parts.filter(Boolean).join("\n\n");
 }
 
+function buildExamSubjectEvaluator(args: {
+  sourceType: "simulator" | "oral";
+  resolvedSubjectFamily: TrainerSubjectFamily | null;
+  sharedEvaluatorTaskType?: string | null;
+}) {
+  const baseEvaluator = resolveEvaluatorDefinition(args.sourceType);
+  if (!args.resolvedSubjectFamily) return baseEvaluator;
+
+  return {
+    ...baseEvaluator,
+    id: `${baseEvaluator.id}.${args.resolvedSubjectFamily}`,
+    subject_family: args.resolvedSubjectFamily,
+    task_type: args.sharedEvaluatorTaskType ?? baseEvaluator.task_type,
+  };
+}
+
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
 
@@ -292,6 +318,18 @@ export async function POST(req: NextRequest) {
     const effectiveFolders = scopeFolderIds.length ? scopeFolderIds : folderId ? [folderId] : [];
     const sessionFolderId = effectiveFolders.length === 1 ? effectiveFolders[0] : null;
     const sessionFolderIdsMeta = effectiveFolders.length > 1 ? effectiveFolders : undefined;
+    let folderSubjectHints: string[] = [];
+
+    if (effectiveFolders.length > 0) {
+      const { data: folderRows } = await admin
+        .from("folders")
+        .select("id,name")
+        .eq("owner_id", ownerId)
+        .in("id", effectiveFolders);
+      folderSubjectHints = ((folderRows ?? []) as Array<{ id: string; name: string | null }>)
+        .map((row) => String(row.name ?? "").trim())
+        .filter(Boolean);
+    }
 
     let filesQ = admin
       .from("files")
@@ -361,6 +399,20 @@ export async function POST(req: NextRequest) {
     const includeBackground = body.includeBackground ?? true;
 
     const mode = body.mode === "oral" ? "oral" : "written";
+    const examPromptText = answered.map((item) => item.prompt).join("\n\n");
+    const subjectCandidates = [...folderSubjectHints, ...answered.map((item) => item.prompt)];
+    const explicitSubjectFamily = resolveTrainerSubjectFamilyFromCandidates(subjectCandidates);
+    const inferredSubjectFamily = inferTrainerEvaluateSharedSubjectFamily(examPromptText);
+    const resolvedSubjectFamily = explicitSubjectFamily ?? inferredSubjectFamily;
+    const sharedSubjectConfig = resolveTrainerEvaluateSharedSubjectConfig({
+      question: examPromptText,
+      resolvedSubjectFamily,
+      virksomhedsokonomiGuidance: hasVirksomhedsokonomiSubjectHintFromCandidates(subjectCandidates),
+      internationalOkonomiGuidance: hasInternationalOkonomiSubjectHintFromCandidates(subjectCandidates),
+    });
+    const subjectPromptAddendum = sharedSubjectConfig?.promptAddendum
+      ? ["", "Fagligt fokus:", sharedSubjectConfig.promptAddendum].join("\n")
+      : "";
 
     const system = [
       "Du er en dansk censor.",
@@ -377,6 +429,7 @@ export async function POST(req: NextRequest) {
       'Format: {"overall":{"quality_grade":"7","summary":"...","strengths":["..."],"improvements":["..."]},"items":[{"id":"q1","grade":"7","feedback":"..."}]}',
       "items[].feedback skal være 4-8 linjer og indeholde mindst 1 konkret forbedring.",
       "overall.summary skal være 6-10 linjer og opsummere niveau, mangler og hvad der skal til for et højere trin.",
+      subjectPromptAddendum,
     ].join(" ");
 
     const qaBlock = answered
@@ -507,7 +560,11 @@ export async function POST(req: NextRequest) {
       items,
     });
     const sourceType = mode === "oral" ? "oral" : "simulator";
-    const evaluator = resolveEvaluatorDefinition(sourceType);
+    const evaluator = buildExamSubjectEvaluator({
+      sourceType,
+      resolvedSubjectFamily,
+      sharedEvaluatorTaskType: sharedSubjectConfig?.evaluator?.task_type ?? null,
+    });
     const taskCoverage = {
       answered_count: answeredCount,
       expected_count: sg.plannedQuestions,
@@ -535,6 +592,9 @@ export async function POST(req: NextRequest) {
       startedAt: body.startedAt ?? null,
       endedAt: body.endedAt ?? null,
       answeredCount,
+      explicitSubjectFamily,
+      inferredSubjectFamily,
+      resolvedSubjectFamily,
       qualityGrade,
       finalGrade,
       result: out.result,

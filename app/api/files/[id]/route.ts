@@ -186,21 +186,17 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     return NextResponse.json({ ok: false, code: "DB_READ_FAILED", error: "Kunne ikke læse filen." }, { status: 500 });
   }
 
-  if (!rFile.data?.id) {
-    return NextResponse.json({ ok: false, code: "NOT_FOUND", error: "Filen blev ikke fundet." }, { status: 404 });
-  }
-
   try {
     await purgeFileArtifacts(admin, {
       ownerId,
       fileId,
-      storagePath: rFile.data?.storage_path,
-      fileMd5: (rFile.data as any)?.md5,
+      storagePath: rFile.data?.storage_path ?? null,
+      fileMd5: (rFile.data as any)?.md5 ?? null,
     });
   } catch (error) {
     console.error("/api/files/[id] DELETE cleanup fejl", error);
     return NextResponse.json({ ok: false, code: "DB_DELETE_FAILED", error: "Kunne ikke slette filen." }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, file_id: fileId }, { status: 200 });
+  return NextResponse.json({ ok: true, file_id: fileId, already_deleted: !rFile.data?.id }, { status: 200 });
 }

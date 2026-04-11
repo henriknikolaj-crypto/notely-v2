@@ -22,6 +22,7 @@ export type PageClassificationSignals = {
 
 export type PageExtractionMeta = {
   page_type: PageType;
+  ocr_decision: OcrDecision;
   table_blocks: number;
   formula_blocks: number;
   structured_preview: string;
@@ -54,9 +55,17 @@ export type ExtractedPdfDocument = {
     ocr_pages: number;
     dominant_page_type: PageType | null;
     page_type_counts: Record<PageType, number>;
+    total_pages: number;
+    pages_with_good_text: number;
+    ocr_candidate_pages: number;
+    ocr_attempted_pages: number;
+    ocr_succeeded_pages: number;
+    early_exit_triggered: boolean;
+    failure_reason: OcrFailureReason;
     pages: Array<{
       page: number;
       page_type: PageType;
+      ocr_decision: OcrDecision;
       extraction_method: "text" | "ocr";
       extraction_quality: ExtractionQuality;
       text_char_count: number;
@@ -80,6 +89,7 @@ export type PdfExtractionProgress = {
 
 type ExtractOpts = {
   fileName?: string;
+  fileSizeBytes?: number;
   maxPages?: number;
   onProgress?: (event: PdfExtractionProgress) => void | Promise<void>;
 };
@@ -107,8 +117,29 @@ type PdfPageSource = {
   lines: string[];
 };
 
+type OcrDecision = "text_ok" | "low_text_candidate" | "scan_like_candidate" | "hopeless_candidate";
+
+type OcrFailureReason =
+  | "insufficient_readable_text"
+  | "ocr_timeout"
+  | "unreadable_scan_pdf"
+  | "scan_heavy_pdf_rejected"
+  | null;
+
+type OcrDiagnostics = {
+  totalPages: number;
+  pagesWithGoodText: number;
+  ocrCandidatePages: number;
+  ocrAttemptedPages: number;
+  ocrSucceededPages: number;
+  earlyExitTriggered: boolean;
+  failureReason: OcrFailureReason;
+};
+
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
+const SCAN_HEAVY_PREFLIGHT_MIN_BYTES = 10 * 1024 * 1024;
 const OCR_TIMEOUT_MS = (() => {
   const value = Number(process.env.OPENAI_OCR_TIMEOUT_MS ?? 10_000);
   return Number.isFinite(value) && value > 0 ? value : 10_000;
@@ -392,6 +423,111 @@ function summarizeDocumentQuality(pages: ExtractedPdfPage[]): ExtractionQuality 
   return "medium";
 }
 
+function countPagesWithGoodText(pages: ExtractedPdfPage[]) {
+  return pages.filter(
+    (page) =>
+      page.extractionQuality === "high" ||
+      (page.extractionQuality === "medium" &&
+        page.wordCount >= 12 &&
+        page.alphaNumRatio >= 0.45 &&
+        page.brokenTokenRatio <= 0.6),
+  ).length;
+}
+
+function summarizeReadableText(pages: ExtractedPdfPage[]) {
+  return pages.reduce(
+    (acc, page) => {
+      acc.totalChars += page.textCharCount;
+      acc.totalWords += page.wordCount;
+      return acc;
+    },
+    {
+      totalChars: 0,
+      totalWords: 0,
+      pagesWithGoodText: countPagesWithGoodText(pages),
+    },
+  );
+}
+
+function classifyOcrDecision(page: ExtractedPdfPage): OcrDecision {
+  if (
+    page.extractionQuality === "high" ||
+    (page.extractionQuality === "medium" &&
+      page.wordCount >= 12 &&
+      page.alphaNumRatio >= 0.45 &&
+      page.brokenTokenRatio <= 0.6)
+  ) {
+    return "text_ok";
+  }
+
+  const scanLike = page.extractionMeta.page_type === "scan";
+  const veryThinText = page.textCharCount < 18 || page.wordCount < 4;
+  const weakText = page.textCharCount < 60 || page.wordCount < 12;
+  const veryBroken = page.brokenTokenRatio >= 0.82 || page.alphaNumRatio <= 0.22;
+
+  if (scanLike && veryThinText && veryBroken) {
+    return "hopeless_candidate";
+  }
+
+  if (scanLike || page.extractionQuality === "low" || veryThinText) {
+    return "scan_like_candidate";
+  }
+
+  if (weakText) {
+    return "low_text_candidate";
+  }
+
+  return "low_text_candidate";
+}
+
+function shouldEarlyExitAfterOcr(args: {
+  diagnostics: OcrDiagnostics;
+  pages: ExtractedPdfPage[];
+  scanLikeDocument: boolean;
+  initialPagesWithGoodText: number;
+  initialTotalChars: number;
+  initialTotalWords: number;
+}) {
+  const { diagnostics, pages, scanLikeDocument, initialPagesWithGoodText, initialTotalChars, initialTotalWords } = args;
+  if (!scanLikeDocument) return false;
+  if (initialPagesWithGoodText > 0) return false;
+  if (initialTotalChars >= 160 || initialTotalWords >= 32) return false;
+  if (diagnostics.ocrAttemptedPages < Math.min(2, diagnostics.ocrCandidatePages)) return false;
+
+  const current = summarizeReadableText(pages);
+  const noUsefulRecovery =
+    current.pagesWithGoodText === 0 &&
+    current.totalChars < 180 &&
+    current.totalWords < 36 &&
+    diagnostics.ocrSucceededPages === 0;
+
+  return noUsefulRecovery;
+}
+
+function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[]; fileSizeBytes: number }) {
+  const { pages, fileSizeBytes } = args;
+  if (fileSizeBytes < SCAN_HEAVY_PREFLIGHT_MIN_BYTES) return false;
+
+  const previewPages = pages.slice(0, Math.min(SCAN_HEAVY_PREFLIGHT_PAGE_COUNT, pages.length));
+  if (previewPages.length < 3) return false;
+
+  const previewReadable = summarizeReadableText(previewPages);
+  const scanHeavyPreviewPages = previewPages.filter(
+    (page) =>
+      page.extractionMeta.ocr_decision === "scan_like_candidate" ||
+      page.extractionMeta.ocr_decision === "hopeless_candidate",
+  ).length;
+  const hopelessPreviewPages = previewPages.filter((page) => page.extractionMeta.ocr_decision === "hopeless_candidate").length;
+
+  return (
+    previewReadable.pagesWithGoodText === 0 &&
+    previewReadable.totalChars < 220 &&
+    previewReadable.totalWords < 44 &&
+    scanHeavyPreviewPages >= Math.max(2, Math.ceil(previewPages.length * 0.75)) &&
+    hopelessPreviewPages >= Math.max(1, Math.floor(previewPages.length / 2))
+  );
+}
+
 function groupItemsIntoLines(items: PositionedTextItem[]) {
   const sorted = [...items].sort((a, b) => {
     if (Math.abs(b.y - a.y) > 2) return b.y - a.y;
@@ -578,7 +714,7 @@ async function runOpenAIOcrForPage(args: {
   }
 }
 
-function summarizeDocumentMeta(pages: ExtractedPdfPage[]) {
+function summarizeDocumentMeta(pages: ExtractedPdfPage[], diagnostics: OcrDiagnostics) {
   const pageTypeCounts: Record<PageType, number> = {
     text: 0,
     scan: 0,
@@ -607,9 +743,17 @@ function summarizeDocumentMeta(pages: ExtractedPdfPage[]) {
     ocr_pages: pages.filter((p) => p.extractionMethod === "ocr").length,
     dominant_page_type: dominantPageType,
     page_type_counts: pageTypeCounts,
+    total_pages: diagnostics.totalPages,
+    pages_with_good_text: diagnostics.pagesWithGoodText,
+    ocr_candidate_pages: diagnostics.ocrCandidatePages,
+    ocr_attempted_pages: diagnostics.ocrAttemptedPages,
+    ocr_succeeded_pages: diagnostics.ocrSucceededPages,
+    early_exit_triggered: diagnostics.earlyExitTriggered,
+    failure_reason: diagnostics.failureReason,
     pages: pages.map((page) => ({
       page: page.pageNumber,
       page_type: page.extractionMeta.page_type,
+      ocr_decision: page.extractionMeta.ocr_decision,
       extraction_method: page.extractionMethod,
       extraction_quality: page.extractionQuality,
       text_char_count: page.textCharCount,
@@ -630,6 +774,7 @@ export async function extractPdfWithFallback(
 ): Promise<ExtractedPdfDocument> {
   const maxPages = Math.max(1, Math.min(opts.maxPages ?? 500, 2000));
   const fileName = (opts.fileName ?? "document.pdf").trim() || "document.pdf";
+  const fileSizeBytes = Math.max(0, Number(opts.fileSizeBytes ?? buf.length) || 0);
   const raw = await extractPdfPagesViaPdfjs(buf, maxPages);
 
   const pages: ExtractedPdfPage[] = raw.pages.map((pageSource, idx) => {
@@ -669,6 +814,7 @@ export async function extractPdfWithFallback(
       brokenTokenRatio: structuredAnalysis.brokenTokenRatio,
       extractionMeta: {
         ...structuredClassification,
+        ocr_decision: "text_ok",
         table_blocks: structured.tableBlocks,
         formula_blocks: structured.formulaBlocks,
         structured_preview: structuredAnalysis.normalizedText.slice(0, 220),
@@ -677,29 +823,89 @@ export async function extractPdfWithFallback(
   });
 
   const ocrTexts: Array<{ page: number; text: string; engine: string }> = [];
-  const ocrCandidatePages = pages.filter((page) => page.extractionQuality !== "high").length;
+  for (const page of pages) {
+    page.extractionMeta.ocr_decision = classifyOcrDecision(page);
+  }
+
+  const initialReadable = summarizeReadableText(pages);
+  const ocrCandidates = pages.filter(
+    (page) =>
+      page.extractionMeta.ocr_decision === "low_text_candidate" ||
+      page.extractionMeta.ocr_decision === "scan_like_candidate",
+  );
+  const hopelessCandidatePages = pages.filter((page) => page.extractionMeta.ocr_decision === "hopeless_candidate").length;
+  const ocrCandidatePages = ocrCandidates.length;
   const initialScanPages = pages.filter((page) => page.extractionMeta.page_type === "scan").length;
   const scanLikeDocument =
     raw.pageCount > 0 &&
-    (initialScanPages > 0 || ocrCandidatePages >= Math.max(1, Math.ceil(raw.pageCount / 2)));
+    (initialScanPages > 0 || ocrCandidatePages + hopelessCandidatePages >= Math.max(1, Math.ceil(raw.pageCount / 2)));
 
-  if (raw.pageCount > 0 && canRunOcr() && ocrCandidatePages > 0) {
+  const diagnostics: OcrDiagnostics = {
+    totalPages: raw.pageCount,
+    pagesWithGoodText: initialReadable.pagesWithGoodText,
+    ocrCandidatePages,
+    ocrAttemptedPages: 0,
+    ocrSucceededPages: 0,
+    earlyExitTriggered: false,
+    failureReason:
+      raw.pageCount > 0 &&
+      scanLikeDocument &&
+      ocrCandidatePages === 0 &&
+      hopelessCandidatePages > 0 &&
+      initialReadable.pagesWithGoodText === 0
+        ? "unreadable_scan_pdf"
+        : null,
+  };
+  let ocrTimeoutCount = 0;
+
+  if (
+    raw.pageCount > 0 &&
+    scanLikeDocument &&
+    diagnostics.pagesWithGoodText === 0 &&
+    shouldRejectScanHeavyPdfPreflight({ pages, fileSizeBytes })
+  ) {
+    diagnostics.earlyExitTriggered = true;
+    diagnostics.failureReason = "scan_heavy_pdf_rejected";
+  }
+
+  if (raw.pageCount > 0 && !diagnostics.failureReason && canRunOcr() && ocrCandidatePages > 0) {
     await opts.onProgress?.({
       stage: "ocr_started",
       totalPages: raw.pageCount,
       ocrCandidatePages,
       scanLikeDocument,
     });
-    for (const page of pages) {
-      if (page.extractionQuality === "high") continue;
 
-      try {
-        const pagePdfBuffer = await extractSinglePagePdf(buf, page.pageNumber - 1);
-        const ocrText = await runOpenAIOcrForPage({
-          fileName,
-          pageNumber: page.pageNumber,
-          pagePdfBuffer,
-        });
+    for (let index = 0; index < ocrCandidates.length; index += 2) {
+      const batch = ocrCandidates.slice(index, index + 2);
+      const results = await Promise.all(
+        batch.map(async (page) => {
+          try {
+            const pagePdfBuffer = await extractSinglePagePdf(buf, page.pageNumber - 1);
+            const ocrText = await runOpenAIOcrForPage({
+              fileName,
+              pageNumber: page.pageNumber,
+              pagePdfBuffer,
+            });
+            return { page, ocrText, error: null as unknown };
+          } catch (error) {
+            return { page, ocrText: "", error };
+          }
+        }),
+      );
+
+      for (const result of results) {
+        const { page, ocrText, error } = result;
+        diagnostics.ocrAttemptedPages += 1;
+
+        if (error) {
+          const code = String((error as any)?.code ?? "").trim();
+          if (code === "OCR_REQUEST_TIMEOUT") {
+            ocrTimeoutCount += 1;
+          }
+          console.warn(`[pdf/extract] OCR fallback failed for page ${page.pageNumber}:`, error);
+          continue;
+        }
 
         if (!ocrText) continue;
 
@@ -709,6 +915,9 @@ export async function extractPdfWithFallback(
           text: ocrText,
         });
         const ocrAnalysis = analyzeText(ocrStructured.text || ocrText);
+        const ocrLooksReadable =
+          ocrAnalysis.looksUsable ||
+          (ocrAnalysis.quality !== "low" && ocrAnalysis.wordCount >= 12 && ocrAnalysis.alphaNumRatio >= 0.45);
         if (ocrAnalysis.score <= originalAnalysis.score && originalAnalysis.looksUsable) continue;
 
         page.text = ocrAnalysis.normalizedText;
@@ -729,13 +938,41 @@ export async function extractPdfWithFallback(
         });
         page.extractionMeta = {
           ...ocrClassification,
+          ocr_decision: classifyOcrDecision({
+            ...page,
+            extractionMeta: {
+              ...page.extractionMeta,
+              ...ocrClassification,
+            },
+          }),
           table_blocks: ocrStructured.tableBlocks,
           formula_blocks: ocrStructured.formulaBlocks,
           structured_preview: ocrAnalysis.normalizedText.slice(0, 220),
         };
+        if (ocrLooksReadable) {
+          diagnostics.ocrSucceededPages += 1;
+        }
         ocrTexts.push({ page: page.pageNumber, text: page.text, engine: OCR_ENGINE });
-      } catch (error) {
-        console.warn(`[pdf/extract] OCR fallback failed for page ${page.pageNumber}:`, error);
+      }
+
+      diagnostics.pagesWithGoodText = countPagesWithGoodText(pages);
+
+      if (
+        shouldEarlyExitAfterOcr({
+          diagnostics,
+          pages,
+          scanLikeDocument,
+          initialPagesWithGoodText: initialReadable.pagesWithGoodText,
+          initialTotalChars: initialReadable.totalChars,
+          initialTotalWords: initialReadable.totalWords,
+        })
+      ) {
+        diagnostics.earlyExitTriggered = true;
+        diagnostics.failureReason =
+          ocrTimeoutCount >= diagnostics.ocrAttemptedPages && diagnostics.ocrAttemptedPages > 0
+            ? "ocr_timeout"
+            : "unreadable_scan_pdf";
+        break;
       }
     }
 
@@ -745,6 +982,19 @@ export async function extractPdfWithFallback(
       ocrCandidatePages,
       scanLikeDocument,
     });
+  }
+
+  const finalReadable = summarizeReadableText(pages);
+  diagnostics.pagesWithGoodText = finalReadable.pagesWithGoodText;
+  if (
+    !diagnostics.failureReason &&
+    scanLikeDocument &&
+    diagnostics.pagesWithGoodText === 0 &&
+    finalReadable.totalChars < 120 &&
+    finalReadable.totalWords < 24
+  ) {
+    diagnostics.failureReason =
+      ocrTimeoutCount > 0 && diagnostics.ocrSucceededPages === 0 ? "ocr_timeout" : "insufficient_readable_text";
   }
 
   const ocrPages = pages.filter((p) => p.extractionMethod === "ocr").length;
@@ -758,6 +1008,6 @@ export async function extractPdfWithFallback(
     extractionQuality: summarizeDocumentQuality(pages),
     pages,
     ocrTexts,
-    extractionMeta: summarizeDocumentMeta(pages),
+    extractionMeta: summarizeDocumentMeta(pages, diagnostics),
   };
 }

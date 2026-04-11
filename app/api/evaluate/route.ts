@@ -14,15 +14,21 @@ import {
   normalizeWeakPointTargets,
   type FeedbackV2,
 } from "@/lib/learning/feedback";
-import { buildDanskTrainerPromptAddendum, inferDanskTrainerTask } from "@/lib/dansk/evaluator";
-import { buildFysikTrainerPromptAddendum, inferFysikTrainerTask } from "@/lib/fysik/evaluator";
 import { buildHistoryTrainerPromptAddendum, inferHistoryTrainerTask } from "@/lib/history/evaluator";
 import { resolveEvaluatorDefinition } from "@/lib/learning/evaluator-registry";
-import { buildMatematikTrainerPromptAddendum, inferMatematikTrainerTask } from "@/lib/matematik/evaluator";
+import {
+  hasInternationalOkonomiSubjectHint as hasInternationalOkonomiGuidanceHint,
+  hasVirksomhedsokonomiSubjectHint as hasVirksomhedsokonomiGuidanceHint,
+  resolveExplicitTrainerSubjectFamily,
+} from "@/lib/learning/subjects/families";
+import {
+  inferTrainerEvaluateSharedSubjectFamily,
+  resolveTrainerEvaluateSharedSubjectConfig,
+} from "@/lib/learning/subjects/evaluate/registry";
+import type { TrainerSubjectFamily } from "@/lib/learning/subjects/types";
 import { buildOkonomiTrainerPromptAddendum, inferOkonomiTrainerTask } from "@/lib/okonomi/evaluator";
 import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
-import { buildSamfundTrainerPromptAddendum, inferSamfundTrainerTask } from "@/lib/samfund/evaluator";
 import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
 import { scopeKeyFromFolderIds } from "@/lib/trainer/generate-question";
 import { sanitizeTrainerPlainText } from "@/lib/trainer/plain-text";
@@ -131,8 +137,6 @@ type TrainerScoreCalibrationResult = {
   reason: string | null;
 };
 
-type TrainerSubjectFamily = "okonomi" | "samfund" | "dansk" | "history" | "fysik" | "matematik" | "biologi" | "geografi";
-
 type TrainerEvaluatorResolution = {
   evaluator: ReturnType<typeof resolveEvaluatorDefinition>;
   promptAddendum: string;
@@ -204,189 +208,11 @@ function sanitizeTrainerSummary(raw: unknown, fallback = TRAINER_SUMMARY_FALLBAC
   return { text, sanitized, reason };
 }
 
-function normalizeTrainerSubjectText(value: string) {
-  return String(value ?? "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/æ/g, "ae")
-    .replace(/ø/g, "oe")
-    .replace(/å/g, "aa");
-}
-
-function parseTrainerSubjectFamily(value: unknown): TrainerSubjectFamily | null {
-  const normalized = normalizeTrainerSubjectText(String(value ?? "").trim());
-  if (!normalized) return null;
-  if (normalized === "fysik") return "fysik";
-  if (normalized === "matematik") return "matematik";
-  if (normalized === "biologi" || normalized === "biology" || normalized === "bio") return "biologi";
-  if (normalized === "geografi" || normalized === "geography" || normalized === "geo") return "geografi";
-  if (normalized === "dansk") return "dansk";
-  if (normalized === "history" || normalized === "historie") return "history";
-  if (normalized === "samfund" || normalized === "samfundsfag") return "samfund";
-  if (
-    normalized === "okonomi" ||
-    normalized === "virksomhedsokonomi" ||
-    normalized === "virksomhedsoekonomi" ||
-    normalized === "business economics" ||
-    normalized === "businesseconomics" ||
-    normalized === "vo" ||
-    normalized === "international okonomi" ||
-    normalized === "international oekonomi" ||
-    normalized === "international economics" ||
-    normalized === "internationaleconomics" ||
-    normalized === "ioe" ||
-    normalized === "ioek" ||
-    normalized === "iok" ||
-    normalized === "makrookonomi" ||
-    normalized === "mikrookonomi"
-  ) {
-    return "okonomi";
-  }
-  return null;
-}
-
-function getTrainerSubjectFamilyCandidates(body: Partial<EvalRequest>, trainerRoundMeta: unknown): unknown[] {
-  const roundMetaRecord = trainerRoundMeta && typeof trainerRoundMeta === "object" ? (trainerRoundMeta as Record<string, unknown>) : null;
-  const bodyMetaRecord = body.meta && typeof body.meta === "object" ? body.meta : null;
-  const bodyMetadataRecord = body.metadata && typeof body.metadata === "object" ? body.metadata : null;
-  const roundNestedMeta = roundMetaRecord?.meta && typeof roundMetaRecord.meta === "object"
-    ? (roundMetaRecord.meta as Record<string, unknown>)
-    : null;
-  const roundNestedMetadata = roundMetaRecord?.metadata && typeof roundMetaRecord.metadata === "object"
-    ? (roundMetaRecord.metadata as Record<string, unknown>)
-    : null;
-
-  return [
-    body.subjectFamily,
-    body.subject_family,
-    bodyMetaRecord?.subjectFamily,
-    bodyMetaRecord?.subject_family,
-    bodyMetadataRecord?.subjectFamily,
-    bodyMetadataRecord?.subject_family,
-    roundMetaRecord?.subjectFamily,
-    roundMetaRecord?.subject_family,
-    roundNestedMeta?.subjectFamily,
-    roundNestedMeta?.subject_family,
-    roundNestedMetadata?.subjectFamily,
-    roundNestedMetadata?.subject_family,
-  ];
-}
-
-function isVirksomhedsokonomiAlias(value: unknown) {
-  const normalized = normalizeTrainerSubjectText(String(value ?? "").trim()).replace(/\s+/g, " ");
-  return (
-    normalized === "virksomhedsokonomi" ||
-    normalized === "virksomhedsoekonomi" ||
-    normalized === "business economics" ||
-    normalized === "businesseconomics" ||
-    normalized === "vo"
-  );
-}
-
-function hasVirksomhedsokonomiGuidanceHint(body: Partial<EvalRequest>, trainerRoundMeta: unknown) {
-  return getTrainerSubjectFamilyCandidates(body, trainerRoundMeta).some((candidate) => isVirksomhedsokonomiAlias(candidate));
-}
-
-function isInternationalOkonomiAlias(value: unknown) {
-  const normalized = normalizeTrainerSubjectText(String(value ?? "").trim()).replace(/\s+/g, " ");
-  return (
-    normalized === "international okonomi" ||
-    normalized === "international oekonomi" ||
-    normalized === "international economics" ||
-    normalized === "internationaleconomics" ||
-    normalized === "ioe" ||
-    normalized === "ioek" ||
-    normalized === "iok"
-  );
-}
-
-function hasInternationalOkonomiGuidanceHint(body: Partial<EvalRequest>, trainerRoundMeta: unknown) {
-  return getTrainerSubjectFamilyCandidates(body, trainerRoundMeta).some((candidate) => isInternationalOkonomiAlias(candidate));
-}
-
-function buildVirksomhedsokonomiTrainerPromptAddendum() {
-  return [
-    "",
-    "Virksomhedsøkonomi-fokus:",
-    "- Fang når en model nævnes, men ikke faktisk bruges til at analysere casen.",
-    "- Skeln tydeligt mellem redegørelse og analyse: eleven skal bruge teori aktivt på virksomheden eller casen.",
-    "- Hvis tal eller nøgletal bruges, så vurder om de bliver fortolket og ikke kun refereret.",
-    "- Vurder om teori, model og case kobles tydeligt sammen i argumentationen.",
-    "- Vær opmærksom på upræcis begrebsbrug, løs vurdering og konklusioner der ikke samler argumentet.",
-  ].join("\n");
-}
-
-function buildInternationalOkonomiTrainerPromptAddendum() {
-  return [
-    "",
-    "International økonomi-fokus:",
-    "- Fang når teori eller model nævnes, men ikke faktisk bruges til at analysere den konkrete økonomiske situation.",
-    "- Skeln tydeligt mellem redegørelse og analyse af økonomiske sammenhænge og årsag-virkning.",
-    "- Hvis tal, statistik, tabeller eller figurer bruges, så vurder om de bliver fortolket og ikke kun gengivet.",
-    "- Vurder om teori og materiale kobles tydeligt sammen, og om vurdering af økonomisk politik eller udvikling er fagligt begrundet.",
-    "- Vær opmærksom på upræcis begrebsbrug og konklusioner der ikke samler argumentet klart.",
-  ].join("\n");
-}
-
-const BIOLOGI_CONTEXT_RE =
-  /\b(biologi|biology|bio|celle|celler|cellebiologi|fysiologi|genetik|dna|rna|protein|enzym|respiration|fotosyntese|evolution|oekologi|økologi|population|naturlig selektion|mutation|mitose|meiose|forsoeg|forsøg|kontrolgruppe|figur|tabel|graf|data)\b/i;
-
-function inferBiologiTrainerTask(question: string) {
-  return BIOLOGI_CONTEXT_RE.test(normalizeTrainerSubjectText(question)) ? "biologi_forklar_analyser_fortolk" : null;
-}
-
-function buildBiologiTrainerPromptAddendum() {
-  return [
-    "",
-    "Biologi-fokus:",
-    "- Fang når biologiske begreber nævnes uden præcis forklaring eller bruges upræcist.",
-    "- Skeln tydeligt mellem redegørelse og egentlig forklaring/analyse af biologiske mekanismer og processer.",
-    "- Hvis data, figurer, tabeller eller forsøgsresultater indgår, så vurder om de bliver fortolket og brugt som belæg.",
-    "- Vurder om teori kobles tydeligt til bilag, case eller forsøgsresultater, og om årsag-virkning forklares biologisk klart.",
-    "- Vær opmærksom på konklusioner der ikke udspringer tydeligt af analysen eller data.",
-  ].join("\n");
-}
-
-const GEOGRAFI_CONTEXT_RE =
-  /\b(geografi|geography|geo|klima|nedboer|nedbør|temperatur|vejr|vejrsystem|vandkredslob|vandkredsløb|erosion|forvitring|pladetektonik|vulkan|jordskelv|urbanisering|befolkning|migration|globalisering|erhverv|regional udvikling|kort|kortbilag|figur|graf|tabel|data|diagram|naturgeografi|samfundsgeografi)\b/i;
-
-function inferGeografiTrainerTask(question: string) {
-  return GEOGRAFI_CONTEXT_RE.test(normalizeTrainerSubjectText(question)) ? "geografi_forklar_analyser_fortolk" : null;
-}
-
-function buildGeografiTrainerPromptAddendum() {
-  return [
-    "",
-    "Geografi-fokus:",
-    "- Fang når geografiske begreber eller modeller nævnes uden faktisk anvendelse på case eller materiale.",
-    "- Skeln tydeligt mellem redegørelse og analyse/forklaring af geografiske processer og sammenhænge.",
-    "- Hvis kort, figurer, grafer, tabeller eller data indgår, så vurder om de bliver fortolket og brugt som belæg.",
-    "- Vurder om naturgeografiske og samfundsgeografiske forhold kobles tydeligt sammen, når opgaven kræver det.",
-    "- Vær opmærksom på uklare årsagskæder, generiske vurderinger og konklusioner der ikke samler argumentet klart.",
-  ].join("\n");
-}
-
-function resolveExplicitTrainerSubjectFamily(body: Partial<EvalRequest>, trainerRoundMeta: unknown): TrainerSubjectFamily | null {
-  const candidates = getTrainerSubjectFamilyCandidates(body, trainerRoundMeta);
-
-  for (const candidate of candidates) {
-    const parsed = parseTrainerSubjectFamily(candidate);
-    if (parsed) return parsed;
-  }
-
-  return null;
-}
-
 function inferTrainerSubjectFamilyFromQuestion(question: string): TrainerSubjectFamily | null {
   if (inferOkonomiTrainerTask(question)) return "okonomi";
-  if (inferSamfundTrainerTask(question)) return "samfund";
-  if (inferDanskTrainerTask(question)) return "dansk";
   if (inferHistoryTrainerTask(question)) return "history";
-  if (inferFysikTrainerTask(question)) return "fysik";
-  if (inferMatematikTrainerTask(question)) return "matematik";
-  if (inferBiologiTrainerTask(question)) return "biologi";
-  if (inferGeografiTrainerTask(question)) return "geografi";
+  const sharedSubjectFamily = inferTrainerEvaluateSharedSubjectFamily(question);
+  if (sharedSubjectFamily) return sharedSubjectFamily;
   return null;
 }
 
@@ -400,52 +226,24 @@ function resolveTrainerEvaluator(
   // Folder/scope names are intentionally not authoritative here because they often describe topic/forloeb, not subject.
   const inferredSubjectFamily = inferTrainerSubjectFamilyFromQuestion(question);
   const resolvedSubjectFamily = explicitSubjectFamily ?? inferredSubjectFamily;
+  const sharedSubjectConfig = resolveTrainerEvaluateSharedSubjectConfig({
+    question,
+    resolvedSubjectFamily,
+    virksomhedsokonomiGuidance,
+    internationalOkonomiGuidance,
+  });
 
   if (resolvedSubjectFamily === "okonomi") {
     const okonomiTaskType = inferOkonomiTrainerTask(question) ?? "okonomi_forklar_sammenhaeng";
-    const virksomhedsokonomiAddendum = virksomhedsokonomiGuidance ? buildVirksomhedsokonomiTrainerPromptAddendum() : "";
-    const internationalOkonomiAddendum = internationalOkonomiGuidance ? buildInternationalOkonomiTrainerPromptAddendum() : "";
     return {
       evaluator: resolveEvaluatorDefinition("trainer", {
         subject_family: "okonomi",
         task_type: okonomiTaskType,
         assessment_mode: "trainer",
       }),
-      promptAddendum: [
-        buildOkonomiTrainerPromptAddendum(okonomiTaskType),
-        virksomhedsokonomiAddendum,
-        internationalOkonomiAddendum,
-      ].filter(Boolean).join("\n"),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily,
-    };
-  }
-
-  if (resolvedSubjectFamily === "samfund") {
-    const samfundTaskType = inferSamfundTrainerTask(question) ?? "samfund_redegoer_analyser";
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "samfund",
-        task_type: samfundTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildSamfundTrainerPromptAddendum(samfundTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily,
-    };
-  }
-
-  if (resolvedSubjectFamily === "dansk") {
-    const danskTaskType = inferDanskTrainerTask(question) ?? "dansk_fortolk_tekst";
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "dansk",
-        task_type: danskTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildDanskTrainerPromptAddendum(danskTaskType),
+      promptAddendum: [buildOkonomiTrainerPromptAddendum(okonomiTaskType), sharedSubjectConfig?.promptAddendum]
+        .filter(Boolean)
+        .join("\n"),
       explicitSubjectFamily: explicitSubjectFamily ?? null,
       inferredSubjectFamily,
       resolvedSubjectFamily,
@@ -467,64 +265,20 @@ function resolveTrainerEvaluator(
     };
   }
 
-  if (resolvedSubjectFamily === "fysik") {
-    const fysikTaskType = inferFysikTrainerTask(question) ?? "fysik_beregn_og_forklar";
+  if (
+    (
+      resolvedSubjectFamily === "samfund" ||
+      resolvedSubjectFamily === "dansk" ||
+      resolvedSubjectFamily === "fysik" ||
+      resolvedSubjectFamily === "matematik" ||
+      resolvedSubjectFamily === "biologi" ||
+      resolvedSubjectFamily === "geografi"
+    ) &&
+    sharedSubjectConfig?.evaluator
+  ) {
     return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "fysik",
-        task_type: fysikTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildFysikTrainerPromptAddendum(fysikTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily,
-    };
-  }
-
-  if (resolvedSubjectFamily === "matematik") {
-    const matematikTaskType = inferMatematikTrainerTask(question) ?? "matematik_beregn_og_vis_metode";
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "matematik",
-        task_type: matematikTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildMatematikTrainerPromptAddendum(matematikTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily,
-    };
-  }
-
-  if (resolvedSubjectFamily === "biologi") {
-    return {
-      evaluator: {
-        id: "trainer.biologi.trainer.biologi_forklar_analyser_fortolk.v1",
-        source_type: "trainer",
-        subject_family: "biologi",
-        task_type: "biologi_forklar_analyser_fortolk",
-        assessment_mode: "trainer",
-        label: "Biologi: forklar, analyser og fortolk",
-      },
-      promptAddendum: buildBiologiTrainerPromptAddendum(),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily,
-    };
-  }
-
-  if (resolvedSubjectFamily === "geografi") {
-    return {
-      evaluator: {
-        id: "trainer.geografi.trainer.geografi_forklar_analyser_fortolk.v1",
-        source_type: "trainer",
-        subject_family: "geografi",
-        task_type: "geografi_forklar_analyser_fortolk",
-        assessment_mode: "trainer",
-        label: "Geografi: forklar, analyser og fortolk",
-      },
-      promptAddendum: buildGeografiTrainerPromptAddendum(),
+      evaluator: sharedSubjectConfig.evaluator,
+      promptAddendum: sharedSubjectConfig.promptAddendum,
       explicitSubjectFamily: explicitSubjectFamily ?? null,
       inferredSubjectFamily,
       resolvedSubjectFamily,
@@ -546,36 +300,6 @@ function resolveTrainerEvaluator(
     };
   }
 
-  const samfundTaskType = inferSamfundTrainerTask(question);
-  if (samfundTaskType) {
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "samfund",
-        task_type: samfundTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildSamfundTrainerPromptAddendum(samfundTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "samfund",
-    };
-  }
-
-  const danskTaskType = inferDanskTrainerTask(question);
-  if (danskTaskType) {
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "dansk",
-        task_type: danskTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildDanskTrainerPromptAddendum(danskTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "dansk",
-    };
-  }
-
   const historyTaskType = inferHistoryTrainerTask(question);
   if (historyTaskType) {
     return {
@@ -588,70 +312,6 @@ function resolveTrainerEvaluator(
       explicitSubjectFamily: explicitSubjectFamily ?? null,
       inferredSubjectFamily,
       resolvedSubjectFamily: "history",
-    };
-  }
-
-  const fysikTaskType = inferFysikTrainerTask(question);
-  if (fysikTaskType) {
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "fysik",
-        task_type: fysikTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildFysikTrainerPromptAddendum(fysikTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "fysik",
-    };
-  }
-
-  const matematikTaskType = inferMatematikTrainerTask(question);
-  if (matematikTaskType) {
-    return {
-      evaluator: resolveEvaluatorDefinition("trainer", {
-        subject_family: "matematik",
-        task_type: matematikTaskType,
-        assessment_mode: "trainer",
-      }),
-      promptAddendum: buildMatematikTrainerPromptAddendum(matematikTaskType),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "matematik",
-    };
-  }
-
-  if (inferBiologiTrainerTask(question)) {
-    return {
-      evaluator: {
-        id: "trainer.biologi.trainer.biologi_forklar_analyser_fortolk.v1",
-        source_type: "trainer",
-        subject_family: "biologi",
-        task_type: "biologi_forklar_analyser_fortolk",
-        assessment_mode: "trainer",
-        label: "Biologi: forklar, analyser og fortolk",
-      },
-      promptAddendum: buildBiologiTrainerPromptAddendum(),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "biologi",
-    };
-  }
-
-  if (inferGeografiTrainerTask(question)) {
-    return {
-      evaluator: {
-        id: "trainer.geografi.trainer.geografi_forklar_analyser_fortolk.v1",
-        source_type: "trainer",
-        subject_family: "geografi",
-        task_type: "geografi_forklar_analyser_fortolk",
-        assessment_mode: "trainer",
-        label: "Geografi: forklar, analyser og fortolk",
-      },
-      promptAddendum: buildGeografiTrainerPromptAddendum(),
-      explicitSubjectFamily: explicitSubjectFamily ?? null,
-      inferredSubjectFamily,
-      resolvedSubjectFamily: "geografi",
     };
   }
 

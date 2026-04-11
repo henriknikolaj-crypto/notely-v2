@@ -12,6 +12,11 @@ import { resolveModelForFeature } from "@/lib/openai/model";
 import { rankChunksForPrompt } from "@/lib/retrieval/structureAware";
 import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
 import { parseQuestionListOutput, type QuestionOutputDiagnostics } from "@/lib/learning/question-output";
+import { resolveTrainerSubjectFamilyFromCandidates } from "@/lib/learning/subjects/families";
+import {
+  inferTrainerGenerateSharedSubjectFamily,
+  resolveTrainerGenerateSharedSubjectConfig,
+} from "@/lib/learning/subjects/generate/registry";
 import { ensureProfile } from "@/lib/server/ensureProfile";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import {
@@ -433,6 +438,15 @@ export async function POST(req: NextRequest) {
 
     const model = resolveModelForFeature("simulator");
     const promptTopic = pickedFiles.map((file) => fileTitle(file)).join(" | ");
+    const sharedSubjectCandidates = [promptTopic, ...pickedFiles.map((file) => fileTitle(file))];
+    const resolvedSharedSubjectFamily =
+      resolveTrainerSubjectFamilyFromCandidates(sharedSubjectCandidates) ??
+      inferTrainerGenerateSharedSubjectFamily(`${promptTopic}\n${baseContextText}`);
+    const sharedGenerateSubjectConfig = resolveTrainerGenerateSharedSubjectConfig({
+      resolvedSubjectFamily: resolvedSharedSubjectFamily,
+      candidates: sharedSubjectCandidates,
+    });
+    const sharedGeneratePromptBlock = sharedGenerateSubjectConfig?.promptAddendum ?? "";
 
     const avoidBlock =
       avoidQuestions.length > 0
@@ -449,6 +463,7 @@ KRAV:
 - Ingen multiple choice.
 - Ingen forklaringer udenfor JSON.
 - Output SKAL være JSON og kun JSON.
+${sharedGeneratePromptBlock}
 
 FORMAT:
 {"questions":[{"id":"q1","prompt":"..."},{"id":"q2","prompt":"..."}, ...]}
@@ -511,6 +526,7 @@ FORMAT:
       const strategyUserPrompt = [
         `Antal spørgsmål: ${count}`,
         `Sværhedsgrad: ${difficulty}`,
+        `Fag/tema: ${promptTopic}`,
         strategyFocusBiasBlock,
         avoidBlock.trim(),
         "",

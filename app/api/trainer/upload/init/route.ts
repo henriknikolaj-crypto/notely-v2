@@ -10,7 +10,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const UPLOAD_BUCKET = process.env.SUPABASE_UPLOAD_BUCKET || "trainer_uploads";
-const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 function stripPathy(name: string) {
   const n = String(name ?? "").trim();
@@ -111,7 +111,7 @@ export async function POST(req: NextRequest) {
         {
           ok: false,
           code: "FILE_TOO_LARGE",
-          error: "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer.",
+          error: "Filen er større end 25 MB. Prøv at komprimere PDF’en eller del den i to filer.",
           requestId,
         },
         { status: 413 },

@@ -1,5 +1,11 @@
 import "server-only";
 
+import { resolveTrainerSubjectFamilyFromCandidates } from "@/lib/learning/subjects/families";
+import {
+  inferTrainerGenerateSharedSubjectFamily,
+  resolveTrainerGenerateSharedSubjectConfig,
+} from "@/lib/learning/subjects/generate/registry";
+import type { TrainerSubjectFamily } from "@/lib/learning/subjects/types";
 import { deriveFocusTargetsFromLearningSignals, type LearningFocusSessionRow } from "@/lib/learning/focus";
 
 export type Difficulty = "easy" | "medium" | "hard";
@@ -32,7 +38,7 @@ export type WeakPointTarget = {
 
 export type InferredQuestionDifficulty = "easy" | "medium" | "advanced";
 export type QuestionCalibrationTarget = "simpler_than_source" | "match_source" | "slightly_simplified";
-export type QuestionSubjectFamily = "generic" | "okonomi" | "samfund" | "dansk" | "matematik" | "fysik";
+export type QuestionSubjectFamily = "generic" | TrainerSubjectFamily;
 
 export type QuestionCalibrationProfile = {
   subjectFamily: QuestionSubjectFamily;
@@ -136,11 +142,6 @@ const OKONOMI_TECHNICAL_SOURCE_RE =
   /(?:\bregress(?:ion|ionsmodel|ionsanalyse)\b|\bkoefficient(?:er)?\b|\bsignifik(?:ant|ans|ansniveau)\b|\bbeta\d*\b|β\d*|Δ|delta\b|\bdummy-?variabel\b|\bforecast\b|\blag\b|\bp-vaerdi\b|\bp-værdi\b|\bstandardfejl\b|\bboks\s*\d+\b|\bmodel\s*\d+\b)/i;
 const OKONOMI_TECHNICAL_OUTPUT_RE =
   /(?:β\d*|Δ|\bkoefficient(?:er)?\b|\bsignifik(?:ant|ans|ansniveau)\b|\bregress(?:ion|ionsmodel|ionsanalyse)\b|\bdummy-?variabel\b|\bforecast\b|\blag\b|\bp-vaerdi\b|\bp-værdi\b|\bstandardfejl\b)/i;
-const SAMFUND_TOPIC_RE = /\b(samfund|samfundsfag|politik|politiske|velfaerd|velfærd|offentlige finanser|solidaritet|individuelt ansvar)\b/i;
-const DANSK_TOPIC_RE = /\b(dansk|novelle|digt|lyrik|fortolk|virkemiddel|tekstbel(aeg|æg)|motiv|symbolik)\b/i;
-const MATEMATIK_TOPIC_RE = /\b(matematik|funktion|graf|integral|vektor|parabel|sandsynlighed|ligning)\b/i;
-const FYSIK_TOPIC_RE =
-  /\b(fysik|kraft|energi|acceleration|spænding|strom|strøm|bølge|frekvens|effekt|bevægelse|hydrofon|lydhastighed|lydsignal|tryk|temperatur)\b/i;
 const ADVANCED_MATEMATIK_SOURCE_RE = /\b(integral|differentialligning|vektorfunktion|parameterfremstilling|bevis|udled)\b/i;
 const ADVANCED_FYSIK_SOURCE_RE = /\b(vektorfelt|induktion|resonans|interferens|energitab|feltsstyrke)\b/i;
 const ADVANCED_SAMFUND_SOURCE_RE = /\b(diskurs|metode|komparativ|institutionel|strukturforklaring|aktorteori)\b/i;
@@ -1287,12 +1288,10 @@ function normalizeTopicAndContext(topic: string, contextText: string) {
 }
 
 function inferQuestionSubjectFamilyFromText(value: string): QuestionSubjectFamily {
-  const joined = String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  if (OKONOMI_TOPIC_RE.test(joined) || OKONOMI_CONTEXT_RE.test(joined)) return "okonomi";
-  if (SAMFUND_TOPIC_RE.test(joined)) return "samfund";
-  if (DANSK_TOPIC_RE.test(joined)) return "dansk";
-  if (FYSIK_TOPIC_RE.test(joined)) return "fysik";
-  if (MATEMATIK_TOPIC_RE.test(joined)) return "matematik";
+  const parsed = resolveTrainerSubjectFamilyFromCandidates([value]);
+  if (parsed) return parsed;
+  const inferred = inferTrainerGenerateSharedSubjectFamily(String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, ""));
+  if (inferred) return inferred;
   return "generic";
 }
 
@@ -1680,6 +1679,12 @@ export function buildGenerateQuestionPrompts(args: {
   const { topic, explicitSubjectFamily, difficulty, effectiveFocusMode, focusTargets, avoidQuestions, usedFileTitle, contextText } = args;
   const okonomiProfile = inferOkonomiQuestionLanguageProfile(topic, contextText);
   const calibrationProfile = inferQuestionCalibrationProfile(topic, contextText, explicitSubjectFamily);
+  const subjectResolution = resolveQuestionSubjectFamily(topic, contextText, explicitSubjectFamily);
+  const sharedGenerateSubjectConfig = resolveTrainerGenerateSharedSubjectConfig({
+    resolvedSubjectFamily:
+      subjectResolution.resolvedSubjectFamily === "generic" ? null : subjectResolution.resolvedSubjectFamily,
+    candidates: [explicitSubjectFamily, topic],
+  });
 
   const avoidBlock =
     avoidQuestions.length > 0
@@ -1697,6 +1702,7 @@ export function buildGenerateQuestionPrompts(args: {
   const biasApplied = effectiveFocusMode === "weakest" && focusTargets.length > 0;
   const okonomiPlainLanguageBlock = buildOkonomiPlainLanguagePromptBlock(okonomiProfile);
   const calibrationPromptBlock = buildQuestionCalibrationPromptBlock(calibrationProfile);
+  const sharedGeneratePromptBlock = sharedGenerateSubjectConfig?.promptAddendum ?? "";
   const quantitativePromptBlock = buildQuantitativePromptBlock(
     inferQuantitativeQuestionProfile(topic, contextText, explicitSubjectFamily),
   );
@@ -1719,6 +1725,7 @@ VIGTIGT:
 		- Hvis materialet er kort eller repetitivt, skal du skabe variation gennem vinkel, framing og spørgsmålstype, ikke ved at opfinde nyt indhold.
 		- Du må ikke opfinde teorier, kilder, cases eller fakta, som ikke er understøttet af materialet.
 ${okonomiPlainLanguageBlock}
+${sharedGeneratePromptBlock}
 ${calibrationPromptBlock}
 ${quantitativePromptBlock}
 

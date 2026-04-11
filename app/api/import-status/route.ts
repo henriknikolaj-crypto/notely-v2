@@ -7,6 +7,7 @@ import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import {
   normalizeImportJobRow,
+  pickBestImportJob,
   resolveMaterialReadiness,
 } from "@/lib/trainer/materialReadiness";
 
@@ -44,6 +45,23 @@ function formatDa(iso: string) {
 function isAuthRateLimited(error: any) {
   const message = String(error?.message ?? error ?? "").toLowerCase();
   return error?.status === 429 || message.includes("over_request_rate_limit") || message.includes("rate limit");
+}
+
+function toActiveJobResponse(job: ReturnType<typeof normalizeImportJobRow>) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    status: String(job.status ?? "unknown"),
+    stage: job.stage,
+    error: job.error,
+    requestId: job.requestId,
+    fileId: job.fileId,
+    folderId: job.folderId,
+    uploadKind: job.uploadKind,
+    queuedAt: job.queuedAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+  };
 }
 
 export async function GET(req: NextRequest) {
@@ -234,91 +252,39 @@ export async function GET(req: NextRequest) {
       if (jobIdParam && isUuidLike(jobIdParam)) {
         const jobRes = await admin
           .from("jobs")
-          .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at")
+          .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at,created_at,updated_at")
           .eq("owner_id", ownerId)
           .eq("id", jobIdParam)
           .maybeSingle();
-        if (!jobRes.error && jobRes.data) jobRow = jobRes.data;
+        if (!jobRes.error && jobRes.data) jobRow = normalizeImportJobRow(jobRes.data);
       } else if (uploadRequestIdParam) {
         const jobsRes = await admin
           .from("jobs")
-          .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at")
+          .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at,created_at,updated_at")
           .eq("owner_id", ownerId)
           .eq("kind", "import")
-          .order("queued_at", { ascending: false, nullsFirst: false })
+          .order("updated_at", { ascending: false, nullsFirst: false })
           .limit(100);
 
         if (!jobsRes.error && Array.isArray(jobsRes.data)) {
-          candidateMatches = jobsRes.data.map((row: any) => ({
-            id: String(row?.id ?? ""),
-            status: row?.status != null ? String(row.status) : null,
-            payloadRequestId: row?.payload?.request_id ? String(row.payload.request_id) : null,
-            metaRequestId: row?.meta?.request_id ? String(row.meta.request_id) : null,
+          const matchingJobs = jobsRes.data
+            .map((row: any) => normalizeImportJobRow(row))
+            .filter((job) => {
+              if (!job) return false;
+              return job.requestId === uploadRequestIdParam;
+            });
+
+          candidateMatches = matchingJobs.map((job) => ({
+            id: job.id,
+            status: job.status,
+            payloadRequestId: job.requestId,
+            metaRequestId: job.requestId,
           }));
-          jobRow =
-            jobsRes.data.find((row: any) => {
-              const payloadRequestId = String(row?.payload?.request_id ?? "").trim();
-              const metaRequestId = String(row?.meta?.request_id ?? "").trim();
-              const resultRequestId = String(row?.result?.requestId ?? "").trim();
-              return (
-                payloadRequestId === uploadRequestIdParam ||
-                metaRequestId === uploadRequestIdParam ||
-                resultRequestId === uploadRequestIdParam
-              );
-            }) ?? null;
+          jobRow = pickBestImportJob(matchingJobs);
         }
       }
 
-      if (jobRow) {
-        activeJob = {
-          id: String(jobRow.id),
-          status: String(jobRow.status ?? "unknown"),
-          stage: jobRow?.payload?.stage ? String(jobRow.payload.stage) : jobRow?.meta?.stage ? String(jobRow.meta.stage) : null,
-          error:
-            typeof jobRow?.error?.message === "string"
-              ? jobRow.error.message
-              : typeof jobRow?.error === "string"
-                ? jobRow.error
-                : null,
-          requestId:
-            jobRow?.payload?.request_id
-              ? String(jobRow.payload.request_id)
-              : jobRow?.meta?.request_id
-                ? String(jobRow.meta.request_id)
-                : jobRow?.result?.requestId
-                  ? String(jobRow.result.requestId)
-                  : null,
-          fileId:
-            jobRow?.result?.fileId != null
-              ? String(jobRow.result.fileId)
-              : jobRow?.payload?.file_id != null
-                ? String(jobRow.payload.file_id)
-                : jobRow?.meta?.file_id != null
-                  ? String(jobRow.meta.file_id)
-                : null,
-          folderId:
-            jobRow?.result?.folderId != null
-              ? String(jobRow.result.folderId)
-              : jobRow?.payload?.folder_id != null
-                ? String(jobRow.payload.folder_id)
-                : jobRow?.meta?.folder_id != null
-                  ? String(jobRow.meta.folder_id)
-                : null,
-          uploadKind:
-            jobRow?.result?.uploadKind != null
-              ? String(jobRow.result.uploadKind)
-              : jobRow?.payload?.upload_kind != null
-                ? String(jobRow.payload.upload_kind)
-                : jobRow?.meta?.upload_kind != null
-                  ? String(jobRow.meta.upload_kind)
-                : jobRow?.payload?.input_kind != null
-                  ? String(jobRow.payload.input_kind)
-                  : null,
-          queuedAt: jobRow?.queued_at ? String(jobRow.queued_at) : null,
-          startedAt: jobRow?.started_at ? String(jobRow.started_at) : null,
-          finishedAt: jobRow?.finished_at ? String(jobRow.finished_at) : null,
-        };
-      }
+      activeJob = toActiveJobResponse(jobRow);
 
       console.info("[import-status] lookup", {
         requestId,
@@ -368,11 +334,11 @@ export async function GET(req: NextRequest) {
             .limit(4000),
           admin
             .from("jobs")
-            .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at")
+            .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at,created_at,updated_at")
             .eq("owner_id", ownerId)
             .eq("kind", "import")
-            .order("queued_at", { ascending: false, nullsFirst: false })
-            .limit(200),
+            .order("updated_at", { ascending: false, nullsFirst: false })
+            .limit(300),
         ]);
 
         const chunkCountByFileId = new Map<string, number>();
@@ -384,22 +350,25 @@ export async function GET(req: NextRequest) {
           }
         }
 
-        const latestJobByFileId = new Map<string, ReturnType<typeof normalizeImportJobRow>>();
+        const jobsByFileId = new Map<string, Array<ReturnType<typeof normalizeImportJobRow>>>();
         if (Array.isArray(jobsRes.data)) {
           for (const row of jobsRes.data as any[]) {
             const normalized = normalizeImportJobRow(row);
             const fileId = normalized?.fileId ?? null;
-            if (!normalized || !fileId || latestJobByFileId.has(fileId)) continue;
-            latestJobByFileId.set(fileId, normalized);
+            if (!normalized || !fileId) continue;
+            const group = jobsByFileId.get(fileId) ?? [];
+            group.push(normalized);
+            jobsByFileId.set(fileId, group);
           }
         }
 
         folderFiles = fileRows.map((row: any) => {
           const fileId = String(row?.id ?? "").trim();
           const chunkCount = chunkCountByFileId.get(fileId) ?? 0;
+          const bestJob = pickBestImportJob(jobsByFileId.get(fileId) ?? []);
           const readiness = resolveMaterialReadiness({
             chunkCount,
-            latestJob: (latestJobByFileId.get(fileId) as any) ?? null,
+            latestJob: bestJob,
           });
           return {
             id: fileId,

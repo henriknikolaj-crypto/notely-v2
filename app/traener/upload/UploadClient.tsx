@@ -31,6 +31,25 @@ type FileReadiness = {
   jobStage: string | null;
 };
 
+type UserFileStatusKind = "uploaded" | "preparing" | "ready" | "failed";
+
+type LocalFileStatus = {
+  fileId: string;
+  fileName: string;
+  folderId: string;
+  sizeBytes: number | null;
+  uploadedAt: string | null;
+  status: UserFileStatusKind;
+  error: string | null;
+  updatedAt: number;
+};
+
+type UserFileStatus = {
+  kind: UserFileStatusKind;
+  label: string;
+  detail: string | null;
+};
+
 type UploadResult = {
   kind: "pdf" | "audio";
   fileName: string;
@@ -77,19 +96,38 @@ type Props = {
   onFoldersChange?: (folders: Folder[]) => void;
 };
 
-const MAX_FILE_BYTES = 50 * 1024 * 1024;
-const PDF_TOO_LARGE_ERROR = "Filen er større end 50 MB. Prøv at komprimere PDF’en eller del den i to filer.";
-const PDF_TOO_MANY_PAGES_ERROR = "PDF’en har for mange sider til din plan.";
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const PDF_TOO_LARGE_ERROR = "Filen er større end 25 MB. Prøv at komprimere PDF’en eller del den i to filer.";
+const PDF_TOO_MANY_PAGES_ERROR =
+  "PDF’en har for mange sider til hurtig og sikker behandling. Del den op i mindre filer på højst 100 sider.";
 const MONTHLY_IMPORT_QUOTA_ERROR = "Du har nået din månedlige importkvote.";
 const WEBUPLOAD_PAYLOAD_TOO_LARGE_ERROR =
   "Filen er for stor til at blive sendt gennem webupload lige nu. Prøv en mindre fil eller komprimer PDF’en.";
+const UPLOAD_STATUS_POLL_INITIAL_MS = 2_000;
 const UPLOAD_STATUS_POLL_MS = 5_000;
+const UPLOAD_STATUS_POLL_SLOW_MS = 10_000;
 const UPLOAD_STATUS_BACKOFF_MS = 15_000;
 const UPLOAD_JOB_BOOT_TIMEOUT_MS = 45_000;
 const DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
 const PDF_UPLOAD_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 const ACTIVE_UPLOAD_REFRESH_MS = 15_000;
 const UPLOAD_READY_FOLLOWUP_REFRESH_MS = 1_500;
+const PREPARING_STATUS_TOKENS = new Set([
+  "preparing",
+  "processing",
+  "queued",
+  "ocr_started",
+  "ocr_finished",
+  "processing_started",
+  "pdf_extract_started",
+  "pdf_extract_finished",
+  "chunk_build_started",
+  "chunk_build_finished",
+  "payload_stage",
+  "file_buffered",
+  "storage_upload_finished",
+]);
+const READY_STATUS_TOKENS = new Set(["ready", "succeeded", "finished", "completed"]);
 
 function createClientRequestId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -227,6 +265,129 @@ function buildReadinessMap(rows: FileReadiness[]) {
   }, {});
 }
 
+function normalizeStatusToken(value: string | null | undefined) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function buildUserFileStatus(kind: UserFileStatusKind, error?: string | null): UserFileStatus {
+  if (kind === "uploaded") {
+    return { kind, label: "Uploadet", detail: null };
+  }
+  if (kind === "preparing") {
+    return { kind, label: "Klargøres", detail: null };
+  }
+  if (kind === "ready") {
+    return { kind, label: "Klar", detail: null };
+  }
+  return { kind, label: "Fejl", detail: error ?? "Klargøring fejlede" };
+}
+
+function statusPriority(kind: UserFileStatusKind) {
+  if (kind === "uploaded") return 1;
+  if (kind === "preparing") return 2;
+  if (kind === "ready") return 3;
+  return 0;
+}
+
+function mergeLocalFileStatus(current: LocalFileStatus | null, next: LocalFileStatus) {
+  if (!current) return next;
+  if (next.status === "ready") return { ...current, ...next };
+  if (current.status === "ready") return current;
+  if (next.status === "failed") return { ...current, ...next };
+  if (current.status === "failed") return current;
+  if (statusPriority(next.status) >= statusPriority(current.status)) {
+    return { ...current, ...next };
+  }
+  return {
+    ...current,
+    ...next,
+    status: current.status,
+    error: current.error,
+    updatedAt: current.updatedAt,
+  };
+}
+
+function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStatus | null {
+  if (!readiness) return null;
+
+  const jobStatus = normalizeStatusToken(readiness.jobStatus);
+  const jobStage = normalizeStatusToken(readiness.jobStage);
+
+  if (readiness.readiness === "failed" || jobStatus === "failed" || jobStage === "failed") {
+    return buildUserFileStatus("failed", readiness.readinessDetail);
+  }
+
+  if (
+    readiness.ready ||
+    readiness.readiness === "ready" ||
+    READY_STATUS_TOKENS.has(jobStatus) ||
+    READY_STATUS_TOKENS.has(jobStage)
+  ) {
+    return buildUserFileStatus("ready");
+  }
+
+  if (
+    readiness.readiness === "processing" ||
+    PREPARING_STATUS_TOKENS.has(jobStatus) ||
+    PREPARING_STATUS_TOKENS.has(jobStage)
+  ) {
+    return buildUserFileStatus("preparing");
+  }
+
+  return buildUserFileStatus("preparing");
+}
+
+function pickDisplayStatus(localStatus: UserFileStatus | null, serverStatus: UserFileStatus | null) {
+  if (!localStatus) return serverStatus;
+  if (!serverStatus) return localStatus;
+  if (serverStatus.kind === "ready" || localStatus.kind === "ready") {
+    return serverStatus.kind === "ready" ? serverStatus : localStatus;
+  }
+  if (serverStatus.kind === "failed" || localStatus.kind === "failed") {
+    return serverStatus.kind === "failed" ? serverStatus : localStatus;
+  }
+  return statusPriority(localStatus.kind) >= statusPriority(serverStatus.kind) ? localStatus : serverStatus;
+}
+
+function omitSuppressedFiles(rows: FileRow[], suppressedFileIds: Record<string, true>) {
+  const suppressedIds = Object.keys(suppressedFileIds);
+  if (suppressedIds.length === 0) return rows;
+  return rows.filter((row) => !suppressedFileIds[row.id]);
+}
+
+function mergeVisibleFileRows(
+  serverRows: FileRow[],
+  folderId: string | null,
+  localStatusesById: Record<string, LocalFileStatus>,
+  suppressedFileIds: Record<string, true>,
+) {
+  const visibleServerRows = omitSuppressedFiles(serverRows, suppressedFileIds);
+  const merged = [...visibleServerRows];
+  const seen = new Set(visibleServerRows.map((row) => row.id));
+
+  for (const status of Object.values(localStatusesById)) {
+    if (
+      !folderId ||
+      status.folderId !== folderId ||
+      seen.has(status.fileId) ||
+      status.status === "ready" ||
+      suppressedFileIds[status.fileId]
+    ) {
+      continue;
+    }
+
+    merged.unshift({
+      id: status.fileId,
+      name: status.fileName,
+      folderId: status.folderId,
+      sizeBytes: status.sizeBytes,
+      uploadedAt: status.uploadedAt,
+    });
+  }
+
+  return merged;
+}
+
 function findMatchingUploadFile(upload: ActiveUpload | null, rows: FileRow[]) {
   if (!upload) return null;
   return (
@@ -276,21 +437,17 @@ function pickImportQuota(json: any): { used: number; limit: number | null } {
 function describeProcessingStage(activeUpload: ActiveUpload | null) {
   if (!activeUpload || activeUpload.kind !== "pdf" || !activeUpload.responseSettled) return null;
 
-  const status = String(activeUpload.status ?? "").toLowerCase();
-  const stage = String(activeUpload.stage ?? "").toLowerCase();
+  const status = normalizeStatusToken(activeUpload.status);
+  const stage = normalizeStatusToken(activeUpload.stage);
+  if (status === "failed" || stage === "failed") return "Status: Fejl";
+  if (READY_STATUS_TOKENS.has(status) || READY_STATUS_TOKENS.has(stage)) return "Status: Klar";
+  return "Status: Klargøres";
+}
 
-  if (status === "failed") return "Behandlingen af PDF’en fejlede.";
-  if (stage === "queued") return "PDF’en er modtaget. Materialet står i kø til behandling.";
-  if (stage === "processing_started") return "PDF’en er modtaget. Materialet bliver klargjort nu.";
-  if (stage === "ocr_started") {
-    return "PDF’en ser ud til at være scannet og kan derfor tage længere tid at behandle. Vi forsøger at læse den med OCR.";
-  }
-  if (stage === "pdf_extract_started") return "PDF’en læses og OCR-behandles nu.";
-  if (stage === "ocr_finished" || stage === "pdf_extract_finished" || stage === "chunk_build_started") {
-    return "Teksten er hentet. Materialet bliver gjort klar til brug i Notely.";
-  }
-  if (stage === "chunk_build_finished") return "Materialet færdiggøres nu.";
-  return "PDF’en er modtaget. Materialet bliver gjort klar til brug i Notely.";
+function getUploadPollDelayMs(elapsedMs: number) {
+  if (elapsedMs < 15_000) return UPLOAD_STATUS_POLL_INITIAL_MS;
+  if (elapsedMs < 60_000) return UPLOAD_STATUS_POLL_MS;
+  return UPLOAD_STATUS_POLL_SLOW_MS;
 }
 
 export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId, onFoldersChange }: Props) {
@@ -318,6 +475,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError, setFilesError] = useState<string | null>(null);
   const [fileReadinessById, setFileReadinessById] = useState<Record<string, FileReadiness>>({});
+  const [localFileStatusesById, setLocalFileStatusesById] = useState<Record<string, LocalFileStatus>>({});
+  const [suppressedFileIds, setSuppressedFileIds] = useState<Record<string, true>>({});
+  const suppressedFileIdsRef = useRef<Record<string, true>>({});
 
   // upload
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -343,6 +503,10 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [movingId, setMovingId] = useState<string | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
   const [moveNotice, setMoveNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    suppressedFileIdsRef.current = suppressedFileIds;
+  }, [suppressedFileIds]);
 
   const dispatchQuotaChanged = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -517,11 +681,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       const raw = Array.isArray(json.files) ? json.files : Array.isArray(json.items) ? json.items : [];
       const normalized = raw.map(normalizeFileRow).filter(Boolean) as FileRow[];
-      setFiles(normalized);
+      const visibleRows = omitSuppressedFiles(normalized, suppressedFileIdsRef.current);
+      setFiles(visibleRows);
       const readinessRows = Array.isArray(readinessJson.folderFiles) ? readinessJson.folderFiles : [];
-      const readinessById = buildReadinessMap(readinessRows);
+      const readinessById = buildReadinessMap(
+        readinessRows.filter((row) => row?.id && !suppressedFileIdsRef.current[String(row.id)]),
+      );
       setFileReadinessById(readinessById);
-      return { files: normalized, readinessById };
+      return { files: visibleRows, readinessById };
     } catch (e) {
       console.error("[UploadClient] loadFiles error", e);
       setFiles([]);
@@ -596,10 +763,82 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const hasValidUploadFolder = !!uploadFolderId && folderOptions.some((folder) => folder.id === uploadFolderId);
   const canUpload = !!pickedFile && hasValidUploadFolder && !uploading && !quotaBlocked && !foldersLoading;
   const processingStatusText = describeProcessingStage(activeUpload);
+  const visibleFiles = useMemo(
+    () => mergeVisibleFileRows(files, listFolderId, localFileStatusesById, suppressedFileIds),
+    [files, listFolderId, localFileStatusesById, suppressedFileIds],
+  );
+
+  const upsertLocalFileStatus = useCallback((nextStatus: LocalFileStatus) => {
+    setLocalFileStatusesById((prev) => {
+      const current = prev[nextStatus.fileId] ?? null;
+      return {
+        ...prev,
+        [nextStatus.fileId]: mergeLocalFileStatus(current, nextStatus),
+      };
+    });
+  }, []);
+
+  const removeLocalFileStatus = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return;
+    setLocalFileStatusesById((prev) => {
+      if (!(fileId in prev)) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  }, []);
+
+  const removeFileReadiness = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return;
+    setFileReadinessById((prev) => {
+      if (!(fileId in prev)) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  }, []);
+
+  const suppressFile = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return;
+    setSuppressedFileIds((prev) => {
+      if (prev[fileId]) return prev;
+      const next: Record<string, true> = { ...prev, [fileId]: true };
+      suppressedFileIdsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const unsuppressFile = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return;
+    setSuppressedFileIds((prev) => {
+      if (!(fileId in prev)) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      suppressedFileIdsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const isFileSuppressed = useCallback((fileId: string | null | undefined) => {
+    if (!fileId) return false;
+    return !!suppressedFileIdsRef.current[fileId];
+  }, []);
+
+  const resolveFileStatus = useCallback(
+    (file: FileRow) => {
+      const localStatus = localFileStatusesById[file.id]
+        ? buildUserFileStatus(localFileStatusesById[file.id]!.status, localFileStatusesById[file.id]!.error)
+        : null;
+      const serverStatus = mapReadinessToUserStatus(fileReadinessById[file.id] ?? null);
+      return pickDisplayStatus(localStatus, serverStatus);
+    },
+    [fileReadinessById, localFileStatusesById],
+  );
 
   const refreshActiveUploadFiles = useCallback(
     async (upload: ActiveUpload | null, reason: string, force = false) => {
       if (!upload || !upload.responseSettled) return null;
+      if (isFileSuppressed(upload.fileId)) return null;
       const currentFolderId = listFolderIdRef.current;
       if (!currentFolderId || currentFolderId !== upload.folderId) return null;
 
@@ -619,11 +858,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       });
       return await loadFiles(currentFolderId);
     },
-    [loadFiles],
+    [isFileSuppressed, loadFiles],
   );
 
   const refreshCompletedUploadFiles = useCallback(
     async (upload: ActiveUpload | null, reason: string, skipImmediateRefresh = false) => {
+      if (isFileSuppressed(upload?.fileId)) return;
       const folderId = upload?.folderId ?? listFolderIdRef.current ?? uploadFolderId;
       const shouldRefreshVisibleFolder = !!folderId && listFolderIdRef.current === folderId;
 
@@ -651,16 +891,29 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         }, UPLOAD_READY_FOLLOWUP_REFRESH_MS);
       }
     },
-    [loadFiles, uploadFolderId],
+    [isFileSuppressed, loadFiles, uploadFolderId],
   );
 
   useEffect(() => {
+    if (!activeUpload?.fileId) return;
+    if (!isFileSuppressed(activeUpload.fileId)) return;
+
+    console.info("[UploadClient] stopping local polling for removed file", {
+      requestId: activeUpload.requestId,
+      fileId: activeUpload.fileId,
+    });
+    setActiveUpload(null);
+    setUploading(false);
+  }, [activeUpload, isFileSuppressed, suppressedFileIds]);
+
+  useEffect(() => {
     if (!activeUpload) return;
+    if (isFileSuppressed(activeUpload.fileId)) return;
     if (!activeUpload.responseSettled) return;
     if (activeUpload.kind !== "pdf") return;
     if (listFolderId !== activeUpload.folderId) return;
 
-    const matchedFile = findMatchingUploadFile(activeUpload, files);
+    const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
     if (!matchedFile) return;
     const readiness = fileReadinessById[matchedFile.id] ?? null;
     if (!readiness?.ready) return;
@@ -673,58 +926,51 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       readiness: readiness.readiness,
       chunkCount: readiness.chunkCount,
     });
-    clearCompletedUploadStatus(activeUpload, matchedFile.id);
+    upsertLocalFileStatus({
+      fileId: matchedFile.id,
+      fileName: matchedFile.name,
+      folderId: activeUpload.folderId,
+      sizeBytes: matchedFile.sizeBytes,
+      uploadedAt: matchedFile.uploadedAt,
+      status: "ready",
+      error: null,
+      updatedAt: Date.now(),
+    });
     void refreshCompletedUploadFiles(activeUpload, "visible-file-ready", true);
     setUploadNotice("Materialet er klar nu.");
     setActiveUpload(null);
     setUploading(false);
     dispatchQuotaChanged();
-  }, [activeUpload, dispatchQuotaChanged, fileReadinessById, files, listFolderId, refreshCompletedUploadFiles]);
+  }, [
+    activeUpload,
+    dispatchQuotaChanged,
+    fileReadinessById,
+    listFolderId,
+    refreshCompletedUploadFiles,
+    isFileSuppressed,
+    upsertLocalFileStatus,
+    visibleFiles,
+  ]);
 
-  function readinessTone(readiness: FileReadiness | null) {
-    if (!readiness) return "border-zinc-200 bg-zinc-50 text-zinc-700";
-    if (readiness.readiness === "failed") return "border-stone-200 bg-stone-50 text-zinc-700";
-    return "border-zinc-200 bg-zinc-50 text-zinc-600";
+  function readinessTone(status: UserFileStatus | null) {
+    if (!status) return "border-transparent bg-transparent text-transparent";
+    if (status.kind === "failed") return "border-red-200 bg-red-50 text-red-700";
+    if (status.kind === "ready") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    return "border-zinc-200 bg-zinc-50 text-zinc-700";
   }
 
-  function fileListBadgeLabel(readiness: FileReadiness | null) {
-    if (!readiness || readiness.ready || readiness.readiness === "ready") return null;
-    if (readiness.readiness === "failed") return "Fejlede";
-    return "Behandles";
+  function fileListBadgeLabel(status: UserFileStatus | null) {
+    if (!status || status.kind === "ready") return null;
+    return status.label;
   }
 
-  function fileListStatusDetail(readiness: FileReadiness | null) {
-    if (!readiness) return null;
-    if (readiness.readiness === "failed") return readiness.readinessDetail ?? "Klargøring fejlede";
-    return null;
-  }
-
-  function clearCompletedUploadStatus(upload: ActiveUpload | null, matchedFileId?: string | null) {
-    if (!upload) return;
-    setFileReadinessById((prev) => {
-      const next = { ...prev };
-
-      if (matchedFileId && matchedFileId in next) {
-        delete next[matchedFileId];
-        return next;
-      }
-
-      if (upload.fileId && upload.fileId in next) {
-        delete next[upload.fileId];
-        return next;
-      }
-
-      const fallbackFile = files.find((file) => file.name === upload.fileName);
-      if (fallbackFile?.id && fallbackFile.id in next) {
-        delete next[fallbackFile.id];
-      }
-
-      return next;
-    });
+  function fileListStatusDetail(status: UserFileStatus | null) {
+    return status?.kind === "failed" ? status.detail : null;
   }
 
   useEffect(() => {
     if (!activeUpload) return;
+    if (isFileSuppressed(activeUpload.fileId)) return;
 
     let cancelled = false;
     let nextDelayMs = UPLOAD_STATUS_POLL_MS;
@@ -737,6 +983,18 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     const stopWithError = (message: string, reason: string) => {
       if (cancelled) return;
+      if (activeUpload.fileId) {
+        upsertLocalFileStatus({
+          fileId: activeUpload.fileId,
+          fileName: activeUpload.fileName,
+          folderId: activeUpload.folderId,
+          sizeBytes: visibleFiles.find((file) => file.id === activeUpload.fileId)?.sizeBytes ?? null,
+          uploadedAt: visibleFiles.find((file) => file.id === activeUpload.fileId)?.uploadedAt ?? null,
+          status: "failed",
+          error: message,
+          updatedAt: Date.now(),
+        });
+      }
       uploadAbortReasonRef.current = message;
       uploadAbortRef.current?.abort(reason);
       setUploadError(message);
@@ -749,7 +1007,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       });
     };
 
-      const poll = async () => {
+    const poll = async () => {
       const elapsedMs = Date.now() - activeUpload.startedAt;
       const timeoutMs = activeUpload.kind === "pdf" ? PDF_UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS;
       if (elapsedMs > timeoutMs) {
@@ -785,7 +1043,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         const text = await res.text();
         const json = (safeJson(text) ?? {}) as ImportStatusPayload;
         const activeJob = json?.activeJob ?? null;
-        nextDelayMs = UPLOAD_STATUS_POLL_MS;
+        nextDelayMs = getUploadPollDelayMs(elapsedMs);
 
         console.info("[UploadClient] polling tick", {
           requestId: activeUpload.requestId,
@@ -800,7 +1058,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           setActiveUpload((prev) =>
             prev && prev.requestId === activeUpload.requestId
               ? {
-	                  ...prev,
+                  ...prev,
                   jobId: activeJob.id ? String(activeJob.id) : null,
                   status: activeJob.status ? String(activeJob.status) : null,
                   stage: activeJob.stage ? String(activeJob.stage) : null,
@@ -809,31 +1067,42 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           );
         }
 
-          const normalizedJobStatus = String(activeJob?.status ?? "").toLowerCase();
-          const shouldForceRefresh =
-            !!activeUpload.responseSettled &&
-            (!activeJob || ["finished", "completed", "succeeded"].includes(normalizedJobStatus));
-          const refreshedSnapshot = await refreshActiveUploadFiles(
-            activeUpload,
-            !activeJob ? "active-job-missing" : shouldForceRefresh ? "job-finished" : "processing-reconcile",
-            shouldForceRefresh,
-          );
-          if (refreshedSnapshot && isUploadReadyFromSnapshot(activeUpload, refreshedSnapshot.files, refreshedSnapshot.readinessById)) {
-            if (!cancelled) {
-              const matchedFile = findMatchingUploadFile(activeUpload, refreshedSnapshot.files);
-              console.info("[UploadClient] stopping processing state after readiness refresh", {
-                requestId: activeUpload.requestId,
-                reason: !activeJob ? "active-job-missing" : normalizedJobStatus || "processing",
+        const normalizedJobStatus = String(activeJob?.status ?? "").toLowerCase();
+        const shouldForceRefresh =
+          !!activeUpload.responseSettled &&
+          (!activeJob || ["finished", "completed", "succeeded"].includes(normalizedJobStatus));
+        const refreshedSnapshot = await refreshActiveUploadFiles(
+          activeUpload,
+          !activeJob ? "active-job-missing" : shouldForceRefresh ? "job-finished" : "processing-reconcile",
+          shouldForceRefresh,
+        );
+        if (refreshedSnapshot && isUploadReadyFromSnapshot(activeUpload, refreshedSnapshot.files, refreshedSnapshot.readinessById)) {
+          if (!cancelled) {
+            const matchedFile = findMatchingUploadFile(activeUpload, refreshedSnapshot.files);
+            console.info("[UploadClient] stopping processing state after readiness refresh", {
+              requestId: activeUpload.requestId,
+              reason: !activeJob ? "active-job-missing" : normalizedJobStatus || "processing",
+            });
+            if (matchedFile?.id) {
+              upsertLocalFileStatus({
+                fileId: matchedFile.id,
+                fileName: matchedFile.name,
+                folderId: activeUpload.folderId,
+                sizeBytes: matchedFile.sizeBytes,
+                uploadedAt: matchedFile.uploadedAt,
+                status: "ready",
+                error: null,
+                updatedAt: Date.now(),
               });
-              clearCompletedUploadStatus(activeUpload, matchedFile?.id ?? null);
-              void refreshCompletedUploadFiles(activeUpload, "polling-readiness-refresh", true);
-              setUploadNotice("Materialet er klar nu.");
-              setActiveUpload(null);
-              setUploading(false);
-              dispatchQuotaChanged();
             }
-            return;
+            void refreshCompletedUploadFiles(activeUpload, "polling-readiness-refresh", true);
+            setUploadNotice("Materialet er klar nu.");
+            setActiveUpload(null);
+            setUploading(false);
+            dispatchQuotaChanged();
           }
+          return;
+        }
 
         if (!activeJob && elapsedMs > UPLOAD_JOB_BOOT_TIMEOUT_MS) {
           console.info("[UploadClient] waiting for job start", {
@@ -852,7 +1121,19 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
         if (["finished", "completed", "succeeded"].includes(normalizedJobStatus)) {
           if (!cancelled) {
-            clearCompletedUploadStatus(activeUpload);
+            if (activeUpload.fileId) {
+              const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
+              upsertLocalFileStatus({
+                fileId: activeUpload.fileId,
+                fileName: matchedFile?.name ?? activeUpload.fileName,
+                folderId: activeUpload.folderId,
+                sizeBytes: matchedFile?.sizeBytes ?? null,
+                uploadedAt: matchedFile?.uploadedAt ?? null,
+                status: "ready",
+                error: null,
+                updatedAt: Date.now(),
+              });
+            }
             void refreshCompletedUploadFiles(activeUpload, "job-finished");
             setUploadNotice("Materialet er klar nu.");
             setActiveUpload(null);
@@ -889,7 +1170,18 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         requestId: activeUpload.requestId,
       });
     };
-  }, [activeUpload, dispatchImportStatusRefresh, dispatchQuotaChanged, loadFiles, refreshActiveUploadFiles, refreshCompletedUploadFiles, uploadFolderId]);
+  }, [
+    activeUpload,
+    dispatchImportStatusRefresh,
+    dispatchQuotaChanged,
+    isFileSuppressed,
+    loadFiles,
+    refreshActiveUploadFiles,
+    refreshCompletedUploadFiles,
+    uploadFolderId,
+    upsertLocalFileStatus,
+    visibleFiles,
+  ]);
 
   async function doUpload() {
     if (!hasValidUploadFolder) {
@@ -910,6 +1202,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     dispatchUploadActivity(true);
 
     let keepPollingAfterResponse = false;
+    let pendingFileId: string | null = null;
+    let optimisticUploadedAt: string | null = null;
 
     try {
       const clientRequestId = createClientRequestId();
@@ -983,6 +1277,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
               }
             : prev,
         );
+        pendingFileId = initFileId;
 
         const supabase = createBrowserClient();
         const storageUpload = await supabase.storage.from(bucket).uploadToSignedUrl(storagePath, uploadToken, pickedFile, {
@@ -993,6 +1288,20 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (storageUpload.error) {
           setUploadError(storageUpload.error.message || "Kunne ikke sende filen direkte til storage.");
           return;
+        }
+
+        optimisticUploadedAt = new Date().toISOString();
+        if (!isFileSuppressed(initFileId)) {
+          upsertLocalFileStatus({
+            fileId: initFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "uploaded",
+            error: null,
+            updatedAt: Date.now(),
+          });
         }
 
         res = await fetch("/api/trainer/upload", {
@@ -1037,6 +1346,18 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           res,
           responseText,
         });
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: msg,
+            updatedAt: Date.now(),
+          });
+        }
         setQuotaBlocked(msg);
         dispatchQuotaChanged();
         return;
@@ -1049,39 +1370,86 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             j?.error ??
             "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
         );
+        removeLocalFileStatus(pendingFileId);
         setUploadNotice(msg);
         return;
       }
 
       if (res.status === 401) {
         const j = data;
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: String(j?.error ?? "Login kræves."),
+            updatedAt: Date.now(),
+          });
+        }
         setUploadError(String(j?.error ?? "Login kræves."));
         return;
       }
 
       if (res.status === 413) {
-        setUploadError(
-          resolveUploadErrorMessage(res.status, data, pickedFile, {
-            res,
-            responseText,
-          }),
-        );
+        const message = resolveUploadErrorMessage(res.status, data, pickedFile, {
+          res,
+          responseText,
+        });
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: message,
+            updatedAt: Date.now(),
+          });
+        }
+        setUploadError(message);
         return;
       }
 
       if (res.status === 403) {
         const j = data;
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."),
+            updatedAt: Date.now(),
+          });
+        }
         setUploadNotice(String(j?.message ?? j?.error ?? "Handlingen er ikke tilgængelig lige nu."));
         return;
       }
 
       if (!res.ok) {
-        setUploadError(
-          resolveUploadErrorMessage(res.status, data, pickedFile, {
-            res,
-            responseText,
-          }),
-        );
+        const message = resolveUploadErrorMessage(res.status, data, pickedFile, {
+          res,
+          responseText,
+        });
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile.name,
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: message,
+            updatedAt: Date.now(),
+          });
+        }
+        setUploadError(message);
         return;
       }
 
@@ -1101,6 +1469,18 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       keepPollingAfterResponse = processingAccepted;
       setUploading(false);
+      if (pendingFileId && uploadKind === "pdf" && !isFileSuppressed(pendingFileId)) {
+        upsertLocalFileStatus({
+          fileId: pendingFileId,
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          uploadedAt: optimisticUploadedAt,
+          status: processingAccepted ? "preparing" : "ready",
+          error: null,
+          updatedAt: Date.now(),
+        });
+      }
 
       setPickedFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -1159,11 +1539,35 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       if ((e as any)?.name === "AbortError") {
         const reason = uploadAbortReasonRef.current ?? "Uploaden blev afbrudt. Prøv igen.";
         console.warn("[UploadClient] upload aborted", { reason });
+        if (pendingFileId && uploadAbortReasonRef.current && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile?.name ?? activeUpload?.fileName ?? "Upload",
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile?.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: reason,
+            updatedAt: Date.now(),
+          });
+        }
         if (uploadAbortReasonRef.current) {
           setUploadError(reason);
         }
       } else {
         console.error("[UploadClient] upload error", e);
+        if (pendingFileId && !isFileSuppressed(pendingFileId)) {
+          upsertLocalFileStatus({
+            fileId: pendingFileId,
+            fileName: pickedFile?.name ?? activeUpload?.fileName ?? "Upload",
+            folderId: uploadFolderId,
+            sizeBytes: typeof pickedFile?.size === "number" ? pickedFile.size : null,
+            uploadedAt: optimisticUploadedAt,
+            status: "failed",
+            error: "Upload fejlede. Prøv igen.",
+            updatedAt: Date.now(),
+          });
+        }
         setUploadError("Upload fejlede. Prøv igen.");
       }
     } finally {
@@ -1182,7 +1586,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setMoveNotice(null);
     setMovingId(fileId);
 
-    const prevFolderId = files.find((x) => x.id === fileId)?.folderId ?? null;
+    const prevFolderId = visibleFiles.find((x) => x.id === fileId)?.folderId ?? null;
     const currentList = listFolderIdRef.current;
     const destName = folderOptions.find((x) => x.id === newFolderId)?.name ?? "den nye mappe";
 
@@ -1225,8 +1629,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   }
 
   async function deleteFile(fileId: string) {
-    const file = files.find((x) => x.id === fileId);
+    const file = visibleFiles.find((x) => x.id === fileId);
     const name = file?.name ?? "filen";
+    const currentList = listFolderIdRef.current;
 
     const ok = window.confirm(
       `Er du sikker på, at du vil slette "${name}"?\n\n` +
@@ -1238,6 +1643,16 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     setDeleteError(null);
     setDeletingId(fileId);
+    suppressFile(fileId);
+    setFiles((prev) => prev.filter((f) => f.id !== fileId));
+    removeFileReadiness(fileId);
+    removeLocalFileStatus(fileId);
+
+    if (activeUpload?.fileId === fileId) {
+      uploadAbortRef.current?.abort("delete-file");
+      setActiveUpload(null);
+      setUploading(false);
+    }
 
     let res: Response | null = null;
 
@@ -1257,12 +1672,13 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
     if (!res || !res.ok) {
       const j = res ? safeJson(await res.text()) : null;
+      unsuppressFile(fileId);
+      await loadFiles(currentList);
       setDeleteError(String(j?.error ?? j?.message ?? "Kunne ikke slette filen. Prøv igen."));
       setDeletingId(null);
       return;
     }
 
-    setFiles((prev) => prev.filter((f) => f.id !== fileId));
     setDeletingId(null);
     dispatchImportStatusRefresh();
   }
@@ -1339,7 +1755,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         >
           <div className="text-sm font-medium text-zinc-900">Træk en PDF eller lydfil herind eller klik for at vælge.</div>
           <div className="mt-1 text-xs text-zinc-500">Understøtter PDF samt almindelige lydfiler som mp3, m4a, wav, webm og ogg.</div>
-          <div className="mt-1 text-xs text-zinc-500">PDF: maks. 50 MB pr. fil.</div>
+          <div className="mt-1 text-xs text-zinc-500">PDF: maks. 25 MB og 100 sider pr. fil.</div>
 
           <div className="mt-4 flex items-center justify-center gap-2">
             <span className="rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium">Vælg fil</span>
@@ -1434,22 +1850,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       {/* Files list */}
       <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-        <div className="flex items-center justify-between">
+        <div>
           <div>
             <div className="text-sm font-semibold text-zinc-900">Materiale i dine mapper</div>
             <div className="mt-1 text-xs text-zinc-600">Viser PDF- og lydfiler i den mappe, du vælger herunder.</div>
           </div>
-
-          <button
-            type="button"
-            onClick={() => void loadFiles(listFolderIdRef.current)}
-            className="inline-flex items-center gap-2 rounded-full border border-zinc-300 bg-white px-4 py-2 text-xs font-medium"
-          >
-            <span className="inline-flex h-3.5 w-3.5 items-center justify-center">
-              {filesLoading ? <span className="h-2 w-2 animate-pulse rounded-full bg-zinc-400" /> : null}
-            </span>
-            <span>Opdater liste</span>
-          </button>
         </div>
 
         <div className="mt-4 flex items-center gap-3">
@@ -1478,31 +1883,35 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}
 
         <div className="mt-4 space-y-3">
-          {!filesLoading && (!listFolderId || files.length === 0) ? (
+          {!filesLoading && (!listFolderId || visibleFiles.length === 0) ? (
             <div className="text-xs text-zinc-500">
               {listFolderId ? "Ingen filer i denne mappe endnu." : "Vælg en mappe."}
             </div>
           ) : null}
 
-          {files.map((f) => (
-            <div
-              key={f.id}
-              className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3"
-            >
+          {visibleFiles.map((f) => {
+            const status = resolveFileStatus(f);
+            const badgeLabel = fileListBadgeLabel(status);
+            const statusDetail = fileListStatusDetail(status);
+            const isTransientUpload = status?.kind === "uploaded" || status?.kind === "preparing";
+
+            return (
+              <div
+                key={f.id}
+                className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3"
+              >
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex min-h-[28px] items-center gap-2">
                   <div className="text-sm font-medium text-zinc-900">{f.name}</div>
-	                  {fileListBadgeLabel(fileReadinessById[f.id] ?? null) ? (
-	                    <span
-	                      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium leading-none ${readinessTone(fileReadinessById[f.id] ?? null)}`}
-	                    >
-	                      {fileListBadgeLabel(fileReadinessById[f.id] ?? null)}
-	                    </span>
-	                  ) : null}
+                  <span
+                    className={`inline-flex min-w-[88px] items-center justify-center rounded-full border px-2.5 py-1 text-[10px] font-medium leading-none ${readinessTone(status)} ${badgeLabel ? "" : "invisible"}`}
+                  >
+                    {badgeLabel ?? "Klar"}
+                  </span>
                 </div>
                 <div className="mt-1 text-[11px] text-zinc-500">
                   {humanBytes(f.sizeBytes)} {f.uploadedAt ? `· ${fmtDa(f.uploadedAt)}` : ""}
-                  {fileListStatusDetail(fileReadinessById[f.id] ?? null) ? ` · ${fileListStatusDetail(fileReadinessById[f.id] ?? null)}` : ""}
+                  {statusDetail ? ` · ${statusDetail}` : ""}
                 </div>
               </div>
 
@@ -1515,7 +1924,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                     if (!v) return;
                     void moveFile(f.id, v);
                   }}
-                  disabled={folderOptions.length === 0 || deletingId === f.id || movingId === f.id}
+                  disabled={folderOptions.length === 0 || deletingId === f.id || movingId === f.id || isTransientUpload}
                   title="Flyt til anden mappe"
                 >
                   {folderOptions.map((fo) => (
@@ -1531,11 +1940,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                   disabled={deletingId === f.id || movingId === f.id}
                   className="rounded-full border border-red-300 bg-white px-3 py-2 text-xs font-medium text-red-700 disabled:opacity-40"
                 >
-                  {deletingId === f.id ? "Sletter..." : "Slet"}
+                  {deletingId === f.id ? (isTransientUpload ? "Afbryder..." : "Sletter...") : "Slet"}
                 </button>
               </div>
-            </div>
-          ))}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
