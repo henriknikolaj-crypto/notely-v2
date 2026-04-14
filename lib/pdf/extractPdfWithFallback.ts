@@ -7,6 +7,15 @@ import { PDFDocument } from "pdf-lib";
 export type ExtractionMethod = "text" | "ocr" | "mixed";
 export type ExtractionQuality = "high" | "medium" | "low";
 export type PageType = "text" | "scan" | "table_heavy" | "formula_heavy" | "mixed";
+export type PdfDocumentClass = "text_layer_pdf" | "image_only_pdf" | "mixed_pdf";
+export type PdfExtractionRoute = "text_fast_path" | "ocr_first_path";
+export type PdfExtractionTimings = {
+  pdf_open_ms: number;
+  render_ms: number;
+  ocr_ms: number;
+  total_ms: number;
+  ocr_page_count: number;
+};
 
 export type PageClassificationSignals = {
   lineCount: number;
@@ -51,6 +60,8 @@ export type ExtractedPdfDocument = {
   pages: ExtractedPdfPage[];
   ocrTexts: Array<{ page: number; text: string; engine: string }>;
   extractionMeta: {
+    document_class: PdfDocumentClass;
+    extraction_route: PdfExtractionRoute;
     page_count: number;
     ocr_pages: number;
     dominant_page_type: PageType | null;
@@ -77,7 +88,9 @@ export type ExtractedPdfDocument = {
     }>;
     total_table_blocks: number;
     total_formula_blocks: number;
+    timings: PdfExtractionTimings;
   };
+  timings: PdfExtractionTimings;
 };
 
 export type PdfExtractionProgress = {
@@ -85,6 +98,8 @@ export type PdfExtractionProgress = {
   totalPages: number;
   ocrCandidatePages: number;
   scanLikeDocument: boolean;
+  documentClass: PdfDocumentClass;
+  ocrStrategy: "ocr_first" | "ocr_fallback";
 };
 
 type ExtractOpts = {
@@ -92,6 +107,7 @@ type ExtractOpts = {
   fileSizeBytes?: number;
   maxPages?: number;
   allowOcr?: boolean;
+  ocrStrategy?: "auto" | "ocr_first";
   onProgress?: (event: PdfExtractionProgress) => void | Promise<void>;
 };
 
@@ -142,11 +158,21 @@ const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "
 const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
 const SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT = 3;
 const SCAN_HEAVY_OCR_SAMPLE_BUDGET_MS = 20_000;
+const OCR_FALLBACK_BATCH_SIZE = 2;
+const OCR_FIRST_BATCH_SIZE = 3;
 const OCR_TIMEOUT_MS = (() => {
   const value = Number(process.env.OPENAI_OCR_TIMEOUT_MS ?? 10_000);
   return Number.isFinite(value) && value > 0 ? value : 10_000;
 })();
 const require = createRequire(import.meta.url);
+
+function nowMs() {
+  return Date.now();
+}
+
+function elapsedMs(startedAt: number) {
+  return Math.max(0, nowMs() - startedAt);
+}
 
 function normalizePageText(input: string) {
   return String(input ?? "")
@@ -451,6 +477,54 @@ function summarizeReadableText(pages: ExtractedPdfPage[]) {
   );
 }
 
+function classifyDocumentClass(args: {
+  pageCount: number;
+  pages: ExtractedPdfPage[];
+  readable: ReturnType<typeof summarizeReadableText>;
+  initialScanPages: number;
+  ocrCandidatePages: number;
+  hopelessCandidatePages: number;
+}): PdfDocumentClass {
+  const { pageCount, pages, readable, initialScanPages, ocrCandidatePages, hopelessCandidatePages } = args;
+  if (pageCount <= 0) return "text_layer_pdf";
+
+  const thinTextPages = pages.filter((page) => page.textCharCount < 30 || page.wordCount < 6).length;
+  const candidateLikePages = ocrCandidatePages + hopelessCandidatePages;
+
+  const clearlyTextLayer =
+    readable.pagesWithGoodText >= Math.max(1, Math.ceil(pageCount * 0.4)) &&
+    readable.totalWords >= Math.max(50, pageCount * 12) &&
+    readable.totalChars >= Math.max(260, pageCount * 120) &&
+    candidateLikePages <= Math.max(1, Math.ceil(pageCount * 0.4));
+  if (clearlyTextLayer) return "text_layer_pdf";
+
+  const clearlyImageOnly =
+    readable.pagesWithGoodText === 0 &&
+    readable.totalWords < Math.max(24, pageCount * 6) &&
+    readable.totalChars < Math.max(140, pageCount * 28) &&
+    (candidateLikePages >= Math.max(1, Math.ceil(pageCount * 0.8)) ||
+      thinTextPages >= Math.max(1, Math.ceil(pageCount * 0.8)) ||
+      initialScanPages >= Math.max(1, Math.ceil(pageCount * 0.6)));
+  if (clearlyImageOnly) return "image_only_pdf";
+
+  return "mixed_pdf";
+}
+
+function selectOcrCandidates(args: {
+  pages: ExtractedPdfPage[];
+  strategy: "ocr_first" | "ocr_fallback";
+}) {
+  const { pages, strategy } = args;
+  if (strategy === "ocr_first") {
+    return pages.filter((page) => page.extractionMeta.ocr_decision !== "text_ok");
+  }
+  return pages.filter(
+    (page) =>
+      page.extractionMeta.ocr_decision === "low_text_candidate" ||
+      page.extractionMeta.ocr_decision === "scan_like_candidate",
+  );
+}
+
 function classifyOcrDecision(page: ExtractedPdfPage): OcrDecision {
   if (
     page.extractionQuality === "high" ||
@@ -604,12 +678,15 @@ async function runScanHeavyOcrSample(args: {
   fileName: string;
   pages: ExtractedPdfPage[];
 }) {
+  const sampleStartedAt = nowMs();
   const samplePages = pickRepresentativeOcrSamplePages(args.pages);
   if (samplePages.length === 0) {
     return {
+      elapsedMs: 0,
       attemptedPages: 0,
       succeededPages: 0,
       timeoutCount: 0,
+      budgetExceeded: false,
       promising: false,
       ocrTexts: [] as Array<{ page: number; text: string; engine: string }>,
     };
@@ -668,6 +745,7 @@ async function runScanHeavyOcrSample(args: {
     succeededPages >= 1;
 
   return {
+    elapsedMs: elapsedMs(sampleStartedAt),
     attemptedPages,
     succeededPages,
     timeoutCount,
@@ -716,7 +794,7 @@ function groupItemsIntoLines(items: PositionedTextItem[]) {
 async function extractPdfPagesViaPdfjs(
   buf: Buffer,
   maxPages: number,
-): Promise<{ pageCount: number; pages: PdfPageSource[] }> {
+): Promise<{ pageCount: number; pages: PdfPageSource[]; timings: Pick<PdfExtractionTimings, "pdf_open_ms" | "render_ms"> }> {
   const mod: any = await import("pdfjs-dist/legacy/build/pdf.js");
   const pdfjs: any = mod?.default ?? mod;
   if (!(globalThis as any).pdfjsWorker?.WorkerMessageHandler) {
@@ -724,14 +802,17 @@ async function extractPdfPagesViaPdfjs(
     (globalThis as any).pdfjsWorker = workerMod?.default ?? workerMod;
   }
 
+  const openStartedAt = nowMs();
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buf),
     disableWorker: true,
   });
 
   const pdf = await loadingTask.promise;
+  const pdfOpenMs = elapsedMs(openStartedAt);
   const pageCount = Math.min(Number(pdf?.numPages ?? 0) || 0, maxPages);
   const pages: PdfPageSource[] = [];
+  const renderStartedAt = nowMs();
 
   try {
     for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
@@ -762,7 +843,14 @@ async function extractPdfPagesViaPdfjs(
     } catch {}
   }
 
-  return { pageCount, pages };
+  return {
+    pageCount,
+    pages,
+    timings: {
+      pdf_open_ms: Math.max(0, pdfOpenMs),
+      render_ms: elapsedMs(renderStartedAt),
+    },
+  };
 }
 
 function canRunOcr() {
@@ -863,7 +951,14 @@ async function runOpenAIOcrForPage(args: {
   }
 }
 
-function summarizeDocumentMeta(pages: ExtractedPdfPage[], diagnostics: OcrDiagnostics) {
+function summarizeDocumentMeta(args: {
+  pages: ExtractedPdfPage[];
+  diagnostics: OcrDiagnostics;
+  documentClass: PdfDocumentClass;
+  extractionRoute: PdfExtractionRoute;
+  timings: PdfExtractionTimings;
+}) {
+  const { pages, diagnostics, documentClass, extractionRoute, timings } = args;
   const pageTypeCounts: Record<PageType, number> = {
     text: 0,
     scan: 0,
@@ -888,6 +983,8 @@ function summarizeDocumentMeta(pages: ExtractedPdfPage[], diagnostics: OcrDiagno
       .find(([, count]) => count > 0)?.[0] as PageType | undefined) ?? null;
 
   return {
+    document_class: documentClass,
+    extraction_route: extractionRoute,
     page_count: pages.length,
     ocr_pages: pages.filter((p) => p.extractionMethod === "ocr").length,
     dominant_page_type: dominantPageType,
@@ -914,6 +1011,7 @@ function summarizeDocumentMeta(pages: ExtractedPdfPage[], diagnostics: OcrDiagno
     })),
     total_table_blocks: totalTableBlocks,
     total_formula_blocks: totalFormulaBlocks,
+    timings,
   };
 }
 
@@ -921,11 +1019,12 @@ export async function extractPdfWithFallback(
   buf: Buffer,
   opts: ExtractOpts = {},
 ): Promise<ExtractedPdfDocument> {
+  const extractionStartedAt = nowMs();
   const maxPages = Math.max(1, Math.min(opts.maxPages ?? 500, 2000));
   const allowOcr = opts.allowOcr !== false;
   const fileName = (opts.fileName ?? "document.pdf").trim() || "document.pdf";
-  const fileSizeBytes = Math.max(0, Number(opts.fileSizeBytes ?? buf.length) || 0);
   const raw = await extractPdfPagesViaPdfjs(buf, maxPages);
+  let ocrMs = 0;
 
   const pages: ExtractedPdfPage[] = raw.pages.map((pageSource, idx) => {
     const analysis = analyzeText(pageSource.rawText);
@@ -978,17 +1077,29 @@ export async function extractPdfWithFallback(
   }
 
   const initialReadable = summarizeReadableText(pages);
-  let ocrCandidates = pages.filter(
-    (page) =>
-      page.extractionMeta.ocr_decision === "low_text_candidate" ||
-      page.extractionMeta.ocr_decision === "scan_like_candidate",
-  );
-  const hopelessCandidatePages = pages.filter((page) => page.extractionMeta.ocr_decision === "hopeless_candidate").length;
-  let ocrCandidatePages = ocrCandidates.length;
   const initialScanPages = pages.filter((page) => page.extractionMeta.page_type === "scan").length;
+  const hopelessCandidatePages = pages.filter((page) => page.extractionMeta.ocr_decision === "hopeless_candidate").length;
+  const initialFallbackCandidates = selectOcrCandidates({ pages, strategy: "ocr_fallback" });
+  const documentClass = classifyDocumentClass({
+    pageCount: raw.pageCount,
+    pages,
+    readable: initialReadable,
+    initialScanPages,
+    ocrCandidatePages: initialFallbackCandidates.length,
+    hopelessCandidatePages,
+  });
+  const ocrStrategy: "ocr_first" | "ocr_fallback" =
+    allowOcr && (opts.ocrStrategy === "ocr_first" || documentClass !== "text_layer_pdf") ? "ocr_first" : "ocr_fallback";
+  let ocrCandidates = selectOcrCandidates({ pages, strategy: ocrStrategy });
+  if (ocrStrategy === "ocr_first" && ocrCandidates.length === 0 && raw.pageCount > 0 && initialReadable.pagesWithGoodText === 0) {
+    ocrCandidates = [...pages];
+  }
+  let ocrCandidatePages = ocrCandidates.length;
   const scanLikeDocument =
     raw.pageCount > 0 &&
-    (initialScanPages > 0 || ocrCandidatePages + hopelessCandidatePages >= Math.max(1, Math.ceil(raw.pageCount / 2)));
+    (documentClass === "image_only_pdf" ||
+      initialScanPages > 0 ||
+      ocrCandidatePages + hopelessCandidatePages >= Math.max(1, Math.ceil(raw.pageCount / 2)));
 
   const diagnostics: OcrDiagnostics = {
     totalPages: raw.pageCount,
@@ -1000,6 +1111,7 @@ export async function extractPdfWithFallback(
     failureReason:
       raw.pageCount > 0 &&
       scanLikeDocument &&
+      ocrStrategy !== "ocr_first" &&
       ocrCandidatePages === 0 &&
       hopelessCandidatePages > 0 &&
       initialReadable.pagesWithGoodText === 0
@@ -1011,6 +1123,7 @@ export async function extractPdfWithFallback(
   if (
     raw.pageCount > 0 &&
     scanLikeDocument &&
+    ocrStrategy !== "ocr_first" &&
     diagnostics.pagesWithGoodText === 0 &&
     shouldRejectScanHeavyPdfPreflight({ pages })
   ) {
@@ -1020,15 +1133,12 @@ export async function extractPdfWithFallback(
         fileName,
         pages,
       });
+      ocrMs += sample.elapsedMs;
       diagnostics.ocrAttemptedPages += sample.attemptedPages;
       diagnostics.ocrSucceededPages += sample.succeededPages;
       ocrTexts.push(...sample.ocrTexts);
       diagnostics.pagesWithGoodText = countPagesWithGoodText(pages);
-      ocrCandidates = pages.filter(
-        (page) =>
-          page.extractionMeta.ocr_decision === "low_text_candidate" ||
-          page.extractionMeta.ocr_decision === "scan_like_candidate",
-      );
+      ocrCandidates = selectOcrCandidates({ pages, strategy: ocrStrategy });
       ocrCandidatePages = ocrCandidates.length;
       diagnostics.ocrCandidatePages = ocrCandidatePages;
 
@@ -1051,10 +1161,15 @@ export async function extractPdfWithFallback(
       totalPages: raw.pageCount,
       ocrCandidatePages,
       scanLikeDocument,
+      documentClass,
+      ocrStrategy,
     });
 
-    for (let index = 0; index < ocrCandidates.length; index += 2) {
-      const batch = ocrCandidates.slice(index, index + 2);
+    const ocrBatchSize = ocrStrategy === "ocr_first" ? OCR_FIRST_BATCH_SIZE : OCR_FALLBACK_BATCH_SIZE;
+    const ocrStartedAt = nowMs();
+
+    for (let index = 0; index < ocrCandidates.length; index += ocrBatchSize) {
+      const batch = ocrCandidates.slice(index, index + ocrBatchSize);
       const results = await Promise.all(
         batch.map(async (page) => {
           try {
@@ -1114,12 +1229,15 @@ export async function extractPdfWithFallback(
         break;
       }
     }
+    ocrMs += elapsedMs(ocrStartedAt);
 
     await opts.onProgress?.({
       stage: "ocr_finished",
       totalPages: raw.pageCount,
       ocrCandidatePages,
       scanLikeDocument,
+      documentClass,
+      ocrStrategy,
     });
   }
 
@@ -1139,6 +1257,14 @@ export async function extractPdfWithFallback(
   const ocrPages = pages.filter((p) => p.extractionMethod === "ocr").length;
   const extractionMethod: ExtractionMethod =
     ocrPages === 0 ? "text" : ocrPages === pages.length ? "ocr" : "mixed";
+  const extractionRoute: PdfExtractionRoute = ocrPages === 0 ? "text_fast_path" : "ocr_first_path";
+  const timings: PdfExtractionTimings = {
+    pdf_open_ms: raw.timings.pdf_open_ms,
+    render_ms: raw.timings.render_ms,
+    ocr_ms: ocrMs,
+    total_ms: elapsedMs(extractionStartedAt),
+    ocr_page_count: diagnostics.ocrAttemptedPages,
+  };
 
   return {
     pageCount: raw.pageCount,
@@ -1147,6 +1273,13 @@ export async function extractPdfWithFallback(
     extractionQuality: summarizeDocumentQuality(pages),
     pages,
     ocrTexts,
-    extractionMeta: summarizeDocumentMeta(pages, diagnostics),
+    timings,
+    extractionMeta: summarizeDocumentMeta({
+      pages,
+      diagnostics,
+      documentClass,
+      extractionRoute,
+      timings,
+    }),
   };
 }

@@ -1,5 +1,7 @@
 import "server-only";
 
+import { resolveUploadActivity } from "@/lib/trainer/uploadState";
+
 export type NormalizedImportJob = {
   id: string;
   status: string | null;
@@ -43,14 +45,6 @@ function parseTimeMs(value: string | null | undefined) {
 
 function normalizeStatus(status: string | null | undefined) {
   return String(status ?? "").trim().toLowerCase();
-}
-
-function isFirstReadyStage(stage: string | null | undefined) {
-  return normalizeStatus(stage) === "first_ready";
-}
-
-function isDeepProcessingStage(stage: string | null | undefined) {
-  return normalizeStatus(stage) === "deep_processing";
 }
 
 export function isImportJobFinishedStatus(status: string | null | undefined) {
@@ -144,18 +138,19 @@ export function normalizeImportJobRow(row: any): NormalizedImportJob | null {
 export function resolveMaterialReadiness(args: {
   chunkCount: number;
   latestJob: NormalizedImportJob | null;
-}) : MaterialReadiness {
+}): MaterialReadiness {
   const chunkCount = Math.max(0, Number(args.chunkCount ?? 0) || 0);
   const latestJob = args.latestJob ?? null;
   const jobStatus = latestJob?.status ?? null;
   const jobStage = latestJob?.stage ?? null;
+  const uploadActivity = resolveUploadActivity({ status: jobStatus, stage: jobStage });
 
-  if ((chunkCount > 0 || isFirstReadyStage(jobStage)) && isDeepProcessingStage(jobStage)) {
+  if ((chunkCount > 0 || uploadActivity.phase === "ready") && uploadActivity.phase === "background") {
     return {
       ready: true,
       state: "background",
-      label: "Forbedres",
-      detail: "Materialet er klar og forbedres i baggrunden",
+      label: uploadActivity.label,
+      detail: uploadActivity.detail,
       chunkCount,
       jobStatus,
       jobStage,
@@ -163,12 +158,12 @@ export function resolveMaterialReadiness(args: {
     };
   }
 
-  if (chunkCount > 0 || isImportJobFinishedStatus(jobStatus) || isFirstReadyStage(jobStage)) {
+  if (chunkCount > 0 || uploadActivity.phase === "ready" || isImportJobFinishedStatus(jobStatus)) {
     return {
       ready: true,
       state: "ready",
       label: "Klar",
-      detail: chunkCount > 0 || isFirstReadyStage(jobStage) ? "Materialet er klar" : "Behandling afsluttet",
+      detail: chunkCount > 0 || uploadActivity.phase === "ready" ? "Materialet er klar" : "Behandling afsluttet",
       chunkCount,
       jobStatus,
       jobStage,
@@ -176,7 +171,7 @@ export function resolveMaterialReadiness(args: {
     };
   }
 
-  if (isImportJobFailedStatus(jobStatus)) {
+  if (isImportJobFailedStatus(jobStatus) || uploadActivity.phase === "failed") {
     return {
       ready: false,
       state: "failed",
@@ -192,8 +187,8 @@ export function resolveMaterialReadiness(args: {
   return {
     ready: false,
     state: "processing",
-    label: "Klargøres",
-    detail: "Materialet klargøres",
+    label: uploadActivity.label,
+    detail: uploadActivity.detail,
     chunkCount,
     jobStatus,
     jobStage,

@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 import { createBrowserClient } from "@/lib/supabase/client";
+import { isTerminalUploadActivityPhase, resolveUploadActivity } from "@/lib/trainer/uploadState";
 
 type Folder = {
   id: string;
@@ -31,7 +32,7 @@ type FileReadiness = {
   jobStage: string | null;
 };
 
-type UserFileStatusKind = "uploaded" | "preparing" | "enhancing" | "ready" | "failed";
+type UserFileStatusKind = "uploading" | "classifying" | "ocring" | "preparing" | "enhancing" | "ready" | "failed";
 
 type LocalFileStatus = {
   fileId: string;
@@ -116,26 +117,6 @@ const DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
 const PDF_UPLOAD_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 const ACTIVE_UPLOAD_REFRESH_MS = 15_000;
 const UPLOAD_READY_FOLLOWUP_REFRESH_MS = 1_500;
-const PREPARING_STATUS_TOKENS = new Set([
-  "started",
-  "preparing",
-  "processing",
-  "queued",
-  "first_processing",
-  "ocr_started",
-  "ocr_finished",
-  "processing_started",
-  "pdf_extract_started",
-  "pdf_extract_finished",
-  "chunk_build_started",
-  "chunk_build_finished",
-  "payload_stage",
-  "file_buffered",
-  "storage_upload_finished",
-]);
-const READY_STATUS_TOKENS = new Set(["ready", "succeeded", "finished", "completed", "first_ready"]);
-const BACKGROUND_STATUS_TOKENS = new Set(["deep_processing"]);
-
 function createClientRequestId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -287,16 +268,18 @@ function buildReadinessMap(rows: FileReadiness[]) {
   }, {});
 }
 
-function normalizeStatusToken(value: string | null | undefined) {
-  return String(value ?? "").trim().toLowerCase();
-}
-
 function buildUserFileStatus(kind: UserFileStatusKind, error?: string | null): UserFileStatus {
-  if (kind === "uploaded") {
-    return { kind, label: "Uploadet", detail: null };
+  if (kind === "uploading") {
+    return { kind, label: "Uploades", detail: error ?? "Filen uploades og registreres" };
+  }
+  if (kind === "classifying") {
+    return { kind, label: "Klassificeres", detail: error ?? "Vi afgør den hurtigste sikre behandlingsvej" };
+  }
+  if (kind === "ocring") {
+    return { kind, label: "OCR i gang", detail: error ?? "Vi læser siderne med OCR" };
   }
   if (kind === "preparing") {
-    return { kind, label: "Klargøres", detail: null };
+    return { kind, label: "Klargøres", detail: error ?? "Materialet klargøres" };
   }
   if (kind === "enhancing") {
     return { kind, label: "Forbedres", detail: error ?? "Materialet er klar og forbedres i baggrunden" };
@@ -308,10 +291,12 @@ function buildUserFileStatus(kind: UserFileStatusKind, error?: string | null): U
 }
 
 function statusPriority(kind: UserFileStatusKind) {
-  if (kind === "uploaded") return 1;
-  if (kind === "preparing") return 2;
-  if (kind === "ready") return 3;
-  if (kind === "enhancing") return 4;
+  if (kind === "uploading") return 1;
+  if (kind === "classifying") return 2;
+  if (kind === "ocring") return 3;
+  if (kind === "preparing") return 4;
+  if (kind === "ready") return 5;
+  if (kind === "enhancing") return 6;
   return 0;
 }
 
@@ -338,56 +323,54 @@ function mergeLocalFileStatus(current: LocalFileStatus | null, next: LocalFileSt
 function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStatus | null {
   if (!readiness) return null;
 
-  const jobStatus = normalizeStatusToken(readiness.jobStatus);
-  const jobStage = normalizeStatusToken(readiness.jobStage);
+  const uploadActivity = resolveUploadActivity({
+    status: readiness.jobStatus,
+    stage: readiness.jobStage,
+  });
 
   if (readiness.readiness === "failed") {
     return buildUserFileStatus("failed", readiness.readinessDetail);
   }
 
-  if (
-    readiness.readiness === "background" ||
-    BACKGROUND_STATUS_TOKENS.has(jobStatus) ||
-    BACKGROUND_STATUS_TOKENS.has(jobStage)
-  ) {
+  if (readiness.readiness === "background" || uploadActivity.phase === "background") {
     return buildUserFileStatus("enhancing", readiness.readinessDetail);
   }
 
-  if (
-    readiness.ready ||
-    readiness.readiness === "ready" ||
-    READY_STATUS_TOKENS.has(jobStatus) ||
-    READY_STATUS_TOKENS.has(jobStage)
-  ) {
+  if (readiness.ready || readiness.readiness === "ready" || uploadActivity.phase === "ready") {
     return buildUserFileStatus("ready");
   }
 
-  if (jobStatus === "failed" || jobStage === "failed") {
+  if (uploadActivity.phase === "failed") {
     return buildUserFileStatus("failed", readiness.readinessDetail);
   }
 
-  if (
-    readiness.readiness === "processing" ||
-    PREPARING_STATUS_TOKENS.has(jobStatus) ||
-    PREPARING_STATUS_TOKENS.has(jobStage)
-  ) {
-    return buildUserFileStatus("preparing");
+  if (uploadActivity.phase === "ocr") {
+    return buildUserFileStatus("ocring", readiness.readinessDetail);
   }
 
-  return buildUserFileStatus("preparing");
+  if (uploadActivity.phase === "classifying") {
+    return buildUserFileStatus("classifying", readiness.readinessDetail);
+  }
+
+  if (uploadActivity.phase === "uploading") {
+    return buildUserFileStatus("uploading", readiness.readinessDetail);
+  }
+
+  return buildUserFileStatus("preparing", readiness.readinessDetail);
 }
 
 function pickDisplayStatus(localStatus: UserFileStatus | null, serverStatus: UserFileStatus | null) {
   if (!localStatus) return serverStatus;
   if (!serverStatus) return localStatus;
+  if (serverStatus.kind === "failed") return serverStatus;
+  if ((localStatus.kind === "failed" || localStatus.kind === "ready") && serverStatus.kind !== localStatus.kind) {
+    return serverStatus;
+  }
   if (serverStatus.kind === "enhancing" || localStatus.kind === "enhancing") {
     return serverStatus.kind === "enhancing" ? serverStatus : localStatus;
   }
   if (serverStatus.kind === "ready" || localStatus.kind === "ready") {
     return serverStatus.kind === "ready" ? serverStatus : localStatus;
-  }
-  if (serverStatus.kind === "failed" || localStatus.kind === "failed") {
-    return serverStatus.kind === "failed" ? serverStatus : localStatus;
   }
   return statusPriority(localStatus.kind) >= statusPriority(serverStatus.kind) ? localStatus : serverStatus;
 }
@@ -433,12 +416,10 @@ function mergeVisibleFileRows(
 
 function findMatchingUploadFile(upload: ActiveUpload | null, rows: FileRow[]) {
   if (!upload) return null;
-  return (
-    rows.find((file) => {
-      if (upload.fileId && file.id === upload.fileId) return true;
-      return file.name === upload.fileName;
-    }) ?? null
-  );
+  if (upload.fileId) {
+    return rows.find((file) => file.id === upload.fileId) ?? null;
+  }
+  return rows.find((file) => file.name === upload.fileName) ?? null;
 }
 
 function isUploadReadyFromSnapshot(
@@ -480,14 +461,18 @@ function pickImportQuota(json: any): { used: number; limit: number | null } {
 function describeProcessingStage(activeUpload: ActiveUpload | null) {
   if (!activeUpload || activeUpload.kind !== "pdf" || !activeUpload.responseSettled) return null;
 
-  const status = normalizeStatusToken(activeUpload.status);
-  const stage = normalizeStatusToken(activeUpload.stage);
-  if (status === "failed" || stage === "failed") return null;
-  if (BACKGROUND_STATUS_TOKENS.has(status) || BACKGROUND_STATUS_TOKENS.has(stage)) {
+  const uploadActivity = resolveUploadActivity({
+    status: activeUpload.status,
+    stage: activeUpload.stage,
+  });
+  if (uploadActivity.phase === "failed" || uploadActivity.phase === "ready") return null;
+  if (uploadActivity.phase === "background") {
     return "Status: Materialet er klar og forbedres i baggrunden";
   }
-  if (READY_STATUS_TOKENS.has(status) || READY_STATUS_TOKENS.has(stage)) return null;
-  return "Status: Klargøres";
+  if (uploadActivity.phase === "uploading") return "Status: Filen uploades";
+  if (uploadActivity.phase === "classifying") return "Status: PDF'en klassificeres";
+  if (uploadActivity.phase === "ocr") return "Status: OCR i gang";
+  return "Status: Materialet klargøres";
 }
 
 function getUploadPollDelayMs(elapsedMs: number) {
@@ -511,6 +496,17 @@ function mergeActiveUploadState(current: ActiveUpload | null, patch: Partial<Act
     status: patch.status ?? current.status,
     stage: patch.stage ?? current.stage,
   };
+}
+
+function mapUploadPhaseToLocalStatus(phase: ReturnType<typeof resolveUploadActivity>["phase"]): UserFileStatusKind | null {
+  if (phase === "uploading") return "uploading";
+  if (phase === "classifying") return "classifying";
+  if (phase === "ocr") return "ocring";
+  if (phase === "processing") return "preparing";
+  if (phase === "background") return "enhancing";
+  if (phase === "ready") return "ready";
+  if (phase === "failed") return "failed";
+  return null;
 }
 
 export default function UploadClient({ folders: initialFolders, initialFolderId, ownerId, onFoldersChange }: Props) {
@@ -553,6 +549,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [audioNoteMode, setAudioNoteMode] = useState<"resume" | "focus" | "both">("both");
   const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
   const [activeUpload, setActiveUpload] = useState<ActiveUpload | null>(null);
+  const activeUploadRef = useRef<ActiveUpload | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const uploadAbortReasonRef = useRef<string | null>(null);
   const lastActiveUploadRefreshRef = useRef(0);
@@ -787,6 +784,26 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   }, [activeUpload?.requestId]);
 
   useEffect(() => {
+    activeUploadRef.current = activeUpload;
+  }, [activeUpload]);
+
+  useEffect(() => {
+    const phase = activeUpload
+      ? resolveUploadActivity({
+          status: activeUpload.status,
+          stage: activeUpload.stage,
+        }).phase
+      : null;
+    if (!phase || isTerminalUploadActivityPhase(phase)) return;
+    setUploadNotice(null);
+    setUploadError(null);
+  }, [activeUpload]);
+
+  useEffect(() => {
+    dispatchUploadActivity(Boolean(activeUpload) || uploading);
+  }, [activeUpload, dispatchUploadActivity, uploading]);
+
+  useEffect(() => {
     return () => {
       if (uploadReadyRefreshTimeoutRef.current != null) {
         window.clearTimeout(uploadReadyRefreshTimeoutRef.current);
@@ -842,6 +859,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const hasValidUploadFolder = !!uploadFolderId && folderOptions.some((folder) => folder.id === uploadFolderId);
   const canUpload = !!pickedFile && hasValidUploadFolder && !uploading && !quotaBlocked && !foldersLoading;
   const processingStatusText = describeProcessingStage(activeUpload);
+  const activeUploadPhase = activeUpload
+    ? resolveUploadActivity({
+        status: activeUpload.status,
+        stage: activeUpload.stage,
+      }).phase
+    : null;
+  const visibleUploadNotice =
+    activeUploadPhase && !isTerminalUploadActivityPhase(activeUploadPhase) ? null : uploadNotice;
   const visibleFiles = useMemo(
     () => mergeVisibleFileRows(files, listFolderId, localFileStatusesById, suppressedFileIds),
     [files, listFolderId, localFileStatusesById, suppressedFileIds],
@@ -1065,31 +1090,34 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   }
 
   function fileListStatusDetail(status: UserFileStatus | null) {
-    return status?.kind === "failed" || status?.kind === "enhancing" ? status.detail : null;
+    if (!status || status.kind === "ready") return null;
+    return status.detail;
   }
 
   useEffect(() => {
-    if (!activeUpload) return;
-    if (isFileSuppressed(activeUpload.fileId)) return;
-
+    const trackedRequestId = activeUpload?.requestId ?? null;
+    if (!trackedRequestId) return;
     let cancelled = false;
     let nextDelayMs = UPLOAD_STATUS_POLL_MS;
     let timeoutId: number | null = null;
+    const initialUpload = activeUploadRef.current ?? activeUpload;
     console.info("[UploadClient] polling started", {
-      requestId: activeUpload.requestId,
-      fileName: activeUpload.fileName,
-      startedAt: activeUpload.startedAt,
+      requestId: trackedRequestId,
+      fileName: initialUpload?.fileName ?? null,
+      startedAt: initialUpload?.startedAt ?? null,
     });
 
     const stopWithError = (message: string, reason: string) => {
       if (cancelled) return;
-      if (activeUpload.fileId) {
+      const currentUpload = activeUploadRef.current;
+      if (!currentUpload || currentUpload.requestId !== trackedRequestId) return;
+      if (currentUpload.fileId) {
         upsertLocalFileStatus({
-          fileId: activeUpload.fileId,
-          fileName: activeUpload.fileName,
-          folderId: activeUpload.folderId,
-          sizeBytes: visibleFiles.find((file) => file.id === activeUpload.fileId)?.sizeBytes ?? null,
-          uploadedAt: visibleFiles.find((file) => file.id === activeUpload.fileId)?.uploadedAt ?? null,
+          fileId: currentUpload.fileId,
+          fileName: currentUpload.fileName,
+          folderId: currentUpload.folderId,
+          sizeBytes: visibleFiles.find((file) => file.id === currentUpload.fileId)?.sizeBytes ?? null,
+          uploadedAt: visibleFiles.find((file) => file.id === currentUpload.fileId)?.uploadedAt ?? null,
           status: "failed",
           error: message,
           updatedAt: Date.now(),
@@ -1097,44 +1125,48 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       }
       uploadAbortReasonRef.current = message;
       uploadAbortRef.current?.abort(reason);
-      clearPickedFileSelection(activeUpload.fileName);
-      if (!activeUpload.fileId) {
+      clearPickedFileSelection(currentUpload.fileName);
+      if (!currentUpload.fileId) {
         setUploadError(message);
       }
       setUploading(false);
-      setActiveUpload(null);
+      setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
       console.warn("[UploadClient] polling stopped with error", {
-        requestId: activeUpload.requestId,
+        requestId: trackedRequestId,
         reason,
         message,
       });
     };
 
-    const poll = async () => {
-      const elapsedMs = Date.now() - activeUpload.startedAt;
-      const timeoutMs = activeUpload.kind === "pdf" ? PDF_UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS;
+    const poll = async (): Promise<boolean> => {
+      const currentUpload = activeUploadRef.current;
+      if (!currentUpload || currentUpload.requestId !== trackedRequestId) return false;
+      if (isFileSuppressed(currentUpload.fileId)) return false;
+
+      const elapsedMs = Date.now() - currentUpload.startedAt;
+      const timeoutMs = currentUpload.kind === "pdf" ? PDF_UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_UPLOAD_REQUEST_TIMEOUT_MS;
       if (elapsedMs > timeoutMs) {
         if (!cancelled) {
           setUploadNotice(
-            activeUpload.kind === "pdf"
+            currentUpload.kind === "pdf"
               ? "Uploaden tager længere tid end forventet. Materialet kan stadig være på vej."
               : "Uploaden tog længere tid end forventet. Prøv at opdatere om lidt.",
           );
           setUploading(false);
-          setActiveUpload(null);
+          setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
           console.warn("[UploadClient] polling stopped after timeout", {
-            requestId: activeUpload.requestId,
+            requestId: trackedRequestId,
             elapsedMs,
             timeoutMs,
           });
         }
-        return;
+        return false;
       }
 
       try {
-        const statusQuery = activeUpload.jobId
-          ? `job_id=${encodeURIComponent(activeUpload.jobId)}`
-          : `request_id=${encodeURIComponent(activeUpload.requestId)}`;
+        const statusQuery = currentUpload.jobId
+          ? `job_id=${encodeURIComponent(currentUpload.jobId)}`
+          : `request_id=${encodeURIComponent(currentUpload.requestId)}`;
         const res = await fetch(`/api/import-status?${statusQuery}`, {
           method: "GET",
           cache: "no-store",
@@ -1144,11 +1176,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (res.status === 401 || res.status === 429) {
           nextDelayMs = UPLOAD_STATUS_BACKOFF_MS;
           console.warn("[UploadClient] polling temporary auth/status issue", {
-            requestId: activeUpload.requestId,
+            requestId: trackedRequestId,
             status: res.status,
             nextDelayMs,
           });
-          return;
+          return true;
         }
 
         const text = await res.text();
@@ -1156,17 +1188,17 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         const activeJob = json?.activeJob ?? null;
 
         console.info("[UploadClient] polling tick", {
-          requestId: activeUpload.requestId,
+          requestId: trackedRequestId,
           responseOk: res.ok,
           activeJobId: activeJob?.id ?? null,
           activeJobStatus: activeJob?.status ?? null,
           activeJobStage: activeJob?.stage ?? null,
-          responseSettled: activeUpload.responseSettled,
+          responseSettled: currentUpload.responseSettled,
         });
 
         if (activeJob?.id) {
           setActiveUpload((prev) =>
-            prev && prev.requestId === activeUpload.requestId
+            prev && prev.requestId === trackedRequestId
               ? mergeActiveUploadState(prev, {
                   jobId: asString(activeJob.id),
                   fileId: asString(activeJob.fileId),
@@ -1178,60 +1210,83 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           );
         }
 
-        const normalizedJobStatus = String(activeJob?.status ?? "").toLowerCase();
-        const normalizedJobStage = String(activeJob?.stage ?? "").toLowerCase();
+        const uploadActivity = resolveUploadActivity({
+          status: activeJob?.status,
+          stage: activeJob?.stage,
+        });
+        const uploadReachedTerminalState = isTerminalUploadActivityPhase(uploadActivity.phase);
         nextDelayMs = getUploadPollDelayMs(elapsedMs);
 
+        if (!uploadReachedTerminalState) {
+          setUploadNotice(null);
+          setUploadError(null);
+        }
+
+        const latestUpload = activeUploadRef.current;
+        if (!latestUpload || latestUpload.requestId !== trackedRequestId) return false;
+
+        if (latestUpload.fileId) {
+          const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
+          const liveStatus = mapUploadPhaseToLocalStatus(uploadActivity.phase);
+          if (liveStatus && uploadActivity.phase !== "ready" && uploadActivity.phase !== "background" && uploadActivity.phase !== "failed") {
+            upsertLocalFileStatus({
+              fileId: latestUpload.fileId,
+              fileName: matchedFile?.name ?? latestUpload.fileName,
+              folderId: latestUpload.folderId,
+              sizeBytes: matchedFile?.sizeBytes ?? null,
+              uploadedAt: matchedFile?.uploadedAt ?? null,
+              status: liveStatus,
+              error: uploadActivity.detail,
+              updatedAt: Date.now(),
+            });
+          }
+        }
+
         if (
-          activeUpload.fileId &&
-          (READY_STATUS_TOKENS.has(normalizedJobStatus) ||
-            READY_STATUS_TOKENS.has(normalizedJobStage) ||
-            BACKGROUND_STATUS_TOKENS.has(normalizedJobStatus) ||
-            BACKGROUND_STATUS_TOKENS.has(normalizedJobStage))
+          latestUpload.fileId &&
+          (uploadActivity.phase === "ready" || uploadActivity.phase === "background")
         ) {
           if (!cancelled) {
-            const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
+            const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
             upsertLocalFileStatus({
-              fileId: activeUpload.fileId,
-              fileName: matchedFile?.name ?? activeUpload.fileName,
-              folderId: activeUpload.folderId,
+              fileId: latestUpload.fileId,
+              fileName: matchedFile?.name ?? latestUpload.fileName,
+              folderId: latestUpload.folderId,
               sizeBytes: matchedFile?.sizeBytes ?? null,
               uploadedAt: matchedFile?.uploadedAt ?? null,
               status: "ready",
               error: null,
               updatedAt: Date.now(),
             });
-            void refreshCompletedUploadFiles(activeUpload, "job-first-ready");
+            void refreshCompletedUploadFiles(latestUpload, "job-first-ready");
             setUploadNotice("Materialet er klar nu.");
-            setActiveUpload(null);
+            setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
             setUploading(false);
             dispatchQuotaChanged();
           }
-          return;
+          return false;
         }
 
         const shouldForceRefresh =
-          !!activeUpload.responseSettled &&
-          (!activeJob ||
-            READY_STATUS_TOKENS.has(normalizedJobStatus) ||
-            READY_STATUS_TOKENS.has(normalizedJobStage));
+          !!latestUpload.responseSettled &&
+          (!activeJob || uploadActivity.phase === "ready");
         const refreshedSnapshot = await refreshActiveUploadFiles(
-          activeUpload,
+          latestUpload,
           !activeJob ? "active-job-missing" : shouldForceRefresh ? "job-finished" : "processing-reconcile",
           shouldForceRefresh,
         );
-        if (refreshedSnapshot && isUploadReadyFromSnapshot(activeUpload, refreshedSnapshot.files, refreshedSnapshot.readinessById)) {
+        if (refreshedSnapshot && isUploadReadyFromSnapshot(latestUpload, refreshedSnapshot.files, refreshedSnapshot.readinessById)) {
           if (!cancelled) {
-            const matchedFile = findMatchingUploadFile(activeUpload, refreshedSnapshot.files);
+            const matchedFile = findMatchingUploadFile(latestUpload, refreshedSnapshot.files);
             console.info("[UploadClient] stopping processing state after readiness refresh", {
-              requestId: activeUpload.requestId,
-              reason: !activeJob ? "active-job-missing" : normalizedJobStatus || "processing",
+              requestId: trackedRequestId,
+              reason: !activeJob ? "active-job-missing" : uploadActivity.phase,
             });
             if (matchedFile?.id) {
               upsertLocalFileStatus({
                 fileId: matchedFile.id,
                 fileName: matchedFile.name,
-                folderId: activeUpload.folderId,
+                folderId: latestUpload.folderId,
                 sizeBytes: matchedFile.sizeBytes,
                 uploadedAt: matchedFile.uploadedAt,
                 status: "ready",
@@ -1239,39 +1294,39 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                 updatedAt: Date.now(),
               });
             }
-            void refreshCompletedUploadFiles(activeUpload, "polling-readiness-refresh", true);
+            void refreshCompletedUploadFiles(latestUpload, "polling-readiness-refresh", true);
             setUploadNotice("Materialet er klar nu.");
-            setActiveUpload(null);
+            setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
             setUploading(false);
             dispatchQuotaChanged();
           }
-          return;
+          return false;
         }
 
         if (!activeJob && elapsedMs > UPLOAD_JOB_BOOT_TIMEOUT_MS) {
           console.info("[UploadClient] waiting for job start", {
-            requestId: activeUpload.requestId,
+            requestId: trackedRequestId,
             elapsedMs,
             timeoutMs,
           });
         }
 
-        if (normalizedJobStatus === "failed") {
+        if (uploadActivity.phase === "failed") {
           stopWithError(activeJob?.error ?? "Uploaden fejlede under behandlingen.", "job-failed");
-          if (listFolderIdRef.current === activeUpload.folderId) {
-            void loadFiles(activeUpload.folderId);
+          if (listFolderIdRef.current === latestUpload.folderId) {
+            void loadFiles(latestUpload.folderId);
           }
-          return;
+          return false;
         }
 
-        if (READY_STATUS_TOKENS.has(normalizedJobStatus) || READY_STATUS_TOKENS.has(normalizedJobStage)) {
+        if (uploadActivity.phase === "ready") {
           if (!cancelled) {
-            if (activeUpload.fileId) {
-              const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
+            if (latestUpload.fileId) {
+              const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
               upsertLocalFileStatus({
-                fileId: activeUpload.fileId,
-                fileName: matchedFile?.name ?? activeUpload.fileName,
-                folderId: activeUpload.folderId,
+                fileId: latestUpload.fileId,
+                fileName: matchedFile?.name ?? latestUpload.fileName,
+                folderId: latestUpload.folderId,
                 sizeBytes: matchedFile?.sizeBytes ?? null,
                 uploadedAt: matchedFile?.uploadedAt ?? null,
                 status: "ready",
@@ -1279,44 +1334,52 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
                 updatedAt: Date.now(),
               });
             }
-            void refreshCompletedUploadFiles(activeUpload, "job-finished");
+            void refreshCompletedUploadFiles(latestUpload, "job-finished");
             setUploadNotice("Materialet er klar nu.");
-            setActiveUpload(null);
+            setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
             dispatchQuotaChanged();
           }
-          return;
+          return false;
         }
+        return true;
       } catch (error) {
         if (!cancelled) {
           nextDelayMs = UPLOAD_STATUS_BACKOFF_MS;
           console.warn("[UploadClient] polling error", {
-            requestId: activeUpload.requestId,
+            requestId: trackedRequestId,
             error,
             nextDelayMs,
           });
         }
+        return true;
       }
     };
 
     const scheduleNext = () => {
       if (cancelled) return;
       timeoutId = window.setTimeout(async () => {
-        await poll();
-        scheduleNext();
+        const shouldContinue = await poll();
+        if (shouldContinue && !cancelled) {
+          scheduleNext();
+        }
       }, nextDelayMs);
     };
 
-    void poll().finally(() => scheduleNext());
+    void poll().then((shouldContinue) => {
+      if (shouldContinue && !cancelled) {
+        scheduleNext();
+      }
+    });
 
     return () => {
       cancelled = true;
       if (timeoutId != null) window.clearTimeout(timeoutId);
       console.info("[UploadClient] polling stopped", {
-        requestId: activeUpload.requestId,
+        requestId: trackedRequestId,
       });
     };
   }, [
-    activeUpload,
+    activeUpload?.requestId,
     dispatchQuotaChanged,
     isFileSuppressed,
     loadFiles,
@@ -1344,7 +1407,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setUploadResult(null);
     setDeleteErrorsById({});
     uploadAbortReasonRef.current = null;
-    dispatchUploadActivity(true);
 
     let keepPollingAfterResponse = false;
     let pendingFileId: string | null = null;
@@ -1422,6 +1484,16 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             : prev,
         );
         pendingFileId = initFileId;
+        upsertLocalFileStatus({
+          fileId: initFileId,
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          uploadedAt: null,
+          status: "uploading",
+          error: null,
+          updatedAt: Date.now(),
+        });
 
         const supabase = createBrowserClient();
         const storageUpload = await supabase.storage.from(bucket).uploadToSignedUrl(storagePath, uploadToken, pickedFile, {
@@ -1599,13 +1671,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       });
       setUploadError(null);
       const uploadKind = data?.uploadKind === "audio" ? "audio" : "pdf";
-      const responseStage = normalizeStatusToken(asString(data?.stage));
-      const responseJobStatus = normalizeStatusToken(asString(data?.jobStatus));
-      const responseAlreadyReady =
-        READY_STATUS_TOKENS.has(responseStage) ||
-        READY_STATUS_TOKENS.has(responseJobStatus) ||
-        BACKGROUND_STATUS_TOKENS.has(responseStage) ||
-        BACKGROUND_STATUS_TOKENS.has(responseJobStatus);
+      const responseActivity = resolveUploadActivity({
+        status: asString(data?.jobStatus),
+        stage: asString(data?.stage),
+      });
+      const responseAlreadyReady = responseActivity.phase === "ready" || responseActivity.phase === "background";
       const processingAccepted =
         uploadKind === "pdf" &&
         !responseAlreadyReady &&
@@ -1616,14 +1686,19 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       keepPollingAfterResponse = processingAccepted;
       setUploading(false);
+      if (processingAccepted) {
+        setUploadNotice(null);
+        setUploadError(null);
+      }
       if (pendingFileId && uploadKind === "pdf" && !isFileSuppressed(pendingFileId)) {
+        const pendingStatus = mapUploadPhaseToLocalStatus(responseActivity.phase) ?? "preparing";
         upsertLocalFileStatus({
           fileId: pendingFileId,
           fileName: pickedFile.name,
           folderId: uploadFolderId,
           sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
           uploadedAt: optimisticUploadedAt,
-          status: processingAccepted ? "preparing" : "ready",
+          status: processingAccepted ? pendingStatus : "ready",
           error: null,
           updatedAt: Date.now(),
         });
@@ -1647,7 +1722,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
               kind: "pdf",
               fileName: pickedFile.name,
               message: processingAccepted
-                ? "Fil modtaget. Materialet bliver gjort klar til brug i Notely."
+                ? responseActivity.phase === "ocr"
+                  ? "Fil modtaget. OCR er i gang, og materialet bliver gjort klar til brug i Notely."
+                  : "Fil modtaget. Materialet bliver gjort klar til brug i Notely."
                 : "Fil modtaget og klar til brug i Notely.",
             },
       );
@@ -1726,7 +1803,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         setActiveUpload(null);
       }
       setUploading(false);
-      dispatchUploadActivity(false);
     }
   }
 
@@ -1982,7 +2058,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         ) : null}
 
         {quotaBlocked ? <LimitNotice className="mt-4">{quotaBlocked}</LimitNotice> : null}
-        {uploadNotice ? <LimitNotice className="mt-3">{uploadNotice}</LimitNotice> : null}
+        {visibleUploadNotice ? <LimitNotice className="mt-3">{visibleUploadNotice}</LimitNotice> : null}
         {uploadError && !activeUpload ? <div className="mt-3 text-xs text-red-600">{uploadError}</div> : null}
         {processingStatusText ? <div className="mt-3 text-xs text-zinc-600">{processingStatusText}</div> : null}
         <div className="mt-4 flex items-center justify-between">
@@ -2051,7 +2127,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             const statusDetail = fileListStatusDetail(status);
             const rowDeleteError = deleteErrorsById[f.id] ?? null;
             const isLocalOnlyRow = !isPersistedFileRow(f.id);
-            const isTransientUpload = status?.kind === "uploaded" || status?.kind === "preparing";
+            const isTransientUpload =
+              status?.kind === "uploading" ||
+              status?.kind === "classifying" ||
+              status?.kind === "ocring" ||
+              status?.kind === "preparing";
 
             return (
               <div

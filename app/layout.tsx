@@ -1,7 +1,7 @@
 ﻿// app/layout.tsx
 import type { Metadata } from "next";
+import type { CSSProperties } from "react";
 import "./globals.css";
-import { Inter, Birthstone } from "next/font/google";
 import { Toaster } from "sonner";
 
 export const metadata: Metadata = {
@@ -9,16 +9,11 @@ export const metadata: Metadata = {
   description: "Studieassistent / Eksamens­træner",
 };
 
-const inter = Inter({
-  subsets: ["latin"],
-  display: "swap",
-});
-
-const birthstone = Birthstone({
-  subsets: ["latin"],
-  weight: "400",
-  variable: "--font-birthstone",
-});
+const bodyStyle: CSSProperties & Record<"--font-logo" | "--font-birthstone", string> = {
+  fontFamily: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  "--font-birthstone": '"Brush Script MT", "Segoe Script", cursive',
+  "--font-logo": 'var(--font-birthstone)',
+};
 
 export default function RootLayout({
   children,
@@ -28,7 +23,8 @@ export default function RootLayout({
   return (
     <html lang="da">
       <body
-        className={`${inter.className} ${birthstone.variable} [--font-logo:var(--font-birthstone)] min-h-screen bg-[#fffef9] text-zinc-900 antialiased selection:bg-black selection:text-white`}
+        style={bodyStyle}
+        className="min-h-screen bg-[#fffef9] text-zinc-900 antialiased selection:bg-black selection:text-white"
       >
         {children}
         <Toaster position="top-right" richColors />

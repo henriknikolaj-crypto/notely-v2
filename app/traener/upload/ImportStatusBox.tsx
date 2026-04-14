@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import { isTerminalUploadActivity, resolveUploadActivity } from "@/lib/trainer/uploadState";
 
 type ImportStatusResponse = {
   ok: boolean;
@@ -31,9 +32,14 @@ type ImportStatusResponse = {
   // optional (nyere “flat” helpers)
   filesTotal?: number;
   latestFile?: { name?: string; uploadedAt?: string | null; updated_at?: string | null } | null;
+  activeJob?: {
+    status?: string | null;
+    stage?: string | null;
+  } | null;
   folderReadinessSummary?: {
     ready: number;
     processing: number;
+    background?: number;
     failed: number;
   } | null;
 
@@ -180,7 +186,17 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
     window.addEventListener("notely-quota-changed", onRefresh);
     window.addEventListener("notely:upload-activity", onUploadActivity as EventListener);
 
-    const t = uploadActive ? null : setInterval(() => void load(), Math.max(15000, refreshMs));
+    const activeJobPhase = data?.activeJob
+      ? resolveUploadActivity({
+          status: data.activeJob.status,
+          stage: data.activeJob.stage,
+        }).phase
+      : null;
+    const shouldAutoRefresh =
+      !uploadActive &&
+      ((!!data?.activeJob && !!activeJobPhase && !isTerminalUploadActivity({ status: data.activeJob?.status, stage: data.activeJob?.stage })) ||
+        ((data?.folderReadinessSummary?.processing ?? 0) > 0));
+    const t = shouldAutoRefresh ? setInterval(() => void load(), Math.max(15000, refreshMs)) : null;
 
     return () => {
       window.removeEventListener("notely:import-status-refresh", onRefresh);
@@ -188,7 +204,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
       window.removeEventListener("notely:upload-activity", onUploadActivity as EventListener);
       if (t != null) clearInterval(t);
     };
-  }, [load, refreshMs, uploadActive]);
+  }, [data, load, refreshMs, uploadActive]);
 
   // ✅ robust udlæsning (nestet + flat)
   const planRaw = (data?.quota?.plan ?? data?.plan ?? "freemium").toString();
@@ -267,7 +283,9 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
         </div>
         {folderReadinessSummary ? (
           <div className="mt-2 text-[11px] text-zinc-500">
-            Klar: {folderReadinessSummary.ready} · Behandles: {folderReadinessSummary.processing} · Fejlede: {folderReadinessSummary.failed}
+            Klar: {folderReadinessSummary.ready} · Behandles: {folderReadinessSummary.processing}
+            {typeof folderReadinessSummary.background === "number" ? ` · Forbedres: ${folderReadinessSummary.background}` : ""}
+            {" · "}Fejlede: {folderReadinessSummary.failed}
           </div>
         ) : null}
       </div>
