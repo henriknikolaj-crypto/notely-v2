@@ -192,7 +192,7 @@ export async function POST(req: NextRequest) {
   jobId = String((jobInsert.data as any).id);
 
   try {
-    await safeJobUpdate(sb, jobId, { status: "started", started_at: new Date().toISOString() });
+    await safeJobUpdate(sb, jobId, { status: "queued", started_at: new Date().toISOString() });
 
     const file = payload.file;
     if (!file?.md5 || !String(file.md5).trim()) throw new Error("payload.file.md5 mangler");
@@ -388,5 +388,4 @@ export async function POST(req: NextRequest) {
     return fail("Import failed", 500, { requestId, detail });
   }
 }
-
 

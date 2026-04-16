@@ -819,7 +819,7 @@ async function safeUpdateJob(admin: any, jobId: string | null, patch: Record<str
               : typeof (attempt as any).meta?.stage === "string"
                 ? String((attempt as any).meta.stage)
                 : null;
-          if (status === "started" || status === "finished" || status === "succeeded" || status === "failed") {
+          if (status === "queued" || status === "finished" || status === "succeeded" || status === "failed") {
             console.info("[trainer/upload] job update committed", {
               jobId,
               mode,
@@ -1359,7 +1359,7 @@ async function processAcceptedPdfUpload(args: {
     const startedAt = new Date().toISOString();
     const firstProcessingPayload = buildStageTrackingPayload("first_processing", null, null, buildPhaseTimingExtraMeta());
     await safeUpdateJob(admin, jobId, {
-      status: "started",
+      status: "queued",
       file_id: fileId,
       started_at: startedAt,
       payload: firstProcessingPayload,
@@ -2306,17 +2306,9 @@ export async function POST(req: NextRequest) {
   let ownerId = "";
   try {
     const sb = resolveUploadAuthClient(req);
-    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
-    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
-
-    let getUserError: string | null = null;
-    ownerId = sessionUserId ?? "";
-
-    if (!ownerId) {
-      const { data: authData, error: authError } = await sb.auth.getUser();
-      getUserError = authError?.message ?? null;
-      ownerId = authData?.user?.id ? String(authData.user.id) : "";
-    }
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    const getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : "";
 
     if (!ownerId) {
       return NextResponse.json(
@@ -2327,9 +2319,9 @@ export async function POST(req: NextRequest) {
           ...(process.env.VERCEL_ENV === "preview"
             ? {
                 debug: {
-                  hasSession: !!sessionData?.session,
-                  sessionUserId,
-                  sessionError: sessionError?.message ?? null,
+                  hasSession: null,
+                  sessionUserId: null,
+                  sessionError: null,
                   getUserError,
                   cookieNames,
                 },

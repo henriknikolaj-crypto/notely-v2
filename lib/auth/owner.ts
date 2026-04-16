@@ -20,18 +20,6 @@ function isUuid(v: string) {
 export async function getOwnerCtx(req: NextRequest, sb: any): Promise<OwnerCtx | null> {
   // 1) Auth først
   try {
-    if (sb?.auth?.getSession) {
-      const { data } = await sb.auth.getSession();
-      const sessionUser = data?.session?.user;
-      if (sessionUser?.id) {
-        return {
-          ownerId: String(sessionUser.id),
-          mode: "auth",
-          user: { id: String(sessionUser.id), email: (sessionUser.email as any) ?? null },
-        };
-      }
-    }
-
     if (sb?.auth?.getUser) {
       const { data, error } = await sb.auth.getUser();
       if (!error && data?.user?.id) {

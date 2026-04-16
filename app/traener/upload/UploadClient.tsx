@@ -64,6 +64,8 @@ type ActiveUpload = {
   startedAt: number;
   fileName: string;
   folderId: string;
+  sizeBytes: number | null;
+  uploadedAt: string | null;
   jobId: string | null;
   fileId: string | null;
   responseSettled: boolean;
@@ -177,6 +179,13 @@ function humanBytes(n: number | null) {
   return `${n} B`;
 }
 
+function joinMetaParts(...parts: Array<string | null | undefined>) {
+  return parts
+    .map((part) => String(part ?? "").trim())
+    .filter((part) => part.length > 0)
+    .join(" · ");
+}
+
 function safeJson(text: string) {
   try {
     return text ? JSON.parse(text) : null;
@@ -270,24 +279,24 @@ function buildReadinessMap(rows: FileReadiness[]) {
 
 function buildUserFileStatus(kind: UserFileStatusKind, error?: string | null): UserFileStatus {
   if (kind === "uploading") {
-    return { kind, label: "Uploades", detail: error ?? "Filen uploades og registreres" };
+    return { kind, label: "Uploades", detail: error ?? null };
   }
   if (kind === "classifying") {
-    return { kind, label: "Klassificeres", detail: error ?? "Vi afgør den hurtigste sikre behandlingsvej" };
+    return { kind, label: "Behandles", detail: error ?? "Analyserer filen" };
   }
   if (kind === "ocring") {
-    return { kind, label: "OCR i gang", detail: error ?? "Vi læser siderne med OCR" };
+    return { kind, label: "Behandles", detail: error ?? "Læser siderne med OCR" };
   }
   if (kind === "preparing") {
-    return { kind, label: "Klargøres", detail: error ?? "Materialet klargøres" };
+    return { kind, label: "Behandles", detail: error ?? "Klargør materialet" };
   }
   if (kind === "enhancing") {
-    return { kind, label: "Forbedres", detail: error ?? "Materialet er klar og forbedres i baggrunden" };
+    return { kind, label: "Forbedres", detail: error ?? "Efterbehandler i baggrunden" };
   }
   if (kind === "ready") {
     return { kind, label: "Klar", detail: null };
   }
-  return { kind, label: "Fejl", detail: error ?? "Klargøring fejlede" };
+  return { kind, label: "Fejl", detail: error ?? "Uploaden fejlede" };
 }
 
 function statusPriority(kind: UserFileStatusKind) {
@@ -318,6 +327,21 @@ function mergeLocalFileStatus(current: LocalFileStatus | null, next: LocalFileSt
     error: current.error,
     updatedAt: current.updatedAt,
   };
+}
+
+function sameLocalFileStatus(a: LocalFileStatus | null, b: LocalFileStatus | null) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.fileId === b.fileId &&
+    a.fileName === b.fileName &&
+    a.folderId === b.folderId &&
+    a.sizeBytes === b.sizeBytes &&
+    a.uploadedAt === b.uploadedAt &&
+    a.status === b.status &&
+    a.error === b.error &&
+    a.updatedAt === b.updatedAt
+  );
 }
 
 function mapReadinessToUserStatus(readiness: FileReadiness | null): UserFileStatus | null {
@@ -416,10 +440,8 @@ function mergeVisibleFileRows(
 
 function findMatchingUploadFile(upload: ActiveUpload | null, rows: FileRow[]) {
   if (!upload) return null;
-  if (upload.fileId) {
-    return rows.find((file) => file.id === upload.fileId) ?? null;
-  }
-  return rows.find((file) => file.name === upload.fileName) ?? null;
+  if (!upload.fileId) return null;
+  return rows.find((file) => file.id === upload.fileId) ?? null;
 }
 
 function isUploadReadyFromSnapshot(
@@ -430,6 +452,53 @@ function isUploadReadyFromSnapshot(
   const matchedFile = findMatchingUploadFile(upload, rows);
   if (!matchedFile) return false;
   return readinessById[matchedFile.id]?.ready === true;
+}
+
+function hasVisibleServerFileRow(upload: ActiveUpload | null, rows: FileRow[], folderId: string | null) {
+  if (!upload?.fileId) return false;
+  return rows.some((row) => row.id === upload.fileId && (!folderId || row.folderId === folderId));
+}
+
+function sameFileRows(a: FileRow[], b: FileRow[]) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      a[i]?.id !== b[i]?.id ||
+      a[i]?.name !== b[i]?.name ||
+      a[i]?.folderId !== b[i]?.folderId ||
+      a[i]?.sizeBytes !== b[i]?.sizeBytes ||
+      a[i]?.uploadedAt !== b[i]?.uploadedAt
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameReadinessMap(a: Record<string, FileReadiness>, b: Record<string, FileReadiness>) {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    const left = a[key];
+    const right = b[key];
+    if (
+      !right ||
+      left.id !== right.id ||
+      left.readiness !== right.readiness ||
+      left.readinessLabel !== right.readinessLabel ||
+      left.readinessDetail !== right.readinessDetail ||
+      left.ready !== right.ready ||
+      left.chunkCount !== right.chunkCount ||
+      left.jobStatus !== right.jobStatus ||
+      left.jobStage !== right.jobStage
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function isAudioFile(file: File | null) {
@@ -489,6 +558,8 @@ function mergeActiveUploadState(current: ActiveUpload | null, patch: Partial<Act
     startedAt: patch.startedAt ?? current.startedAt,
     fileName: patch.fileName ?? current.fileName,
     folderId: patch.folderId ?? current.folderId,
+    sizeBytes: patch.sizeBytes ?? current.sizeBytes,
+    uploadedAt: patch.uploadedAt ?? current.uploadedAt,
     jobId: patch.jobId ?? current.jobId,
     fileId: patch.fileId ?? current.fileId,
     responseSettled: patch.responseSettled ?? current.responseSettled,
@@ -535,6 +606,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const [filesError, setFilesError] = useState<string | null>(null);
   const [fileReadinessById, setFileReadinessById] = useState<Record<string, FileReadiness>>({});
   const [localFileStatusesById, setLocalFileStatusesById] = useState<Record<string, LocalFileStatus>>({});
+  const filesRef = useRef<FileRow[]>([]);
+  const fileReadinessByIdRef = useRef<Record<string, FileReadiness>>({});
   const [suppressedFileIds, setSuppressedFileIds] = useState<Record<string, true>>({});
   const suppressedFileIdsRef = useRef<Record<string, true>>({});
 
@@ -552,6 +625,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   const activeUploadRef = useRef<ActiveUpload | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const uploadAbortReasonRef = useRef<string | null>(null);
+  const uploadPollTimeoutRef = useRef<number | null>(null);
+  const activePollRequestIdRef = useRef<string | null>(null);
   const lastActiveUploadRefreshRef = useRef(0);
   const uploadReadyRefreshTimeoutRef = useRef<number | null>(null);
   const loadFoldersRequestRef = useRef(0);
@@ -569,6 +644,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
   useEffect(() => {
     suppressedFileIdsRef.current = suppressedFileIds;
   }, [suppressedFileIds]);
+
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+
+  useEffect(() => {
+    fileReadinessByIdRef.current = fileReadinessById;
+  }, [fileReadinessById]);
 
   const dispatchQuotaChanged = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -704,17 +787,26 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     }
   }, [initialFolderId, onFoldersChange]);
 
-  const loadFiles = useCallback(async (folderId: string | null) => {
+  const loadFiles = useCallback(async (folderId: string | null, options?: { silent?: boolean }) => {
     const requestSeq = ++loadFilesRequestRef.current;
+    const silent = options?.silent === true;
     if (!folderId) {
-      setFiles([]);
-      setFileReadinessById({});
-      setFilesLoading(false);
+      if (!sameFileRows(filesRef.current, [])) {
+        setFiles([]);
+      }
+      if (!sameReadinessMap(fileReadinessByIdRef.current, {})) {
+        setFileReadinessById({});
+      }
+      if (!silent) {
+        setFilesLoading(false);
+      }
       setFilesError(null);
       return { files: [] as FileRow[], readinessById: {} as Record<string, FileReadiness> };
     }
 
-    setFilesLoading(true);
+    if (!silent) {
+      setFilesLoading(true);
+    }
     setFilesError(null);
 
     try {
@@ -760,8 +852,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       if (requestSeq !== loadFilesRequestRef.current) {
         return { files: visibleRows, readinessById };
       }
-      setFiles(visibleRows);
-      setFileReadinessById(readinessById);
+      if (!sameFileRows(filesRef.current, visibleRows)) {
+        setFiles(visibleRows);
+      }
+      if (!sameReadinessMap(fileReadinessByIdRef.current, readinessById)) {
+        setFileReadinessById(readinessById);
+      }
       return { files: visibleRows, readinessById };
     } catch (e) {
       console.error("[UploadClient] loadFiles error", e);
@@ -769,7 +865,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       setFilesError("Filer opdateres lige nu.");
       return null;
     } finally {
-      if (requestSeq === loadFilesRequestRef.current) {
+      if (!silent && requestSeq === loadFilesRequestRef.current) {
         setFilesLoading(false);
       }
     }
@@ -799,19 +895,36 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     setUploadError(null);
   }, [activeUpload]);
 
+  const shouldBroadcastUploadActivity = useMemo(() => {
+    if (!activeUpload?.requestId) return false;
+    if (activeUpload.kind !== "pdf") return false;
+    if (!activeUpload.responseSettled) return false;
+    const phase = resolveUploadActivity({
+      status: activeUpload.status,
+      stage: activeUpload.stage,
+    }).phase;
+    return !isTerminalUploadActivityPhase(phase);
+  }, [activeUpload]);
+
   useEffect(() => {
-    dispatchUploadActivity(Boolean(activeUpload) || uploading);
-  }, [activeUpload, dispatchUploadActivity, uploading]);
+    dispatchUploadActivity(shouldBroadcastUploadActivity);
+  }, [dispatchUploadActivity, shouldBroadcastUploadActivity]);
 
   useEffect(() => {
     return () => {
+      dispatchUploadActivity(false);
+      activePollRequestIdRef.current = null;
+      if (uploadPollTimeoutRef.current != null) {
+        window.clearTimeout(uploadPollTimeoutRef.current);
+      }
       if (uploadReadyRefreshTimeoutRef.current != null) {
         window.clearTimeout(uploadReadyRefreshTimeoutRef.current);
       }
     };
-  }, []);
+  }, [dispatchUploadActivity]);
 
   function onPickFile(f: File | null) {
+    if (uploading) return;
     setUploadError(null);
     setUploadNotice(null);
     setUploadResult(null);
@@ -867,17 +980,51 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     : null;
   const visibleUploadNotice =
     activeUploadPhase && !isTerminalUploadActivityPhase(activeUploadPhase) ? null : uploadNotice;
+  const pinnedActiveUpload = useMemo(() => {
+    if (!activeUpload) return null;
+    if (activeUpload.fileId && suppressedFileIds[activeUpload.fileId]) return null;
+    if (!listFolderId || activeUpload.folderId !== listFolderId) return null;
+
+    const phase = activeUpload.responseSettled
+      ? resolveUploadActivity({
+          status: activeUpload.status,
+          stage: activeUpload.stage,
+        }).phase
+      : "uploading";
+    const handoffComplete = hasVisibleServerFileRow(activeUpload, files, listFolderId);
+    if (isTerminalUploadActivityPhase(phase) && handoffComplete) return null;
+
+    const localStatus = activeUpload.fileId ? localFileStatusesById[activeUpload.fileId] ?? null : null;
+    const pinnedStatusKind = localStatus?.status ?? mapUploadPhaseToLocalStatus(phase) ?? "uploading";
+    const pinnedStatus = buildUserFileStatus(pinnedStatusKind, localStatus?.error ?? null);
+
+    return {
+      requestId: activeUpload.requestId,
+      fileId: activeUpload.fileId,
+      fileName: activeUpload.fileName,
+      folderId: activeUpload.folderId,
+      sizeBytes: activeUpload.sizeBytes,
+      uploadedAt: activeUpload.uploadedAt,
+      status: pinnedStatus,
+    };
+  }, [activeUpload, files, listFolderId, localFileStatusesById, suppressedFileIds]);
   const visibleFiles = useMemo(
     () => mergeVisibleFileRows(files, listFolderId, localFileStatusesById, suppressedFileIds),
     [files, listFolderId, localFileStatusesById, suppressedFileIds],
   );
+  const renderedVisibleFiles = useMemo(() => {
+    if (!pinnedActiveUpload?.fileId) return visibleFiles;
+    return visibleFiles.filter((file) => file.id !== pinnedActiveUpload.fileId);
+  }, [pinnedActiveUpload?.fileId, visibleFiles]);
 
   const upsertLocalFileStatus = useCallback((nextStatus: LocalFileStatus) => {
     setLocalFileStatusesById((prev) => {
       const current = prev[nextStatus.fileId] ?? null;
+      const merged = mergeLocalFileStatus(current, nextStatus);
+      if (sameLocalFileStatus(current, merged)) return prev;
       return {
         ...prev,
-        [nextStatus.fileId]: mergeLocalFileStatus(current, nextStatus),
+        [nextStatus.fileId]: merged,
       };
     });
   }, []);
@@ -980,7 +1127,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         reason,
         force,
       });
-      return await loadFiles(currentFolderId);
+      return await loadFiles(currentFolderId, { silent: true });
     },
     [isFileSuppressed, loadFiles],
   );
@@ -997,7 +1144,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           folderId,
           reason,
         });
-        await loadFiles(folderId);
+        await loadFiles(folderId, { silent: true });
       }
 
       if (uploadReadyRefreshTimeoutRef.current != null) {
@@ -1011,7 +1158,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             folderId,
             reason,
           });
-          void loadFiles(folderId);
+          void loadFiles(folderId, { silent: true });
         }, UPLOAD_READY_FOLLOWUP_REFRESH_MS);
       }
     },
@@ -1036,8 +1183,9 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     if (!activeUpload.responseSettled) return;
     if (activeUpload.kind !== "pdf") return;
     if (listFolderId !== activeUpload.folderId) return;
+    if (!hasVisibleServerFileRow(activeUpload, files, listFolderId)) return;
 
-    const matchedFile = findMatchingUploadFile(activeUpload, visibleFiles);
+    const matchedFile = findMatchingUploadFile(activeUpload, files);
     if (!matchedFile) return;
     const readiness = fileReadinessById[matchedFile.id] ?? null;
     if (!readiness?.ready) return;
@@ -1069,11 +1217,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     activeUpload,
     dispatchQuotaChanged,
     fileReadinessById,
+    files,
     listFolderId,
     refreshCompletedUploadFiles,
     isFileSuppressed,
     upsertLocalFileStatus,
-    visibleFiles,
   ]);
 
   function readinessTone(status: UserFileStatus | null) {
@@ -1089,17 +1237,45 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     return status.label;
   }
 
-  function fileListStatusDetail(status: UserFileStatus | null) {
-    if (!status || status.kind === "ready") return null;
-    return status.detail;
-  }
+function fileListStatusDetail(status: UserFileStatus | null) {
+  if (!status || status.kind === "ready") return null;
+  return status.detail;
+}
+
+function isAdministrativeOnlyRow(status: UserFileStatus | null) {
+  return status?.kind === "failed";
+}
+
+function fileRowTone(status: UserFileStatus | null) {
+  if (status?.kind === "failed") return "border-red-200 bg-red-50";
+  return "border-zinc-200 bg-white";
+}
+
+function fileNameTone(status: UserFileStatus | null) {
+  if (status?.kind === "failed") return "text-red-950";
+  return "text-zinc-900";
+}
+
+function fileMetaTone(status: UserFileStatus | null) {
+  if (status?.kind === "failed") return "text-red-700";
+  return "text-zinc-500";
+}
+
+function failedRowAdminDetail(status: UserFileStatus | null) {
+  if (status?.kind !== "failed") return null;
+  return "Kun administrativ række. Materialet kan ikke bruges, før filen uploades igen.";
+}
 
   useEffect(() => {
-    const trackedRequestId = activeUpload?.requestId ?? null;
+    const trackedRequestId =
+      activeUpload?.requestId && activeUpload.kind === "pdf" && activeUpload.responseSettled
+        ? activeUpload.requestId
+        : null;
     if (!trackedRequestId) return;
     let cancelled = false;
     let nextDelayMs = UPLOAD_STATUS_POLL_MS;
     let timeoutId: number | null = null;
+    activePollRequestIdRef.current = trackedRequestId;
     const initialUpload = activeUploadRef.current ?? activeUpload;
     console.info("[UploadClient] polling started", {
       requestId: trackedRequestId,
@@ -1116,8 +1292,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           fileId: currentUpload.fileId,
           fileName: currentUpload.fileName,
           folderId: currentUpload.folderId,
-          sizeBytes: visibleFiles.find((file) => file.id === currentUpload.fileId)?.sizeBytes ?? null,
-          uploadedAt: visibleFiles.find((file) => file.id === currentUpload.fileId)?.uploadedAt ?? null,
+          sizeBytes: currentUpload.sizeBytes,
+          uploadedAt: currentUpload.uploadedAt,
           status: "failed",
           error: message,
           updatedAt: Date.now(),
@@ -1199,13 +1375,25 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (activeJob?.id) {
           setActiveUpload((prev) =>
             prev && prev.requestId === trackedRequestId
-              ? mergeActiveUploadState(prev, {
-                  jobId: asString(activeJob.id),
-                  fileId: asString(activeJob.fileId),
-                  folderId: asString(activeJob.folderId) ?? prev.folderId,
-                  status: asString(activeJob.status),
-                  stage: asString(activeJob.stage),
-                })
+              ? (() => {
+                  const next = mergeActiveUploadState(prev, {
+                    jobId: asString(activeJob.id),
+                    fileId: asString(activeJob.fileId),
+                    folderId: asString(activeJob.folderId) ?? prev.folderId,
+                    status: asString(activeJob.status),
+                    stage: asString(activeJob.stage),
+                  });
+                  if (!next) return prev;
+                  return (
+                    next.jobId === prev.jobId &&
+                    next.fileId === prev.fileId &&
+                    next.folderId === prev.folderId &&
+                    next.status === prev.status &&
+                    next.stage === prev.stage
+                  )
+                    ? prev
+                    : next;
+                })()
               : prev,
           );
         }
@@ -1226,15 +1414,14 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (!latestUpload || latestUpload.requestId !== trackedRequestId) return false;
 
         if (latestUpload.fileId) {
-          const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
           const liveStatus = mapUploadPhaseToLocalStatus(uploadActivity.phase);
           if (liveStatus && uploadActivity.phase !== "ready" && uploadActivity.phase !== "background" && uploadActivity.phase !== "failed") {
             upsertLocalFileStatus({
               fileId: latestUpload.fileId,
-              fileName: matchedFile?.name ?? latestUpload.fileName,
+              fileName: latestUpload.fileName,
               folderId: latestUpload.folderId,
-              sizeBytes: matchedFile?.sizeBytes ?? null,
-              uploadedAt: matchedFile?.uploadedAt ?? null,
+              sizeBytes: latestUpload.sizeBytes,
+              uploadedAt: latestUpload.uploadedAt,
               status: liveStatus,
               error: uploadActivity.detail,
               updatedAt: Date.now(),
@@ -1247,22 +1434,27 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           (uploadActivity.phase === "ready" || uploadActivity.phase === "background")
         ) {
           if (!cancelled) {
-            const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
             upsertLocalFileStatus({
               fileId: latestUpload.fileId,
-              fileName: matchedFile?.name ?? latestUpload.fileName,
+              fileName: latestUpload.fileName,
               folderId: latestUpload.folderId,
-              sizeBytes: matchedFile?.sizeBytes ?? null,
-              uploadedAt: matchedFile?.uploadedAt ?? null,
+              sizeBytes: latestUpload.sizeBytes,
+              uploadedAt: latestUpload.uploadedAt,
               status: "ready",
               error: null,
               updatedAt: Date.now(),
             });
-            void refreshCompletedUploadFiles(latestUpload, "job-first-ready");
+            const refreshedSnapshot = await refreshActiveUploadFiles(latestUpload, "job-first-ready", true);
+            const handoffComplete = refreshedSnapshot
+              ? hasVisibleServerFileRow(latestUpload, refreshedSnapshot.files, latestUpload.folderId)
+              : hasVisibleServerFileRow(latestUpload, files, latestUpload.folderId);
+            void refreshCompletedUploadFiles(latestUpload, "job-first-ready", true);
             setUploadNotice("Materialet er klar nu.");
-            setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
             setUploading(false);
             dispatchQuotaChanged();
+            if (handoffComplete) {
+              setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
+            }
           }
           return false;
         }
@@ -1314,7 +1506,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (uploadActivity.phase === "failed") {
           stopWithError(activeJob?.error ?? "Uploaden fejlede under behandlingen.", "job-failed");
           if (listFolderIdRef.current === latestUpload.folderId) {
-            void loadFiles(latestUpload.folderId);
+            void loadFiles(latestUpload.folderId, { silent: true });
           }
           return false;
         }
@@ -1322,22 +1514,27 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         if (uploadActivity.phase === "ready") {
           if (!cancelled) {
             if (latestUpload.fileId) {
-              const matchedFile = findMatchingUploadFile(latestUpload, visibleFiles);
               upsertLocalFileStatus({
                 fileId: latestUpload.fileId,
-                fileName: matchedFile?.name ?? latestUpload.fileName,
+                fileName: latestUpload.fileName,
                 folderId: latestUpload.folderId,
-                sizeBytes: matchedFile?.sizeBytes ?? null,
-                uploadedAt: matchedFile?.uploadedAt ?? null,
+                sizeBytes: latestUpload.sizeBytes,
+                uploadedAt: latestUpload.uploadedAt,
                 status: "ready",
                 error: null,
                 updatedAt: Date.now(),
               });
             }
-            void refreshCompletedUploadFiles(latestUpload, "job-finished");
+            const refreshedSnapshot = await refreshActiveUploadFiles(latestUpload, "job-finished", true);
+            const handoffComplete = refreshedSnapshot
+              ? hasVisibleServerFileRow(latestUpload, refreshedSnapshot.files, latestUpload.folderId)
+              : hasVisibleServerFileRow(latestUpload, files, latestUpload.folderId);
+            void refreshCompletedUploadFiles(latestUpload, "job-finished", true);
             setUploadNotice("Materialet er klar nu.");
-            setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
             dispatchQuotaChanged();
+            if (handoffComplete) {
+              setActiveUpload((prev) => (prev?.requestId === trackedRequestId ? null : prev));
+            }
           }
           return false;
         }
@@ -1363,6 +1560,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           scheduleNext();
         }
       }, nextDelayMs);
+      uploadPollTimeoutRef.current = timeoutId;
     };
 
     void poll().then((shouldContinue) => {
@@ -1374,6 +1572,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     return () => {
       cancelled = true;
       if (timeoutId != null) window.clearTimeout(timeoutId);
+      if (uploadPollTimeoutRef.current != null) {
+        window.clearTimeout(uploadPollTimeoutRef.current);
+        uploadPollTimeoutRef.current = null;
+      }
+      activePollRequestIdRef.current = null;
       console.info("[UploadClient] polling stopped", {
         requestId: trackedRequestId,
       });
@@ -1387,7 +1590,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
     refreshCompletedUploadFiles,
     uploadFolderId,
     upsertLocalFileStatus,
-    visibleFiles,
   ]);
 
   async function doUpload() {
@@ -1418,24 +1620,6 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
 
       const controller = new AbortController();
       uploadAbortRef.current = controller;
-      setActiveUpload({
-        requestId: clientRequestId,
-        startedAt: Date.now(),
-        fileName: pickedFile.name,
-        folderId: uploadFolderId,
-        jobId: null,
-        fileId: null,
-        responseSettled: false,
-        kind: selectedUploadKind,
-        status: null,
-        stage: null,
-      });
-      console.info("[UploadClient] upload started", {
-        requestId: clientRequestId,
-        fileName: pickedFile.name,
-        folderId: uploadFolderId,
-        sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
-      });
 
       let res: Response;
       let responseText = "";
@@ -1455,6 +1639,17 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         });
         const initResponseText = await initRes.text();
         const initData = safeJson(initResponseText) ?? {};
+
+        if (initRes.status === 409 || String(initData?.code ?? "").trim().toUpperCase() === "DUPLICATE_FILE") {
+          const duplicateMessage = getUploadUiMessage(
+            initData?.message ?? initData?.error,
+            "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+          );
+          clearPickedFileSelection(pickedFile.name);
+          setUploadNotice(duplicateMessage);
+          setUploadError(null);
+          return;
+        }
 
         if (!initRes.ok) {
           clearPickedFileSelection(pickedFile.name);
@@ -1478,11 +1673,27 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           return;
         }
 
-        setActiveUpload((prev) =>
-          prev && prev.requestId === clientRequestId
-            ? mergeActiveUploadState(prev, { fileId: initFileId })
-            : prev,
-        );
+        setActiveUpload({
+          requestId: clientRequestId,
+          startedAt: Date.now(),
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          uploadedAt: null,
+          jobId: null,
+          fileId: initFileId,
+          responseSettled: false,
+          kind: selectedUploadKind,
+          status: null,
+          stage: null,
+        });
+        console.info("[UploadClient] upload started", {
+          requestId: clientRequestId,
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          fileId: initFileId,
+        });
         pendingFileId = initFileId;
         upsertLocalFileStatus({
           fileId: initFileId,
@@ -1508,6 +1719,11 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         }
 
         optimisticUploadedAt = new Date().toISOString();
+        setActiveUpload((prev) =>
+          prev && prev.requestId === clientRequestId
+            ? mergeActiveUploadState(prev, { uploadedAt: optimisticUploadedAt })
+            : prev,
+        );
 
         res = await fetch("/api/trainer/upload", {
           method: "POST",
@@ -1524,6 +1740,26 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           signal: controller.signal,
         });
       } else {
+        setActiveUpload({
+          requestId: clientRequestId,
+          startedAt: Date.now(),
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+          uploadedAt: null,
+          jobId: null,
+          fileId: null,
+          responseSettled: false,
+          kind: selectedUploadKind,
+          status: null,
+          stage: null,
+        });
+        console.info("[UploadClient] upload started", {
+          requestId: clientRequestId,
+          fileName: pickedFile.name,
+          folderId: uploadFolderId,
+          sizeBytes: typeof pickedFile.size === "number" ? pickedFile.size : null,
+        });
         const fd = new FormData();
         fd.append("file", pickedFile);
         fd.append("folder_id", uploadFolderId);
@@ -1575,7 +1811,12 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
         );
         removeLocalFileStatus(pendingFileId);
+        setActiveUpload(null);
+        setUploading(false);
         clearPickedFileSelection(pickedFile.name);
+        if (listFolderIdRef.current === uploadFolderId) {
+          await loadFiles(uploadFolderId);
+        }
         setUploadNotice(msg);
         return;
       }
@@ -1730,8 +1971,8 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
       );
       dispatchQuotaChanged();
 
-      if (listFolderIdRef.current === uploadFolderId) {
-        await loadFiles(uploadFolderId);
+      if (listFolderIdRef.current === uploadFolderId && !processingAccepted) {
+        await loadFiles(uploadFolderId, { silent: true });
       }
 
       if (!processingAccepted) {
@@ -1961,26 +2202,29 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
           className={[
             "mt-4 block cursor-pointer rounded-2xl border border-dashed p-6 text-center",
             dragOver ? "border-zinc-700 bg-zinc-50" : "border-zinc-200 bg-white",
-            uploading ? "opacity-60 cursor-default" : "",
           ].join(" ")}
           onDragEnter={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (uploading) return;
             setDragOver(true);
           }}
           onDragOver={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (uploading) return;
             setDragOver(true);
           }}
           onDragLeave={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (uploading) return;
             setDragOver(false);
           }}
           onDrop={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (uploading) return;
             setDragOver(false);
             const f = e.dataTransfer?.files?.[0] ?? null;
             onPickFile(f);
@@ -1996,6 +2240,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             {pickedFile ? (
               <button
                 type="button"
+                disabled={uploading}
                 className="rounded-full border border-zinc-300 bg-white px-3 py-2 text-xs"
                 onClick={(e) => {
                   e.preventDefault();
@@ -2020,6 +2265,7 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             type="file"
             accept="application/pdf,audio/*,.mp3,.m4a,.wav,.mp4,.mpeg,.mpga,.webm,.ogg,.oga,.flac,.aac"
             className="hidden"
+            disabled={uploading}
             onChange={(e) => {
               const f = e.target.files?.[0] ?? null;
               onPickFile(f);
@@ -2115,18 +2361,45 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
         {moveNotice ? <div className="mt-3 text-xs text-zinc-700">{moveNotice}</div> : null}
 
         <div className="mt-4 space-y-3">
-          {!filesLoading && (!listFolderId || visibleFiles.length === 0) ? (
+          {!filesLoading && !pinnedActiveUpload && (!listFolderId || renderedVisibleFiles.length === 0) ? (
             <div className="text-xs text-zinc-500">
               {listFolderId ? "Ingen filer i denne mappe endnu." : "Vælg en mappe."}
             </div>
           ) : null}
 
-          {visibleFiles.map((f) => {
+          {pinnedActiveUpload ? (
+            <div
+              key={`active-${pinnedActiveUpload.requestId}`}
+              className="min-h-[78px] rounded-xl border border-zinc-200 bg-white px-4 py-3"
+            >
+              <div>
+                <div className="flex min-h-[28px] items-center gap-2">
+                  <div className="text-sm font-medium text-zinc-900">{pinnedActiveUpload.fileName}</div>
+                  <span
+                    className={`inline-flex min-w-[88px] items-center justify-center rounded-full border px-2.5 py-1 text-[10px] font-medium leading-none ${readinessTone(pinnedActiveUpload.status)}`}
+                  >
+                    {fileListBadgeLabel(pinnedActiveUpload.status) ?? pinnedActiveUpload.status.label}
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] text-zinc-500">
+                  {joinMetaParts(
+                    humanBytes(pinnedActiveUpload.sizeBytes),
+                    pinnedActiveUpload.uploadedAt ? fmtDa(pinnedActiveUpload.uploadedAt) : "",
+                    fileListStatusDetail(pinnedActiveUpload.status),
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {renderedVisibleFiles.map((f) => {
             const status = resolveFileStatus(f);
             const badgeLabel = fileListBadgeLabel(status);
             const statusDetail = fileListStatusDetail(status);
+            const failedAdminDetail = failedRowAdminDetail(status);
             const rowDeleteError = deleteErrorsById[f.id] ?? null;
             const isLocalOnlyRow = !isPersistedFileRow(f.id);
+            const isAdministrativeOnly = isAdministrativeOnlyRow(status);
             const isTransientUpload =
               status?.kind === "uploading" ||
               status?.kind === "classifying" ||
@@ -2136,44 +2409,48 @@ export default function UploadClient({ folders: initialFolders, initialFolderId,
             return (
               <div
                 key={f.id}
-                className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3"
+                className={`flex items-center justify-between rounded-xl border px-4 py-3 ${fileRowTone(status)}`}
               >
               <div>
                 <div className="flex min-h-[28px] items-center gap-2">
-                  <div className="text-sm font-medium text-zinc-900">{f.name}</div>
+                  <div className={`text-sm font-medium ${fileNameTone(status)}`}>{f.name}</div>
                   <span
                     className={`inline-flex min-w-[88px] items-center justify-center rounded-full border px-2.5 py-1 text-[10px] font-medium leading-none ${readinessTone(status)} ${badgeLabel ? "" : "invisible"}`}
                   >
                     {badgeLabel ?? "Klar"}
                   </span>
                 </div>
-                <div className="mt-1 text-[11px] text-zinc-500">
-                  {humanBytes(f.sizeBytes)} {f.uploadedAt ? `· ${fmtDa(f.uploadedAt)}` : ""}
-                  {statusDetail ? ` · ${statusDetail}` : ""}
+                <div className={`mt-1 text-[11px] ${fileMetaTone(status)}`}>
+                  {joinMetaParts(humanBytes(f.sizeBytes), f.uploadedAt ? fmtDa(f.uploadedAt) : "", statusDetail)}
                 </div>
+                {failedAdminDetail ? <div className="mt-1 text-[11px] text-red-700">{failedAdminDetail}</div> : null}
                 {rowDeleteError ? <div className="mt-1 text-[11px] text-red-600">{rowDeleteError}</div> : null}
               </div>
 
               <div className="flex items-center gap-2">
-                <select
-                  className="rounded-full border border-zinc-200 bg-white px-3 py-2 text-xs"
-                  value={f.folderId ?? ""}
-                  onChange={(e) => {
-                    const v = e.target.value || null;
-                    if (!v) return;
-                    void moveFile(f.id, v);
-                  }}
-                  disabled={
-                    folderOptions.length === 0 || deletingId === f.id || movingId === f.id || isTransientUpload || isLocalOnlyRow
-                  }
-                  title="Flyt til anden mappe"
-                >
-                  {folderOptions.map((fo) => (
-                    <option key={fo.id} value={fo.id}>
-                      {fo.name}
-                    </option>
-                  ))}
-                </select>
+                {isAdministrativeOnly ? (
+                  <span className="rounded-full border border-red-200 bg-white px-3 py-2 text-xs text-red-700">Kun slet</span>
+                ) : (
+                  <select
+                    className="rounded-full border border-zinc-200 bg-white px-3 py-2 text-xs"
+                    value={f.folderId ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      if (!v) return;
+                      void moveFile(f.id, v);
+                    }}
+                    disabled={
+                      folderOptions.length === 0 || deletingId === f.id || movingId === f.id || isTransientUpload || isLocalOnlyRow
+                    }
+                    title="Flyt til anden mappe"
+                  >
+                    {folderOptions.map((fo) => (
+                      <option key={fo.id} value={fo.id}>
+                        {fo.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
 
                 <button
                   type="button"

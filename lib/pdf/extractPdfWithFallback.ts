@@ -17,6 +17,28 @@ export type PdfExtractionTimings = {
   ocr_page_count: number;
 };
 
+type OcrAttemptMode = "pdf_primary";
+type OcrPageOutcome = "not_attempted" | "succeeded" | "degraded" | "failed";
+
+export type OcrPageAttempt = {
+  attempt: number;
+  mode: OcrAttemptMode;
+  duration_ms: number;
+  timeout_ms: number;
+  timed_out: boolean;
+  text_char_count: number;
+  error_code: string | null;
+  render_scale: number | null;
+};
+
+export type OcrPageResult = {
+  page: number;
+  retry_used: boolean;
+  retry_succeeded: boolean;
+  final_outcome: OcrPageOutcome;
+  attempts: OcrPageAttempt[];
+};
+
 export type PageClassificationSignals = {
   lineCount: number;
   nonEmptyLineCount: number;
@@ -71,6 +93,8 @@ export type ExtractedPdfDocument = {
     ocr_candidate_pages: number;
     ocr_attempted_pages: number;
     ocr_succeeded_pages: number;
+    ocr_retried_pages: number;
+    ocr_failed_pages: number;
     early_exit_triggered: boolean;
     failure_reason: OcrFailureReason;
     pages: Array<{
@@ -85,6 +109,10 @@ export type ExtractedPdfDocument = {
       formula_blocks: number;
       structured_preview: string;
       signals: PageClassificationSignals;
+      ocr_retry_used: boolean;
+      ocr_retry_succeeded: boolean;
+      ocr_final_outcome: OcrPageOutcome;
+      ocr_attempts: OcrPageAttempt[];
     }>;
     total_table_blocks: number;
     total_formula_blocks: number;
@@ -149,15 +177,18 @@ type OcrDiagnostics = {
   ocrCandidatePages: number;
   ocrAttemptedPages: number;
   ocrSucceededPages: number;
+  ocrRetriedPages: number;
+  ocrFailedPages: number;
   earlyExitTriggered: boolean;
   failureReason: OcrFailureReason;
+  ocrPageResults: OcrPageResult[];
 };
 
 const OCR_ENGINE = "openai_pdf_ocr";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
 const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
 const SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT = 3;
-const SCAN_HEAVY_OCR_SAMPLE_BUDGET_MS = 20_000;
+const SCAN_HEAVY_PREFLIGHT_MIN_BYTES = 10 * 1024 * 1024;
 const OCR_FALLBACK_BATCH_SIZE = 2;
 const OCR_FIRST_BATCH_SIZE = 3;
 const OCR_TIMEOUT_MS = (() => {
@@ -580,8 +611,9 @@ function shouldEarlyExitAfterOcr(args: {
   return noUsefulRecovery;
 }
 
-function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[] }) {
-  const { pages } = args;
+function shouldRejectScanHeavyPdfPreflight(args: { pages: ExtractedPdfPage[]; fileSizeBytes: number }) {
+  const { pages, fileSizeBytes } = args;
+  if (fileSizeBytes < SCAN_HEAVY_PREFLIGHT_MIN_BYTES) return false;
 
   const previewPages = pages.slice(0, Math.min(SCAN_HEAVY_PREFLIGHT_PAGE_COUNT, pages.length));
   if (previewPages.length < 3) return false;
@@ -686,54 +718,75 @@ async function runScanHeavyOcrSample(args: {
       attemptedPages: 0,
       succeededPages: 0,
       timeoutCount: 0,
-      budgetExceeded: false,
       promising: false,
       ocrTexts: [] as Array<{ page: number; text: string; engine: string }>,
+      pageResults: [] as OcrPageResult[],
+      retriedPages: 0,
+      failedPages: 0,
     };
   }
 
   let attemptedPages = 0;
   let succeededPages = 0;
   let timeoutCount = 0;
-  let budgetExceeded = false;
   const ocrTexts: Array<{ page: number; text: string; engine: string }> = [];
-  const startedAt = Date.now();
+  const pageResults: OcrPageResult[] = [];
+  let retriedPages = 0;
+  let failedPages = 0;
 
   for (let index = 0; index < samplePages.length; index += 2) {
-    if (Date.now() - startedAt >= SCAN_HEAVY_OCR_SAMPLE_BUDGET_MS) {
-      budgetExceeded = true;
-      break;
-    }
     const batch = samplePages.slice(index, index + 2);
     const results = await Promise.all(
       batch.map(async (page) => {
-        try {
-          const pagePdfBuffer = await extractSinglePagePdf(args.buf, page.pageNumber - 1);
-          const ocrText = await runOpenAIOcrForPage({
-            fileName: args.fileName,
-            pageNumber: page.pageNumber,
-            pagePdfBuffer,
-          });
-          return { page, ocrText, error: null as unknown };
-        } catch (error) {
-          return { page, ocrText: "", error };
-        }
+        const ocrRun = await runOcrWithRetryForPage({
+          pdfBuffer: args.buf,
+          fileName: args.fileName,
+          pageNumber: page.pageNumber,
+        });
+        return { page, ...ocrRun };
       }),
     );
 
     for (const result of results) {
       attemptedPages += 1;
-      if (result.error) {
-        const code = String((result.error as any)?.code ?? "").trim();
-        if (code === "OCR_REQUEST_TIMEOUT") timeoutCount += 1;
-        console.warn(`[pdf/extract] OCR sample failed for page ${result.page.pageNumber}:`, result.error);
-        continue;
+      timeoutCount += result.timeoutCount;
+      if (result.retryUsed) retriedPages += 1;
+      let finalOutcome: OcrPageOutcome = "failed";
+
+      if (result.finalError && !result.ocrText) {
+        console.warn(`[pdf/extract] OCR sample failed for page ${result.page.pageNumber}:`, result.finalError);
       }
 
-      const applied = applyOcrTextToPage(result.page, result.ocrText);
-      if (!applied.applied) continue;
-      if (applied.readable) succeededPages += 1;
-      ocrTexts.push({ page: result.page.pageNumber, text: result.page.text, engine: OCR_ENGINE });
+      if (result.ocrText) {
+        const applied = applyOcrTextToPage(result.page, result.ocrText);
+        if (applied.applied && applied.readable) {
+          succeededPages += 1;
+          ocrTexts.push({ page: result.page.pageNumber, text: result.page.text, engine: OCR_ENGINE });
+          finalOutcome = "succeeded";
+        } else {
+          finalOutcome = "degraded";
+        }
+      } else if (!result.finalError) {
+        finalOutcome = "degraded";
+      }
+
+      if (finalOutcome === "failed") failedPages += 1;
+      const pageResult: OcrPageResult = {
+        page: result.page.pageNumber,
+        retry_used: result.retryUsed,
+        retry_succeeded: result.retrySucceeded,
+        final_outcome: finalOutcome,
+        attempts: result.attempts,
+      };
+      pageResults.push(pageResult);
+      logOcrPageOutcome({
+        fileName: args.fileName,
+        pageNumber: result.page.pageNumber,
+        retryUsed: result.retryUsed,
+        retrySucceeded: result.retrySucceeded,
+        finalOutcome,
+        attempts: result.attempts,
+      });
     }
   }
 
@@ -749,9 +802,11 @@ async function runScanHeavyOcrSample(args: {
     attemptedPages,
     succeededPages,
     timeoutCount,
-    budgetExceeded,
     promising,
     ocrTexts,
+    pageResults,
+    retriedPages,
+    failedPages,
   };
 }
 
@@ -884,17 +939,33 @@ async function extractSinglePagePdf(buffer: Buffer, pageIndexZeroBased: number) 
 async function runOpenAIOcrForPage(args: {
   fileName: string;
   pageNumber: number;
+  timeoutMs: number;
+  mode: OcrAttemptMode;
   pagePdfBuffer: Buffer;
 }): Promise<string> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: OCR_TIMEOUT_MS });
-  const base64 = args.pagePdfBuffer.toString("base64");
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: args.timeoutMs });
   const abortController = new AbortController();
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const startedAt = nowMs();
+  const content = [
+    {
+      type: "input_file",
+      filename: `${args.fileName.replace(/\.pdf$/i, "")}-page-${args.pageNumber}.pdf`,
+      file_data: `data:application/pdf;base64,${args.pagePdfBuffer.toString("base64")}`,
+    },
+    {
+      type: "input_text",
+      text:
+        "Transcribe all readable text from this single PDF page. Return only plain text. " +
+        "Keep line breaks when helpful. If no useful text is readable, return an empty string.",
+    },
+  ];
 
   console.info("[pdf/extract] OCR request started", {
     fileName: args.fileName,
     pageNumber: args.pageNumber,
-    timeoutMs: OCR_TIMEOUT_MS,
+    timeoutMs: args.timeoutMs,
+    mode: args.mode,
   });
   try {
     const response: any = await Promise.race([
@@ -904,19 +975,7 @@ async function runOpenAIOcrForPage(args: {
           input: [
             {
               role: "user",
-              content: [
-                {
-                  type: "input_file",
-                  filename: `${args.fileName.replace(/\.pdf$/i, "")}-page-${args.pageNumber}.pdf`,
-                  file_data: `data:application/pdf;base64,${base64}`,
-                },
-                {
-                  type: "input_text",
-                  text:
-                    "Transcribe all readable text from this single PDF page. Return only plain text. " +
-                    "Keep line breaks when helpful. If no useful text is readable, return an empty string.",
-                },
-              ],
+              content,
             },
           ],
         },
@@ -925,30 +984,127 @@ async function runOpenAIOcrForPage(args: {
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           abortController.abort();
-          const error: any = new Error(`OCR request timed out after ${OCR_TIMEOUT_MS}ms`);
+          const error: any = new Error(`OCR request timed out after ${args.timeoutMs}ms`);
           error.code = "OCR_REQUEST_TIMEOUT";
           error.fileName = args.fileName;
           error.pageNumber = args.pageNumber;
-          error.timeoutMs = OCR_TIMEOUT_MS;
+          error.timeoutMs = args.timeoutMs;
+          error.mode = args.mode;
           console.warn("[pdf/extract] OCR request timed out", {
             fileName: args.fileName,
             pageNumber: args.pageNumber,
-            timeoutMs: OCR_TIMEOUT_MS,
+            timeoutMs: args.timeoutMs,
+            mode: args.mode,
           });
           reject(error);
-        }, OCR_TIMEOUT_MS);
+        }, args.timeoutMs);
       }),
     ]);
 
     console.info("[pdf/extract] OCR request finished", {
       fileName: args.fileName,
       pageNumber: args.pageNumber,
+      mode: args.mode,
+      durationMs: elapsedMs(startedAt),
     });
 
     return normalizePageText(getResponseText(response));
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+async function runSingleOcrAttempt(args: {
+  fileName: string;
+  pageNumber: number;
+  attempt: number;
+  mode: OcrAttemptMode;
+  timeoutMs: number;
+  pagePdfBuffer: Buffer;
+}) {
+  const startedAt = nowMs();
+  try {
+    const text = await runOpenAIOcrForPage({
+      fileName: args.fileName,
+      pageNumber: args.pageNumber,
+      timeoutMs: args.timeoutMs,
+      mode: args.mode,
+      pagePdfBuffer: args.pagePdfBuffer,
+    });
+    return {
+      text,
+      error: null as unknown,
+      attempt: {
+        attempt: args.attempt,
+        mode: args.mode,
+        duration_ms: elapsedMs(startedAt),
+        timeout_ms: args.timeoutMs,
+        timed_out: false,
+        text_char_count: text.length,
+        error_code: null,
+        render_scale: null,
+      } satisfies OcrPageAttempt,
+    };
+  } catch (error) {
+    const errorCode = String((error as any)?.code ?? "").trim() || null;
+    return {
+      text: "",
+      error,
+      attempt: {
+        attempt: args.attempt,
+        mode: args.mode,
+        duration_ms: elapsedMs(startedAt),
+        timeout_ms: args.timeoutMs,
+        timed_out: errorCode === "OCR_REQUEST_TIMEOUT",
+        text_char_count: 0,
+        error_code: errorCode,
+        render_scale: null,
+      } satisfies OcrPageAttempt,
+    };
+  }
+}
+
+async function runOcrWithRetryForPage(args: {
+  pdfBuffer: Buffer;
+  fileName: string;
+  pageNumber: number;
+}) {
+  const pagePdfBuffer = await extractSinglePagePdf(args.pdfBuffer, args.pageNumber - 1);
+  const primaryAttempt = await runSingleOcrAttempt({
+    fileName: args.fileName,
+    pageNumber: args.pageNumber,
+    attempt: 1,
+    mode: "pdf_primary",
+    timeoutMs: OCR_TIMEOUT_MS,
+    pagePdfBuffer,
+  });
+
+  return {
+    ocrText: primaryAttempt.text,
+    finalError: primaryAttempt.error,
+    retryUsed: false,
+    retrySucceeded: false,
+    timeoutCount: primaryAttempt.attempt.timed_out ? 1 : 0,
+    attempts: [primaryAttempt.attempt],
+  };
+}
+
+function logOcrPageOutcome(args: {
+  fileName: string;
+  pageNumber: number;
+  retryUsed: boolean;
+  retrySucceeded: boolean;
+  finalOutcome: OcrPageOutcome;
+  attempts: OcrPageAttempt[];
+}) {
+  console.info("[pdf/extract] OCR page outcome", {
+    fileName: args.fileName,
+    pageNumber: args.pageNumber,
+    retryUsed: args.retryUsed,
+    retrySucceeded: args.retrySucceeded,
+    finalOutcome: args.finalOutcome,
+    attempts: args.attempts,
+  });
 }
 
 function summarizeDocumentMeta(args: {
@@ -994,21 +1150,30 @@ function summarizeDocumentMeta(args: {
     ocr_candidate_pages: diagnostics.ocrCandidatePages,
     ocr_attempted_pages: diagnostics.ocrAttemptedPages,
     ocr_succeeded_pages: diagnostics.ocrSucceededPages,
+    ocr_retried_pages: diagnostics.ocrRetriedPages,
+    ocr_failed_pages: diagnostics.ocrFailedPages,
     early_exit_triggered: diagnostics.earlyExitTriggered,
     failure_reason: diagnostics.failureReason,
-    pages: pages.map((page) => ({
-      page: page.pageNumber,
-      page_type: page.extractionMeta.page_type,
-      ocr_decision: page.extractionMeta.ocr_decision,
-      extraction_method: page.extractionMethod,
-      extraction_quality: page.extractionQuality,
-      text_char_count: page.textCharCount,
-      word_count: page.wordCount,
-      table_blocks: page.extractionMeta.table_blocks,
-      formula_blocks: page.extractionMeta.formula_blocks,
-      structured_preview: page.extractionMeta.structured_preview,
-      signals: page.extractionMeta.signals,
-    })),
+    pages: pages.map((page) => {
+      const ocrResult = diagnostics.ocrPageResults.find((result) => result.page === page.pageNumber) ?? null;
+      return {
+        page: page.pageNumber,
+        page_type: page.extractionMeta.page_type,
+        ocr_decision: page.extractionMeta.ocr_decision,
+        extraction_method: page.extractionMethod,
+        extraction_quality: page.extractionQuality,
+        text_char_count: page.textCharCount,
+        word_count: page.wordCount,
+        table_blocks: page.extractionMeta.table_blocks,
+        formula_blocks: page.extractionMeta.formula_blocks,
+        structured_preview: page.extractionMeta.structured_preview,
+        signals: page.extractionMeta.signals,
+        ocr_retry_used: ocrResult?.retry_used ?? false,
+        ocr_retry_succeeded: ocrResult?.retry_succeeded ?? false,
+        ocr_final_outcome: ocrResult?.final_outcome ?? "not_attempted",
+        ocr_attempts: ocrResult?.attempts ?? [],
+      };
+    }),
     total_table_blocks: totalTableBlocks,
     total_formula_blocks: totalFormulaBlocks,
     timings,
@@ -1023,6 +1188,7 @@ export async function extractPdfWithFallback(
   const maxPages = Math.max(1, Math.min(opts.maxPages ?? 500, 2000));
   const allowOcr = opts.allowOcr !== false;
   const fileName = (opts.fileName ?? "document.pdf").trim() || "document.pdf";
+  const fileSizeBytes = Math.max(0, Number(opts.fileSizeBytes ?? buf.length) || 0);
   const raw = await extractPdfPagesViaPdfjs(buf, maxPages);
   let ocrMs = 0;
 
@@ -1107,6 +1273,8 @@ export async function extractPdfWithFallback(
     ocrCandidatePages,
     ocrAttemptedPages: 0,
     ocrSucceededPages: 0,
+    ocrRetriedPages: 0,
+    ocrFailedPages: 0,
     earlyExitTriggered: false,
     failureReason:
       raw.pageCount > 0 &&
@@ -1117,6 +1285,7 @@ export async function extractPdfWithFallback(
       initialReadable.pagesWithGoodText === 0
         ? "unreadable_scan_pdf"
         : null,
+    ocrPageResults: [],
   };
   let ocrTimeoutCount = 0;
 
@@ -1125,7 +1294,7 @@ export async function extractPdfWithFallback(
     scanLikeDocument &&
     ocrStrategy !== "ocr_first" &&
     diagnostics.pagesWithGoodText === 0 &&
-    shouldRejectScanHeavyPdfPreflight({ pages })
+    shouldRejectScanHeavyPdfPreflight({ pages, fileSizeBytes })
   ) {
     if (allowOcr && canRunOcr()) {
       const sample = await runScanHeavyOcrSample({
@@ -1136,6 +1305,9 @@ export async function extractPdfWithFallback(
       ocrMs += sample.elapsedMs;
       diagnostics.ocrAttemptedPages += sample.attemptedPages;
       diagnostics.ocrSucceededPages += sample.succeededPages;
+      diagnostics.ocrRetriedPages += sample.retriedPages;
+      diagnostics.ocrFailedPages += sample.failedPages;
+      diagnostics.ocrPageResults.push(...sample.pageResults);
       ocrTexts.push(...sample.ocrTexts);
       diagnostics.pagesWithGoodText = countPagesWithGoodText(pages);
       ocrCandidates = selectOcrCandidates({ pages, strategy: ocrStrategy });
@@ -1145,7 +1317,7 @@ export async function extractPdfWithFallback(
       if (!sample.promising) {
         diagnostics.earlyExitTriggered = true;
         diagnostics.failureReason =
-          (sample.timeoutCount >= sample.attemptedPages && sample.attemptedPages > 0) || sample.budgetExceeded
+          sample.timeoutCount >= sample.attemptedPages && sample.attemptedPages > 0
             ? "ocr_timeout"
             : "scan_heavy_pdf_rejected";
       }
@@ -1166,47 +1338,70 @@ export async function extractPdfWithFallback(
     });
 
     const ocrBatchSize = ocrStrategy === "ocr_first" ? OCR_FIRST_BATCH_SIZE : OCR_FALLBACK_BATCH_SIZE;
+    console.info("[pdf/extract] OCR batch config", {
+      fileName,
+      documentClass,
+      ocrStrategy,
+      ocrBatchSize,
+    });
     const ocrStartedAt = nowMs();
 
     for (let index = 0; index < ocrCandidates.length; index += ocrBatchSize) {
       const batch = ocrCandidates.slice(index, index + ocrBatchSize);
       const results = await Promise.all(
         batch.map(async (page) => {
-          try {
-            const pagePdfBuffer = await extractSinglePagePdf(buf, page.pageNumber - 1);
-            const ocrText = await runOpenAIOcrForPage({
-              fileName,
-              pageNumber: page.pageNumber,
-              pagePdfBuffer,
-            });
-            return { page, ocrText, error: null as unknown };
-          } catch (error) {
-            return { page, ocrText: "", error };
-          }
+          const ocrRun = await runOcrWithRetryForPage({
+            pdfBuffer: buf,
+            fileName,
+            pageNumber: page.pageNumber,
+          });
+          return { page, ...ocrRun };
         }),
       );
 
       for (const result of results) {
-        const { page, ocrText, error } = result;
+        const { page, ocrText, finalError } = result;
         diagnostics.ocrAttemptedPages += 1;
+        ocrTimeoutCount += result.timeoutCount;
+        if (result.retryUsed) diagnostics.ocrRetriedPages += 1;
+        let finalOutcome: OcrPageOutcome = "failed";
 
-        if (error) {
-          const code = String((error as any)?.code ?? "").trim();
-          if (code === "OCR_REQUEST_TIMEOUT") {
-            ocrTimeoutCount += 1;
+        if (finalError && !ocrText) {
+          console.warn(`[pdf/extract] OCR fallback failed for page ${page.pageNumber}:`, finalError);
+        }
+
+        if (ocrText) {
+          const applied = applyOcrTextToPage(page, ocrText);
+          if (applied.applied && applied.readable) {
+            diagnostics.ocrSucceededPages += 1;
+            ocrTexts.push({ page: page.pageNumber, text: page.text, engine: OCR_ENGINE });
+            finalOutcome = "succeeded";
+          } else {
+            finalOutcome = "degraded";
           }
-          console.warn(`[pdf/extract] OCR fallback failed for page ${page.pageNumber}:`, error);
-          continue;
+        } else if (!finalError) {
+          finalOutcome = "degraded";
         }
 
-        if (!ocrText) continue;
-
-        const applied = applyOcrTextToPage(page, ocrText);
-        if (!applied.applied) continue;
-        if (applied.readable) {
-          diagnostics.ocrSucceededPages += 1;
+        if (finalOutcome === "failed") {
+          diagnostics.ocrFailedPages += 1;
         }
-        ocrTexts.push({ page: page.pageNumber, text: page.text, engine: OCR_ENGINE });
+        const pageResult: OcrPageResult = {
+          page: page.pageNumber,
+          retry_used: result.retryUsed,
+          retry_succeeded: result.retrySucceeded,
+          final_outcome: finalOutcome,
+          attempts: result.attempts,
+        };
+        diagnostics.ocrPageResults.push(pageResult);
+        logOcrPageOutcome({
+          fileName,
+          pageNumber: page.pageNumber,
+          retryUsed: result.retryUsed,
+          retrySucceeded: result.retrySucceeded,
+          finalOutcome,
+          attempts: result.attempts,
+        });
       }
 
       diagnostics.pagesWithGoodText = countPagesWithGoodText(pages);

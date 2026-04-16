@@ -6,6 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { getImportQuotaSnapshot } from "@/lib/quota/importUsage";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
 import {
+  type MaterialReadinessState,
   normalizeImportJobRow,
   pickBestImportJob,
   resolveMaterialReadiness,
@@ -13,6 +14,9 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const REQUEST_ID_LOOKUP_LIMIT = 1000;
+const PAGE_SIZE = 1000;
 
 function n0(x: any): number {
   const v = typeof x === "number" ? x : Number(x);
@@ -40,6 +44,174 @@ function formatDa(iso: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(d);
+}
+
+function asString(value: unknown) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function parseTimeMs(value: string | null | undefined) {
+  if (!value) return 0;
+  const ms = Date.parse(String(value));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function getFileRelevantTime(row: {
+  updatedAt?: string | null;
+  uploadedAt?: string | null;
+  createdAt?: string | null;
+} | null) {
+  if (!row) return 0;
+  return parseTimeMs(row.uploadedAt) || parseTimeMs(row.createdAt);
+}
+
+type MaterialOverviewRow = {
+  id: string;
+  name: string;
+  folderId: string | null;
+  updatedAt: string | null;
+  uploadedAt: string | null;
+  createdAt: string | null;
+  readiness: MaterialReadinessState;
+  readinessLabel: string;
+  readinessDetail: string | null;
+  ready: boolean;
+  chunkCount: number;
+  jobStatus: string | null;
+  jobStage: string | null;
+};
+
+async function fetchAllRows<T>(
+  loadPage: (from: number, to: number) => Promise<{ data: T[] | null; error: any }>,
+) {
+  const rows: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const to = from + PAGE_SIZE - 1;
+    const page = await loadPage(from, to);
+    if (page.error) throw page.error;
+    const data = Array.isArray(page.data) ? page.data : [];
+    rows.push(...data);
+    if (data.length < PAGE_SIZE) break;
+  }
+  return rows;
+}
+
+async function loadMaterialOverview(args: {
+  admin: any;
+  ownerId: string;
+  folderId: string | null;
+  limit?: number | null;
+}) {
+  const files = await fetchAllRows<any>((from, to) => {
+    let q = args.admin
+      .from("files")
+      .select("id,name,original_name,folder_id,uploaded_at,created_at")
+      .eq("owner_id", args.ownerId)
+      .order("created_at", { ascending: false })
+      .range(from, to);
+    if (args.folderId) q = q.eq("folder_id", args.folderId);
+    if (typeof args.limit === "number") q = q.limit(args.limit);
+    return q;
+  });
+
+  const fileRows = files
+    .map((row) => {
+      const id = asString(row?.id);
+      if (!id) return null;
+      return {
+        id,
+        name: asString(row?.name) ?? asString(row?.original_name) ?? "Fil",
+        folderId: asString(row?.folder_id),
+        updatedAt: asString(row?.uploaded_at) ?? asString(row?.created_at),
+        uploadedAt: asString(row?.uploaded_at),
+        createdAt: asString(row?.created_at),
+      };
+    })
+    .filter(Boolean) as Array<{
+    id: string;
+    name: string;
+    folderId: string | null;
+    updatedAt: string | null;
+    uploadedAt: string | null;
+    createdAt: string | null;
+  }>;
+
+  if (fileRows.length === 0) {
+    return {
+      rows: [] as MaterialOverviewRow[],
+      summary: { ready: 0, processing: 0, background: 0, failed: 0 },
+    };
+  }
+
+  const fileIdSet = new Set(fileRows.map((row) => row.id));
+  const [chunkRows, jobRows] = await Promise.all([
+    fetchAllRows<any>((from, to) => {
+      let q = args.admin.from("doc_chunks").select("file_id,folder_id").eq("owner_id", args.ownerId).range(from, to);
+      if (args.folderId) q = q.eq("folder_id", args.folderId);
+      return q;
+    }),
+    fetchAllRows<any>((from, to) =>
+      args.admin
+        .from("jobs")
+        .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at,created_at,updated_at")
+        .eq("owner_id", args.ownerId)
+        .eq("kind", "import")
+        .order("updated_at", { ascending: false, nullsFirst: false })
+        .range(from, to),
+    ),
+  ]);
+
+  const chunkCountByFileId = new Map<string, number>();
+  for (const row of chunkRows) {
+    const fileId = asString((row as any)?.file_id);
+    if (!fileId || !fileIdSet.has(fileId)) continue;
+    chunkCountByFileId.set(fileId, (chunkCountByFileId.get(fileId) ?? 0) + 1);
+  }
+
+  const jobsByFileId = new Map<string, ImportJobRow[]>();
+  for (const row of jobRows) {
+    const normalized = normalizeImportJobRow(row);
+    const fileId = normalized?.fileId ?? null;
+    if (!normalized || !fileId || !fileIdSet.has(fileId)) continue;
+    const group = jobsByFileId.get(fileId) ?? [];
+    group.push(normalized);
+    jobsByFileId.set(fileId, group);
+  }
+
+  const rows: MaterialOverviewRow[] = fileRows.map((row) => {
+    const bestJob = pickBestImportJob(jobsByFileId.get(row.id) ?? []);
+    const readiness = resolveMaterialReadiness({
+      chunkCount: chunkCountByFileId.get(row.id) ?? 0,
+      latestJob: bestJob,
+    });
+    return {
+      id: row.id,
+      name: row.name,
+      folderId: row.folderId,
+      updatedAt: row.updatedAt,
+      uploadedAt: row.uploadedAt,
+      createdAt: row.createdAt,
+      readiness: readiness.state,
+      readinessLabel: readiness.label,
+      readinessDetail: readiness.detail,
+      ready: readiness.ready,
+      chunkCount: readiness.chunkCount,
+      jobStatus: readiness.jobStatus,
+      jobStage: readiness.jobStage,
+    };
+  });
+
+  const summary = rows.reduce(
+    (acc, row) => {
+      acc[row.readiness] += 1;
+      return acc;
+    },
+    { ready: 0, processing: 0, background: 0, failed: 0 },
+  );
+
+  return { rows, summary };
 }
 
 function isAuthRateLimited(error: any) {
@@ -74,11 +246,11 @@ export async function GET(req: NextRequest) {
 
   try {
     const sb = supabaseServerRouteReadOnly(req);
-    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
-    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
-    ownerId = sessionUserId ?? "";
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    const getUserError = authError?.message ?? null;
+    ownerId = authData?.user?.id ? String(authData.user.id) : "";
 
-    if (sessionError && isAuthRateLimited(sessionError)) {
+    if (authError && isAuthRateLimited(authError)) {
       return NextResponse.json(
         {
           ok: false,
@@ -98,9 +270,10 @@ export async function GET(req: NextRequest) {
           ...(process.env.VERCEL_ENV === "preview"
             ? {
                 debug: {
-                  hasSession: !!sessionData?.session,
-                  sessionUserId,
-                  sessionError: sessionError?.message ?? null,
+                  hasSession: null,
+                  sessionUserId: null,
+                  sessionError: null,
+                  getUserError,
                   cookieNames,
                 },
               }
@@ -121,6 +294,7 @@ export async function GET(req: NextRequest) {
                 hasSession: null,
                 sessionUserId: null,
                 sessionError: error?.message ?? null,
+                getUserError: null,
                 cookieNames,
               },
             }
@@ -175,23 +349,18 @@ export async function GET(req: NextRequest) {
   {
     let q = admin
       .from("files")
-      .select("id, name, folder_id, updated_at, uploaded_at, created_at")
+      .select("id, name, folder_id, uploaded_at, created_at")
       .eq("owner_id", ownerId);
 
     if (folderId) q = q.eq("folder_id", folderId);
 
-    // robust: prøv updated_at først, ellers uploaded_at/created_at
-    const r = await q.order("updated_at", { ascending: false, nullsFirst: false }).limit(1);
+    const r = await q.order("uploaded_at", { ascending: false, nullsFirst: false }).limit(1);
 
     if (!r.error && Array.isArray(r.data) && r.data.length) {
       latest = r.data[0];
     } else {
-      const r2 = await q.order("uploaded_at", { ascending: false, nullsFirst: false }).limit(1);
+      const r2 = await q.order("created_at", { ascending: false, nullsFirst: false }).limit(1);
       if (!r2.error && Array.isArray(r2.data) && r2.data.length) latest = r2.data[0];
-      else {
-        const r3 = await q.order("created_at", { ascending: false, nullsFirst: false }).limit(1);
-        if (!r3.error && Array.isArray(r3.data) && r3.data.length) latest = r3.data[0];
-      }
     }
   }
 
@@ -209,7 +378,42 @@ export async function GET(req: NextRequest) {
   }
 
   const latestUploadedAt =
-    (latest?.updated_at ?? latest?.uploaded_at ?? latest?.created_at) ? String(latest.updated_at ?? latest.uploaded_at ?? latest.created_at) : null;
+    (latest?.uploaded_at ?? latest?.created_at)
+      ? String(latest.uploaded_at ?? latest.created_at)
+      : null;
+  let usableFilesTotal = filesTotal;
+  let failedFilesExcluded = 0;
+  let latestUsableFile: { name: string; uploadedAt: string | null } | null = latest
+    ? {
+        name: String(latest.name ?? ""),
+        uploadedAt: latestUploadedAt,
+      }
+    : null;
+
+  try {
+    const materialOverview = await loadMaterialOverview({
+      admin,
+      ownerId,
+      folderId,
+    });
+    const usableRows = materialOverview.rows.filter((row) => row.readiness !== "failed");
+    const latestUsable = [...usableRows].sort((a, b) => getFileRelevantTime(b) - getFileRelevantTime(a))[0] ?? null;
+    usableFilesTotal = usableRows.length;
+    failedFilesExcluded = materialOverview.summary.failed;
+    latestUsableFile = latestUsable
+      ? {
+          name: latestUsable.name,
+          uploadedAt: latestUsable.uploadedAt ?? latestUsable.createdAt,
+        }
+      : null;
+  } catch (materialOverviewError) {
+    console.warn("[import-status] usable files overview warning", {
+      requestId,
+      ownerId,
+      folderId,
+      error: String((materialOverviewError as any)?.message ?? materialOverviewError),
+    });
+  }
 
   let activeJob: {
     id: string;
@@ -267,7 +471,7 @@ export async function GET(req: NextRequest) {
           .eq("owner_id", ownerId)
           .eq("kind", "import")
           .order("updated_at", { ascending: false, nullsFirst: false })
-          .limit(100);
+          .limit(REQUEST_ID_LOOKUP_LIMIT);
 
         if (!jobsRes.error && Array.isArray(jobsRes.data)) {
           const matchingJobs: ImportJobRow[] = jobsRes.data
@@ -339,7 +543,7 @@ export async function GET(req: NextRequest) {
     try {
       const activeFileRes = await admin
         .from("files")
-        .select("id, name, folder_id, updated_at, uploaded_at, created_at")
+        .select("id, name, folder_id, uploaded_at, created_at")
         .eq("owner_id", ownerId)
         .eq("id", activeJob.fileId)
         .maybeSingle();
@@ -362,89 +566,25 @@ export async function GET(req: NextRequest) {
 
   if (effectiveFolderId) {
     try {
-      const folderFilesRes = await admin
-        .from("files")
-        .select("id,name,original_name")
-        .eq("owner_id", ownerId)
-        .eq("folder_id", effectiveFolderId)
-        .order("created_at", { ascending: false })
-        .limit(80);
+      const materialOverview = await loadMaterialOverview({
+        admin,
+        ownerId,
+        folderId: effectiveFolderId,
+        limit: 80,
+      });
 
-      const fileRows = Array.isArray(folderFilesRes.data) ? folderFilesRes.data : [];
-      const fileIds = fileRows
-        .map((row: any) => String(row?.id ?? "").trim())
-        .filter(Boolean);
-
-      if (fileIds.length > 0) {
-        const [chunkRes, jobsRes] = await Promise.all([
-          admin
-            .from("doc_chunks")
-            .select("file_id")
-            .eq("owner_id", ownerId)
-            .in("file_id", fileIds)
-            .limit(4000),
-          admin
-            .from("jobs")
-            .select("id,status,payload,meta,result,error,queued_at,started_at,finished_at,created_at,updated_at")
-            .eq("owner_id", ownerId)
-            .eq("kind", "import")
-            .order("updated_at", { ascending: false, nullsFirst: false })
-            .limit(300),
-        ]);
-
-        const chunkCountByFileId = new Map<string, number>();
-        if (Array.isArray(chunkRes.data)) {
-          for (const row of chunkRes.data as any[]) {
-            const fileId = String(row?.file_id ?? "").trim();
-            if (!fileId) continue;
-            chunkCountByFileId.set(fileId, (chunkCountByFileId.get(fileId) ?? 0) + 1);
-          }
-        }
-
-        const jobsByFileId = new Map<string, Array<ReturnType<typeof normalizeImportJobRow>>>();
-        if (Array.isArray(jobsRes.data)) {
-          for (const row of jobsRes.data as any[]) {
-            const normalized = normalizeImportJobRow(row);
-            const fileId = normalized?.fileId ?? null;
-            if (!normalized || !fileId) continue;
-            const group = jobsByFileId.get(fileId) ?? [];
-            group.push(normalized);
-            jobsByFileId.set(fileId, group);
-          }
-        }
-
-        folderFiles = fileRows.map((row: any) => {
-          const fileId = String(row?.id ?? "").trim();
-          const chunkCount = chunkCountByFileId.get(fileId) ?? 0;
-          const bestJob = pickBestImportJob(jobsByFileId.get(fileId) ?? []);
-          const readiness = resolveMaterialReadiness({
-            chunkCount,
-            latestJob: bestJob,
-          });
-          return {
-            id: fileId,
-            name: String(row?.name ?? row?.original_name ?? "").trim(),
-            readiness: readiness.state,
-            readinessLabel: readiness.label,
-            readinessDetail: readiness.detail,
-            ready: readiness.ready,
-            chunkCount: readiness.chunkCount,
-            jobStatus: readiness.jobStatus,
-            jobStage: readiness.jobStage,
-          };
-        });
-
-        folderReadinessSummary = (folderFiles ?? []).reduce(
-          (acc, file) => {
-            acc[file.readiness] += 1;
-            return acc;
-          },
-          { ready: 0, processing: 0, background: 0, failed: 0 },
-        );
-      } else {
-        folderFiles = [];
-        folderReadinessSummary = { ready: 0, processing: 0, background: 0, failed: 0 };
-      }
+      folderFiles = materialOverview.rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        readiness: row.readiness,
+        readinessLabel: row.readinessLabel,
+        readinessDetail: row.readinessDetail,
+        ready: row.ready,
+        chunkCount: row.chunkCount,
+        jobStatus: row.jobStatus,
+        jobStage: row.jobStage,
+      }));
+      folderReadinessSummary = materialOverview.summary;
     } catch (folderReadinessError) {
       console.warn("[import-status] folder readiness warning", {
         requestId,
@@ -501,12 +641,15 @@ export async function GET(req: NextRequest) {
     },
 
     filesTotal,
+    usableFilesTotal,
+    failedFilesExcluded,
     latestFile: latest
       ? {
           name: String(latest.name ?? ""),
           uploadedAt: latestUploadedAt,
         }
       : null,
+    latestUsableFile,
 
     debug: { orphanedTotal },
     activeJob,

@@ -253,11 +253,11 @@ export async function GET(req: NextRequest) {
 
   try {
     const sb = supabaseServerRouteReadOnly(req);
-    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
-    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
-    const resolvedUserId = sessionUserId;
+    const { data: authData, error: authError } = await sb.auth.getUser();
+    const getUserError = authError?.message ?? null;
+    const resolvedUserId = authData?.user?.id ? String(authData.user.id) : "";
 
-    if (sessionError && isAuthRateLimited(sessionError)) {
+    if (authError && isAuthRateLimited(authError)) {
       return jsonNoStore(
         {
           ok: false,
@@ -275,9 +275,10 @@ export async function GET(req: NextRequest) {
           ...(process.env.VERCEL_ENV === "preview"
             ? {
                 debug: {
-                  hasSession: !!sessionData?.session,
-                  sessionUserId,
-                  sessionError: sessionError?.message ?? null,
+                  hasSession: null,
+                  sessionUserId: null,
+                  sessionError: null,
+                  getUserError,
                   cookieNames,
                 },
               }
@@ -299,6 +300,7 @@ export async function GET(req: NextRequest) {
                 hasSession: null,
                 sessionUserId: null,
                 sessionError: error?.message ?? null,
+                getUserError: null,
                 cookieNames,
               },
             }

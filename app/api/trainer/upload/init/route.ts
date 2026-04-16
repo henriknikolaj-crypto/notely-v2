@@ -31,6 +31,10 @@ function isPdfMetadata(fileName: string, mimeType: string) {
   return getFileExtension(fileName) === ".pdf";
 }
 
+function normalizedDuplicateName(name: string) {
+  return stripPathy(name).trim().toLocaleLowerCase("da-DK");
+}
+
 function errInfo(e: any) {
   if (!e) return { message: "Unknown error" };
   if (typeof e === "string") return { message: e };
@@ -68,6 +72,62 @@ function supabaseAdmin() {
   return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
+async function uploadStorageObjectExists(admin: any, storagePath: string) {
+  const safePath = String(storagePath ?? "").trim();
+  if (!safePath) return false;
+  try {
+    const result = await admin.storage.from(UPLOAD_BUCKET).download(safePath);
+    return !result.error;
+  } catch {
+    return false;
+  }
+}
+
+async function findPreflightDuplicateUpload(
+  admin: any,
+  args: { ownerId: string; folderId: string; fileName: string; sizeBytes: number | null },
+) {
+  const targetName = normalizedDuplicateName(args.fileName);
+  let query = admin
+    .from("files")
+    .select("id,name,original_name,storage_path,size_bytes,uploaded_at")
+    .eq("owner_id", args.ownerId)
+    .eq("folder_id", args.folderId)
+    .order("uploaded_at", { ascending: false, nullsFirst: false })
+    .limit(20);
+
+  if (args.sizeBytes != null) {
+    query = query.eq("size_bytes", args.sizeBytes);
+  }
+
+  const { data, error } = await query;
+  if (error) return { duplicate: null as null | { id: string; storagePath: string }, error };
+
+  const rows = Array.isArray(data)
+    ? (data as Array<{
+        id?: string | null;
+        name?: string | null;
+        original_name?: string | null;
+        storage_path?: string | null;
+        size_bytes?: number | null;
+      }>)
+    : [];
+
+  for (const row of rows) {
+    const rowName = normalizedDuplicateName(String(row?.original_name ?? row?.name ?? ""));
+    if (!rowName || rowName !== targetName) continue;
+    if (args.sizeBytes != null && Number(row?.size_bytes) !== args.sizeBytes) continue;
+
+    const id = String(row?.id ?? "").trim();
+    const storagePath = String(row?.storage_path ?? "").trim();
+    if (!id || !storagePath) continue;
+    if (!(await uploadStorageObjectExists(admin, storagePath))) continue;
+    return { duplicate: { id, storagePath }, error: null };
+  }
+
+  return { duplicate: null as null | { id: string; storagePath: string }, error: null };
+}
+
 export async function POST(req: NextRequest) {
   const fallbackRequestId = randomUUID();
   let requestId: string = fallbackRequestId;
@@ -78,12 +138,8 @@ export async function POST(req: NextRequest) {
     requestId = String(body?.request_id ?? body?.requestId ?? fallbackRequestId).trim() || fallbackRequestId;
 
     const sb = resolveUploadAuthClient(req);
-    const { data: sessionData } = await sb.auth.getSession();
-    ownerId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : "";
-    if (!ownerId) {
-      const { data: authData } = await sb.auth.getUser();
-      ownerId = authData?.user?.id ? String(authData.user.id) : "";
-    }
+    const { data: authData } = await sb.auth.getUser();
+    ownerId = authData?.user?.id ? String(authData.user.id) : "";
 
     if (!ownerId) {
       return NextResponse.json({ ok: false, error: "Unauthorized", requestId }, { status: 401 });
@@ -131,6 +187,28 @@ export async function POST(req: NextRequest) {
     }
     if (!folderRow) {
       return NextResponse.json({ ok: false, error: "Ugyldig mappe (folder_id).", requestId }, { status: 400 });
+    }
+
+    const { duplicate, error: duplicateErr } = await findPreflightDuplicateUpload(admin, {
+      ownerId,
+      folderId,
+      fileName,
+      sizeBytes,
+    });
+    if (duplicateErr) {
+      console.error("[trainer/upload/init] duplicate preflight lookup error:", errInfo(duplicateErr));
+    }
+    if (duplicate?.id) {
+      return NextResponse.json(
+        {
+          ok: false,
+          code: "DUPLICATE_FILE",
+          message: "Denne fil er allerede uploadet. Du kan ikke uploade den samme fil to gange.",
+          existingFileId: duplicate.id,
+          requestId,
+        },
+        { status: 409 },
+      );
     }
 
     const fileId = randomUUID();

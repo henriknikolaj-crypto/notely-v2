@@ -1,9 +1,8 @@
 // app/traener/upload/ImportStatusBox.tsx
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
-import { isTerminalUploadActivity, resolveUploadActivity } from "@/lib/trainer/uploadState";
 
 type ImportStatusResponse = {
   ok: boolean;
@@ -31,7 +30,10 @@ type ImportStatusResponse = {
 
   // optional (nyere “flat” helpers)
   filesTotal?: number;
+  usableFilesTotal?: number;
+  failedFilesExcluded?: number;
   latestFile?: { name?: string; uploadedAt?: string | null; updated_at?: string | null } | null;
+  latestUsableFile?: { name?: string; uploadedAt?: string | null; updated_at?: string | null } | null;
   activeJob?: {
     status?: string | null;
     stage?: string | null;
@@ -92,23 +94,45 @@ async function safeJson(res: Response) {
   }
 }
 
+function sameImportStatusData(a: ImportStatusResponse | null, b: ImportStatusResponse | null) {
+  if (a === b) return true;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 export default function ImportStatusBox(props: { folderId?: string | null; refreshMs?: number }) {
   const folderId = props.folderId ?? null;
-  const refreshMs = typeof props.refreshMs === "number" ? props.refreshMs : 10_000;
+  void props.refreshMs;
 
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [data, setData] = useState<ImportStatusResponse | null>(null);
   const [uploadActive, setUploadActive] = useState(false);
+  const uploadActiveRef = useRef(false);
 
   const url = useMemo(() => {
     const qs = folderId ? `folder_id=${encodeURIComponent(folderId)}` : "";
     return qs ? `/api/import-status?${qs}` : `/api/import-status`;
   }, [folderId]);
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    uploadActiveRef.current = uploadActive;
+  }, [uploadActive]);
+
+  const setStableErr = useCallback((nextErr: string | null) => {
+    setErr((prev) => (prev === nextErr ? prev : nextErr));
+  }, []);
+
+  const setStableData = useCallback((nextData: ImportStatusResponse | null) => {
+    setData((prev) => (sameImportStatusData(prev, nextData) ? prev : nextData));
+  }, []);
+
+  const load = useCallback(async (options?: { showLoading?: boolean }) => {
+    const showLoading = options?.showLoading === true;
     try {
-      setErr(null);
+      if (showLoading) {
+        setLoading(true);
+      }
+      setStableErr(null);
 
       const [statusRes, quotaRes] = await Promise.all([
         fetch(url, {
@@ -116,7 +140,7 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
           cache: "no-store",
           headers: { Accept: "application/json" },
         }),
-        uploadActive
+        uploadActiveRef.current
           ? Promise.resolve(null)
           : fetch("/api/quota/current", {
               method: "GET",
@@ -129,19 +153,19 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
       const quotaJson = quotaRes ? ((await safeJson(quotaRes)) as QuotaCurrentResponse | null) : null;
 
       if (statusRes.status === 401 || statusRes.status === 429 || quotaRes?.status === 401 || quotaRes?.status === 429) {
-        setErr("Upload-status opdateres lige nu.");
+        setStableErr("Upload-status opdateres lige nu.");
         return;
       }
 
       if (!statusRes.ok || !statusJson) {
-        setData(null);
-        setErr("Upload-status opdateres lige nu.");
+        setStableData(null);
+        setStableErr("Upload-status opdateres lige nu.");
         return;
       }
 
       if (statusJson.ok === false) {
-        setData(null);
-        setErr("Upload-status opdateres lige nu.");
+        setStableData(null);
+        setStableErr("Upload-status opdateres lige nu.");
         return;
       }
 
@@ -164,47 +188,40 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
             }
           : statusJson;
 
-      setData(merged);
+      setStableData(merged);
     } catch (e) {
       console.error("[ImportStatusBox] load error", e);
-      setErr("Upload-status opdateres lige nu.");
+      setStableErr("Upload-status opdateres lige nu.");
     } finally {
-      setLoading(false);
+      setLoading((prev) => (showLoading || prev ? false : prev));
     }
-  }, [url, uploadActive]);
+  }, [setStableData, setStableErr, url]);
 
   useEffect(() => {
-    setLoading(true);
-    void load();
+    void load({ showLoading: true });
 
     const onRefresh = () => void load();
     const onUploadActivity = (event: Event) => {
       const customEvent = event as CustomEvent<{ active?: boolean }>;
-      setUploadActive(Boolean(customEvent.detail?.active));
+      const nextActive = Boolean(customEvent.detail?.active);
+      setUploadActive((prev) => {
+        if (prev === nextActive) return prev;
+        return nextActive;
+      });
+      if (!nextActive) {
+        void load();
+      }
     };
     window.addEventListener("notely:import-status-refresh", onRefresh);
     window.addEventListener("notely-quota-changed", onRefresh);
     window.addEventListener("notely:upload-activity", onUploadActivity as EventListener);
 
-    const activeJobPhase = data?.activeJob
-      ? resolveUploadActivity({
-          status: data.activeJob.status,
-          stage: data.activeJob.stage,
-        }).phase
-      : null;
-    const shouldAutoRefresh =
-      !uploadActive &&
-      ((!!data?.activeJob && !!activeJobPhase && !isTerminalUploadActivity({ status: data.activeJob?.status, stage: data.activeJob?.stage })) ||
-        ((data?.folderReadinessSummary?.processing ?? 0) > 0));
-    const t = shouldAutoRefresh ? setInterval(() => void load(), Math.max(15000, refreshMs)) : null;
-
     return () => {
       window.removeEventListener("notely:import-status-refresh", onRefresh);
       window.removeEventListener("notely-quota-changed", onRefresh);
       window.removeEventListener("notely:upload-activity", onUploadActivity as EventListener);
-      if (t != null) clearInterval(t);
     };
-  }, [data, load, refreshMs, uploadActive]);
+  }, [load]);
 
   // ✅ robust udlæsning (nestet + flat)
   const planRaw = (data?.quota?.plan ?? data?.plan ?? "freemium").toString();
@@ -223,10 +240,16 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
     return Math.min(1, Math.max(0, used / (limit as number)));
   }, [used, limit, hasLimit]);
 
-  const filesTotal = n0(data?.files?.total ?? data?.filesTotal ?? 0);
-  const latestName = data?.files?.latest?.name ?? data?.latestFile?.name ?? null;
+  const filesTotal = n0(data?.usableFilesTotal ?? data?.filesTotal ?? data?.files?.total ?? 0);
+  const failedFilesExcluded = n0(data?.failedFilesExcluded ?? 0);
+  const latestName = data?.latestUsableFile?.name ?? data?.latestFile?.name ?? data?.files?.latest?.name ?? null;
   const latestAt =
-    data?.files?.latest?.updated_at ?? data?.latestFile?.uploadedAt ?? data?.latestFile?.updated_at ?? null;
+    data?.latestUsableFile?.uploadedAt ??
+    data?.latestUsableFile?.updated_at ??
+    data?.latestFile?.uploadedAt ??
+    data?.latestFile?.updated_at ??
+    data?.files?.latest?.updated_at ??
+    null;
   const folderReadinessSummary = data?.folderReadinessSummary ?? null;
 
   // ✅ info-tekst om slet (frigiver ikke sider)
@@ -281,6 +304,9 @@ export default function ImportStatusBox(props: { folderId?: string | null; refre
             </>
           ) : null}
         </div>
+        {failedFilesExcluded > 0 ? (
+          <div className="mt-2 text-[11px] text-zinc-500">Fejlede uploads vises stadig i listen, men tæller ikke med her.</div>
+        ) : null}
         {folderReadinessSummary ? (
           <div className="mt-2 text-[11px] text-zinc-500">
             Klar: {folderReadinessSummary.ready} · Behandles: {folderReadinessSummary.processing}
