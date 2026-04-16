@@ -111,9 +111,13 @@ export async function GET(req: NextRequest) {
   const cookieNames = req.cookies.getAll().map((cookie) => cookie.name);
   try {
     sb = supabaseServerRouteReadOnly(req);
-    const { data: authData, error: authError } = await sb.auth.getUser();
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+    const { data: authData, error: authError } = sessionUserId
+      ? { data: null, error: null }
+      : await sb.auth.getUser();
     const getUserError = authError?.message ?? null;
-    ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    ownerId = sessionUserId ?? (authData?.user?.id ? String(authData.user.id) : "");
 
     if (!ownerId) {
       return NextResponse.json(
@@ -123,9 +127,9 @@ export async function GET(req: NextRequest) {
           ...(process.env.VERCEL_ENV === "preview"
             ? {
                 debug: {
-                  hasSession: null,
-                  sessionUserId: null,
-                  sessionError: null,
+                  hasSession: !!sessionData?.session,
+                  sessionUserId,
+                  sessionError: sessionError?.message ?? null,
                   getUserError,
                   cookieNames,
                 },

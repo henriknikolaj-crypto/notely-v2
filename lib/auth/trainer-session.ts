@@ -12,6 +12,15 @@ export const getTrainerSession = cache(async (): Promise<TrainerSession> => {
   const sb = await supabaseServerRSC();
 
   try {
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUser = sessionData?.session?.user ?? null;
+    if (!sessionError && sessionUser?.id) {
+      return {
+        ownerId: String(sessionUser.id),
+        email: sessionUser.email ?? null,
+      };
+    }
+
     const { data, error } = await sb.auth.getUser();
     if (!error && data?.user?.id) {
       return {

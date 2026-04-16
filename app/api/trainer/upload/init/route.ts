@@ -138,8 +138,14 @@ export async function POST(req: NextRequest) {
     requestId = String(body?.request_id ?? body?.requestId ?? fallbackRequestId).trim() || fallbackRequestId;
 
     const sb = resolveUploadAuthClient(req);
-    const { data: authData } = await sb.auth.getUser();
-    ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    const { data: sessionData, error: sessionError } = await sb.auth.getSession();
+    const sessionUserId = sessionData?.session?.user?.id ? String(sessionData.session.user.id) : null;
+    if (!sessionError && sessionUserId) {
+      ownerId = sessionUserId;
+    } else {
+      const { data: authData } = await sb.auth.getUser();
+      ownerId = authData?.user?.id ? String(authData.user.id) : "";
+    }
 
     if (!ownerId) {
       return NextResponse.json({ ok: false, error: "Unauthorized", requestId }, { status: 401 });
