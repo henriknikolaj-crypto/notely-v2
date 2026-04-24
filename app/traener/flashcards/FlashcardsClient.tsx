@@ -5,6 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 import { FlipCard } from "./FlipCard";
 import LimitNotice from "../_ui/LimitNotice";
 
@@ -22,6 +23,7 @@ type Flashcard = {
   id: string;
   question?: string;
   answer?: string;
+  explanation?: string;
   front: string;
   back: string;
   citation?: Citation | null;
@@ -124,6 +126,17 @@ function normalizeCard(raw: any): Flashcard | null {
 
   const front = pickText(raw?.front, q);
   const back = pickText(raw?.back, a);
+  const explanation = pickText(
+    raw?.explanation,
+    raw?.forklaring,
+    raw?.explanationText,
+    raw?.explanation_text,
+    raw?.forklaringText,
+    raw?.forklaring_text,
+    raw?.detail,
+    raw?.data?.explanation,
+    raw?.card?.explanation,
+  );
 
   // Vi kræver front/back – ellers ender UI med blanke kort.
   if (!front || !back) return null;
@@ -152,6 +165,7 @@ function normalizeCard(raw: any): Flashcard | null {
     id,
     question: q || undefined,
     answer: a || undefined,
+    explanation: explanation || undefined,
     front,
     back,
     citation: cit ?? null,
@@ -1102,16 +1116,40 @@ export default function FlashcardsClient({ scopeFolderIds }: Props) {
   // VIGTIGT: front/back er canonical (API sender dem). Brug || (ikke ??) så "" ikke blokerer fallback.
   const frontText = card ? (card.question?.trim() || card.front || "") : "";
   const backText = card ? (card.answer?.trim() || card.back || "") : "";
+  const explanationText = card?.explanation?.trim() || "";
   const frontLooksLong = frontText.length > 110;
-  const backLooksLong = backText.length > 240 || backText.split(/\r?\n/).length >= 4;
+  const backLooksLong =
+    backText.length > 240 || backText.split(/\r?\n/).length >= 4 || explanationText.length > 0;
   const frontContent = (
     <div className={frontLooksLong ? "block -translate-y-6 sm:-translate-y-8" : "block"}>
-      {frontText || <span className="inline-block translate-y-14 sm:translate-y-16">Vælg en mappe for at generere kort.</span>}
+      {frontText ? (
+        <MathMarkdown
+          content={frontText}
+          preserveWhitespace
+          className="text-inherit [&_.katex-display]:my-3 [&_p]:my-0"
+        />
+      ) : (
+        <span className="inline-block translate-y-14 sm:translate-y-16">Vælg en mappe for at generere kort.</span>
+      )}
     </div>
   );
   const backContent = (
-    <div className={backLooksLong ? "block -translate-y-8 sm:-translate-y-10" : "block"}>
-      {backText}
+    <div className={backLooksLong ? "block -translate-y-8 space-y-4 sm:-translate-y-10" : "block space-y-4"}>
+      <MathMarkdown
+        content={backText}
+        preserveWhitespace
+        className="text-inherit [&_.katex-display]:my-3 [&_p]:my-0"
+      />
+      {explanationText ? (
+        <div className="rounded-xl border border-slate-200/80 bg-white/70 px-4 py-3 text-left shadow-sm">
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">Forklaring</div>
+          <MathMarkdown
+            content={explanationText}
+            preserveWhitespace
+            className="text-[13px] leading-6 text-slate-700 [&_.katex-display]:my-3 [&_p]:my-0"
+          />
+        </div>
+      ) : null}
     </div>
   );
 

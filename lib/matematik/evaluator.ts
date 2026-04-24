@@ -1,3 +1,5 @@
+import { buildMatematikOutputStylePromptBlock } from "@/lib/matematik/outputStyle";
+
 export type MatematikTrainerTaskType =
   | "matematik_beregn_og_vis_metode"
   | "matematik_fortolk_graf_eller_funktion"
@@ -147,6 +149,7 @@ export function buildMatematikTrainerPromptAddendum(taskType: MatematikTrainerTa
     '  - "Forklar hvad hældningen betyder i denne sammenhæng."',
     '  - "Du har valgt rigtig metode, men der er en regnefejl i sidste trin."',
     ...taskSpecificGuidance,
+    buildMatematikOutputStylePromptBlock("full"),
   ].join("\n");
 }
 

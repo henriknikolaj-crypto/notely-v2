@@ -1,6 +1,9 @@
 // app/api/generate-mc-batch/route.ts
 import "server-only";
 
+import { buildMcSystemPrompt, extractMcResponseText, parseMcQuestionOutput } from "@/lib/learning/mc-output";
+import { buildMatematikOutputStylePromptBlock, looksLikeMatematikContent } from "@/lib/matematik/outputStyle";
+import { resolveModelForFeature } from "@/lib/openai/model";
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
@@ -116,6 +119,7 @@ type PlannedQuestion = {
   usedChunkIds: string[];
   citations: McCitationPayload[];
   focusAngle: string;
+  isMathContext: boolean;
   userPrompt: string;
 };
 
@@ -130,7 +134,7 @@ type ScoredChunkRow = ChunkRow & {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MC_BATCH_CONCURRENCY = 3;
-const MC_BATCH_CONTEXT_CHAR_LIMIT = 4000;
+const MC_BATCH_CONTEXT_CHAR_LIMIT = 4500;
 const MC_OPENAI_CALL_TIMEOUT_MS = 85_000;
 const MC_OPENAI_MAX_COMPLETION_TOKENS = 1200;
 const MC_SCOPE_DOC_CHUNK_COUNT_MAX_FILES = 12;
@@ -609,30 +613,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(err, { status: quotaSnapshot.status });
     }
 
-    if (
-      typeof quotaSnapshot.remainingThisMonth === "number" &&
-      quotaSnapshot.remainingThisMonth < requestedCount
-    ) {
-      const err: GenerateMcBatchErr = {
-        ok: false,
-        error: "Du har ikke nok Multiple Choice tilbage denne måned til at starte et nyt sæt.",
-        requestId,
-        code: "QUOTA_EXCEEDED",
-        feature: "mc_generate",
-        plan: quotaSnapshot.plan,
-        usedThisMonth: quotaSnapshot.used,
-        monthlyLimit: quotaSnapshot.limitPerMonth,
-        resetAt: quotaSnapshot.resetAt ?? undefined,
-        debug: {
-          requestedCount,
-          remainingThisMonth: quotaSnapshot.remainingThisMonth,
-          reason: "partial-batch-blocked",
-        },
-      };
-      return NextResponse.json(err, { status: 429 });
-    }
-
-    const effectiveCount = requestedCount;
+    const effectiveCount =
+      quotaSnapshot.remainingThisMonth == null ? requestedCount : Math.min(requestedCount, quotaSnapshot.remainingThisMonth);
 
     // Topic (første mappe-navn hvis muligt)
     let topic = "pensum";
@@ -824,41 +806,11 @@ export async function POST(req: NextRequest) {
       return null;
     }
 
-    const model = process.env.OPENAI_MODEL_MC || process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-    const systemPromptBase = `
-Du er en dansk studieassistent.
-Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddrag.
-
-VIGTIGT:
-- Du MÅ KUN bruge den kontekst, du får (KILDE-afsnit).
-- Skriv alt på dansk.
-- Returnér kun ét kompakt JSON-objekt. Ingen markdown, ingen kodeblok, ingen ekstra tekst.
-
-KRAV:
-- 1 spørgsmål
-- 4 svarmuligheder
-- Præcis 1 korrekt
-- Plausible distraktorer (ikke åbenlyse)
-- Spørgsmålet skal være specifikt og må ikke være en ren gentagelse af samme faktasæt.
-- Undgå at gøre "samme korrekt-svar" til løsning igen og igen.
-- "question" skal være kort: maks 1 sætning og helst under 160 tegn.
-- Hver "options[].text" skal være kort: helst under 10 ord.
-- "explanation" skal være meget kort: maks 1 kort sætning og helst under 160 tegn.
-- Brug ingen ekstra felter.
-
-Returnér gyldig JSON:
-{
-  "question": "...",
-  "options": [
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false }
-  ],
-  "explanation": "Kort forklaring"
-}
-`.trim();
+    const model = resolveModelForFeature("mc");
+    const systemPromptBase = buildMcSystemPrompt([
+      'Spørgsmålet skal være specifikt og må ikke være en ren gentagelse af samme faktasæt.',
+      'Undgå at gøre det samme korrekte svar til løsning igen og igen.',
+    ]);
 
     const items: GenerateMcItemOk[] = [];
     let lastUsedFileIdInBatch: string | null = null;
@@ -928,21 +880,24 @@ Returnér gyldig JSON:
       ]
         .filter(Boolean)
         .join("\n");
+      const isMathContext = looksLikeMatematikContent([topic, usedFileTitle, contextText].filter(Boolean).join("\n"));
       metrics.totalPromptBuildMs += nowMs() - promptStartedAt;
 
-      return { batchIndex, usedFileId, usedFileTitle, usedChunkIds, citations, focusAngle, userPrompt };
+      return { batchIndex, usedFileId, usedFileTitle, usedChunkIds, citations, focusAngle, isMathContext, userPrompt };
     }
 
     async function generatePlannedQuestion(planned: PlannedQuestion) {
       let finalQuestion = "";
       let finalOptions: Array<{ text: string; isCorrect: boolean }> = [];
       let finalExplanation: string | null = null;
+      const mathOutputPrompt = planned.isMathContext ? buildMatematikOutputStylePromptBlock("compact") : "";
+      const baseSystemPrompt = mathOutputPrompt ? `${systemPromptBase}\n${mathOutputPrompt}` : systemPromptBase;
 
       for (let attempt = 0; attempt < 2; attempt++) {
         const systemPrompt =
           attempt === 0
-            ? systemPromptBase
-            : `${systemPromptBase}\nEKSTRA VIGTIGT: Du må IKKE gentage tidligere spørgsmål. Vælg et andet fokus i konteksten og et andet korrekt-svar.`;
+            ? baseSystemPrompt
+            : `${baseSystemPrompt}\nEKSTRA VIGTIGT: Du må IKKE gentage tidligere spørgsmål. Vælg et andet fokus i konteksten og et andet korrekt-svar.`;
 
         const openAiStartedAt = nowMs();
         const openAiAbort = new AbortController();
@@ -1025,23 +980,10 @@ Returnér gyldig JSON:
         }
 
         const normalizationStartedAt = nowMs();
-        const raw = completion?.choices?.[0]?.message?.content ?? "{}";
-        const finishReason = completion?.choices?.[0]?.finish_reason ?? null;
-
-        type LlmOption = { text?: string; isCorrect?: boolean };
-        type LlmPayload = { question?: string; options?: LlmOption[]; explanation?: string };
-
-        let payload: LlmPayload = {};
-        let parseOk = true;
-        try {
-          payload = JSON.parse(raw) as LlmPayload;
-        } catch {
-          payload = {};
-          parseOk = false;
-        }
-
-        const q = String(payload.question ?? "").trim();
-        const opts = Array.isArray(payload.options) ? payload.options : [];
+        const extracted = extractMcResponseText(completion);
+        const parsedOutput = parseMcQuestionOutput(extracted.text, extracted.shape.finishReason);
+        const q = parsedOutput.question;
+        const opts = parsedOutput.options;
         const normQ = normalizeQuestion(q);
 
         if (!q || opts.length < 2) {
@@ -1051,11 +993,15 @@ Returnér gyldig JSON:
             batchIndex: planned.batchIndex,
             attempt,
             model,
-            finishReason,
-            parseOk,
-            rawLength: raw.length,
-            questionLength: q.length,
-            optionsLength: opts.length,
+            finishReason: parsedOutput.diagnostics.finishReason,
+            parseOk: parsedOutput.diagnostics.parseOk,
+            extractedFrom: parsedOutput.diagnostics.extractedFrom,
+            responseTextSource: extracted.source,
+            rawLength: parsedOutput.diagnostics.rawLength,
+            questionLength: parsedOutput.diagnostics.questionLength,
+            optionsLength: parsedOutput.diagnostics.optionCount,
+            correctOptionCount: parsedOutput.diagnostics.correctOptionCount,
+            responseShape: extracted.shape,
           });
           metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
           continue;
@@ -1082,7 +1028,7 @@ Returnér gyldig JSON:
           text: stripLeadingLetterOption(String(o.text ?? "")) || `Mulighed ${idx + 1}`,
           isCorrect: idx === correctIdx,
         }));
-        finalExplanation = String(payload.explanation ?? "").trim() || null;
+        finalExplanation = parsedOutput.explanation;
         metrics.totalNormalizationMs += nowMs() - normalizationStartedAt;
         break;
       }
@@ -1410,4 +1356,3 @@ Returnér gyldig JSON:
     return NextResponse.json(out, { status });
   }
 }
-

@@ -16,6 +16,7 @@ type NoteRow = {
   content: string | null;
   created_at: string | null;
   note_type: string | null;
+  metadata?: unknown;
 };
 
 function formatDT(iso: string | null | undefined) {
@@ -48,6 +49,34 @@ type PageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
 
+async function loadNoteWithOptionalMetadata(sb: any, ownerId: string, noteId: string) {
+  const attempts = [
+    "id,title,content,created_at,note_type,metadata",
+    "id,title,content,created_at,note_type",
+  ];
+
+  let lastError: any = null;
+  for (const select of attempts) {
+    const { data, error } = await sb
+      .from("notes")
+      .select(select)
+      .eq("owner_id", ownerId)
+      .eq("id", noteId)
+      .maybeSingle<NoteRow>();
+
+    if (!error) {
+      return {
+        ...(data ?? null),
+        metadata: data?.metadata ?? null,
+      } as NoteRow | null;
+    }
+    lastError = error;
+  }
+
+  if (lastError) throw lastError;
+  return null;
+}
+
 export default async function NoteDetailPage({ params, searchParams }: PageProps) {
   const { id } = await params;
   const sp = (await searchParams) ?? {};
@@ -59,6 +88,8 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
   function safeBackHref(raw: string | undefined): string | null {
     const s = String(raw ?? "").trim();
     if (!s.startsWith("/") || s.startsWith("//")) return null;
+    if (s.startsWith("/_next") || s.includes("_rsc=")) return null;
+    if (!s.startsWith("/notes") && !s.startsWith("/traener/noter") && !s.startsWith("/m/noter")) return null;
     return s;
   }
 
@@ -102,15 +133,16 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
     );
   }
 
-  const { data, error } = await sb
-    .from("notes")
-    .select("id,title,content,created_at,note_type")
-    .eq("owner_id", ownerId)
-    .eq("id", id)
-    .single<NoteRow>();
+  let data: NoteRow | null = null;
+  let error: any = null;
+  try {
+    data = await loadNoteWithOptionalMetadata(sb, ownerId, id);
+  } catch (loadError) {
+    error = loadError;
+  }
 
   if (error || !data) {
-    console.error("NOTE detail error:", error);
+    if (error) console.error("NOTE detail error:", error);
     return (
       <main className="mx-auto max-w-3xl p-6">
         <p className="text-sm text-red-600">Note ikke fundet.</p>
@@ -155,6 +187,20 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
     },
   });
 
+  if (process.env.NODE_ENV !== "production") {
+    const metadataRecord =
+      data.metadata && typeof data.metadata === "object" && !Array.isArray(data.metadata)
+        ? (data.metadata as Record<string, unknown>)
+        : null;
+    console.info("[notes/detail]", {
+      noteId: data.id,
+      noteType: data.note_type ?? null,
+      hasMetadata: Boolean(metadataRecord),
+      metadataKeys: metadataRecord ? Object.keys(metadataRecord).sort() : [],
+      hasMathRenderedNote: Boolean(metadataRecord?.mathRenderedNote ?? metadataRecord?.math_rendered_note),
+    });
+  }
+
   return (
     <main className="mx-auto max-w-3xl px-6 py-7">
       <div className="space-y-5">
@@ -180,7 +226,13 @@ export default async function NoteDetailPage({ params, searchParams }: PageProps
           {isResume ? (
             <ResumeNoteContent content={data.content ?? ""} />
           ) : (
-            <FocusNoteContent content={data.content ?? ""} />
+            <FocusNoteContent
+              content={data.content ?? ""}
+              metadata={data.metadata ?? null}
+              renderContext="saved_note_detail"
+              noteId={data.id}
+              noteType={data.note_type ?? null}
+            />
           )}
         </section>
       </div>

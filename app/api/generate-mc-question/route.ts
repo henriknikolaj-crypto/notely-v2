@@ -1,6 +1,8 @@
 // app/api/generate-mc-question/route.ts
 import "server-only";
 
+import { buildMcSystemPrompt, extractMcResponseText, parseMcQuestionOutput } from "@/lib/learning/mc-output";
+import { buildMatematikOutputStylePromptBlock, looksLikeMatematikContent } from "@/lib/matematik/outputStyle";
 import { resolveModelForFeature } from "@/lib/openai/model";
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
@@ -84,8 +86,8 @@ type ChunkRow = {
 };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const MC_SINGLE_CONTEXT_CHAR_LIMIT = 4000;
-const MC_SINGLE_MAX_COMPLETION_TOKENS = 1600;
+const MC_SINGLE_CONTEXT_CHAR_LIMIT = 7000;
+const MC_SINGLE_MAX_COMPLETION_TOKENS = 1400;
 
 function isOpenAiOutputLimitError(err: any) {
   const status = Number(err?.status ?? 0);
@@ -301,38 +303,7 @@ function chunksPerQuestion(difficulty: Difficulty, maxContextChunks: number) {
   return Math.max(1, Math.min(base, maxContextChunks));
 }
 
-const SYSTEM_PROMPT = `
-Du er en dansk studieassistent.
-Du laver eksamenslignende multiple choice-spørgsmål ud fra elevens pensum-uddrag.
-
-VIGTIGT:
-- Du MÅ KUN bruge den kontekst, du får (KILDE-afsnit).
-- Skriv alt på dansk.
-- Returnér kun ét kompakt JSON-objekt. Ingen markdown, ingen kodeblok, ingen ekstra tekst.
-- Hold hele JSON-svaret så kort som muligt.
-
-KRAV:
-- 1 spørgsmål
-- 4 svarmuligheder
-- Præcis 1 korrekt
-- Plausible distraktorer (ikke åbenlyse)
-- "question" skal være kort: maks 1 sætning og helst under 160 tegn.
-- Hver "options[].text" skal være kort: helst under 10 ord.
-- "explanation" skal være meget kort: maks 1 kort sætning og helst under 160 tegn.
-- Brug ingen ekstra felter.
-
-Returnér gyldig JSON:
-{
-  "question": "...",
-  "options": [
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false },
-    { "text": "...", "isCorrect": true/false }
-  ],
-  "explanation": "Kort forklaring"
-}
-`.trim();
+const SYSTEM_PROMPT_BASE = buildMcSystemPrompt();
 
 export async function POST(req: NextRequest) {
   const requestId = randomUUID();
@@ -552,6 +523,10 @@ export async function POST(req: NextRequest) {
     timings.promptBuildMs = Date.now() - promptStartedAt;
 
     const model = resolveModelForFeature("mc");
+    const isMathContext = looksLikeMatematikContent([topic, usedFileTitle, contextText].filter(Boolean).join("\n"));
+    const systemPrompt = isMathContext
+      ? `${SYSTEM_PROMPT_BASE}\n${buildMatematikOutputStylePromptBlock("compact")}`
+      : SYSTEM_PROMPT_BASE;
 
     const modelStartedAt = Date.now();
     let completion;
@@ -561,7 +536,7 @@ export async function POST(req: NextRequest) {
         max_completion_tokens: MC_SINGLE_MAX_COMPLETION_TOKENS,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
       });
@@ -587,33 +562,24 @@ export async function POST(req: NextRequest) {
     timings.modelMs = Date.now() - modelStartedAt;
 
     const parseStartedAt = Date.now();
-    const raw = completion.choices[0]?.message?.content ?? "{}";
-    const finishReason = completion.choices[0]?.finish_reason ?? null;
-
-    type LlmOption = { text?: string; isCorrect?: boolean };
-    type LlmPayload = { question?: string; options?: LlmOption[]; explanation?: string };
-
-    let payload: LlmPayload = {};
-    let parseOk = true;
-    try {
-      payload = JSON.parse(raw) as LlmPayload;
-    } catch {
-      payload = {};
-      parseOk = false;
-    }
-
-    const q = String(payload.question ?? "").trim();
-    const opts = Array.isArray(payload.options) ? payload.options : [];
+    const extracted = extractMcResponseText(completion);
+    const parsedOutput = parseMcQuestionOutput(extracted.text, extracted.shape.finishReason);
+    const q = parsedOutput.question;
+    const opts = parsedOutput.options;
 
     if (!q || opts.length < 2) {
       console.warn("[generate-mc-question] invalid-model-output", {
         requestId,
         model,
-        finishReason,
-        parseOk,
-        rawLength: raw.length,
-        questionLength: q.length,
-        optionsLength: opts.length,
+        finishReason: parsedOutput.diagnostics.finishReason,
+        parseOk: parsedOutput.diagnostics.parseOk,
+        extractedFrom: parsedOutput.diagnostics.extractedFrom,
+        responseTextSource: extracted.source,
+        rawLength: parsedOutput.diagnostics.rawLength,
+        questionLength: parsedOutput.diagnostics.questionLength,
+        optionsLength: parsedOutput.diagnostics.optionCount,
+        correctOptionCount: parsedOutput.diagnostics.correctOptionCount,
+        responseShape: extracted.shape,
       });
       const err: GenerateMcErr = { ok: false, error: "Kunne ikke generere spørgsmål (tomt output).", requestId };
       return NextResponse.json(err, { status: 500 });
@@ -702,7 +668,7 @@ export async function POST(req: NextRequest) {
       questionId: randomUUID(),
       question: q,
       options,
-      explanation: String(payload.explanation ?? "").trim() || null,
+      explanation: parsedOutput.explanation,
       citations,
       usedFileId,
       meta: { requestId, usedChunkIds, usedFileTitle },
@@ -723,6 +689,10 @@ export async function POST(req: NextRequest) {
         model: timings.modelMs,
         parsingAndPostProcessing: timings.parsingAndPostProcessingMs,
         total: Date.now() - requestStartedAt,
+      },
+      outputExtraction: {
+        responseTextSource: extracted.source,
+        extractedFrom: parsedOutput.diagnostics.extractedFrom,
       },
     });
 

@@ -7,9 +7,11 @@ import { enforceRateLimit } from "@/lib/rateLimit";
 import { quotaTryConsume, supabaseAdminOrNull } from "@/lib/quota/rpc";
 import { createChatCompletion } from "@/lib/openai/buildRequest";
 import { resolveModelForFeature } from "@/lib/openai/model";
+import { buildMatematikOutputStylePromptBlock, looksLikeMatematikContent } from "@/lib/matematik/outputStyle";
 import {
   formatSuspiciousPreview,
   hasSuspiciousFlashcardChars,
+  normalizeFlashcardCardSafeMath,
   normalizeFlashcardMathText,
 } from "@/lib/text/flashcardMath";
 import { supabaseServerRouteReadOnly } from "@/lib/supabase/server-route-readonly";
@@ -594,6 +596,9 @@ export async function POST(req: NextRequest) {
     const usedFallback = sources.length < effectiveRequested;
 
     const model = resolveModelForFeature("flashcards");
+    const isMathFlashcardSet = looksLikeMatematikContent(
+      sources.map((source) => `${source.title}\n${source.text}`).join("\n\n"),
+    );
 
     const systemPrompt = `
 Du er en dansk studieassistent. Du laver flashcards ud fra kilderne nedenfor.
@@ -608,6 +613,8 @@ VIGTIGT:
   - du må bruge maks 2 bullets, men undgå lange tekstmure
 - Hold tonen rolig, klar og nordisk.
 - Front/back må ikke nævne "SOURCE", "sourceIndex", "JSON" eller interne instruktioner.
+
+${isMathFlashcardSet ? buildMatematikOutputStylePromptBlock("card") : ""}
 
 Returnér gyldig JSON:
 {
@@ -639,6 +646,13 @@ Returnér gyldig JSON:
       "- front: kort spørgsmål (helst 1 sætning).",
       "- back: 2-5 korte sætninger, gerne 1 konkret eksempel hvis relevant.",
       "- back må gerne bruge op til 2 bullets, men ikke være en lang mur af tekst.",
+      ...(isMathFlashcardSet
+        ? [
+            "- Ved matematik på flashcards: brug helst inline math til korte udtryk.",
+            "- Brug kun block math, hvis den er meget kort og gør kortet tydeligere.",
+            "- Undgå lange mellemregninger og undgå aligned-blokke, der bliver brede på et lille kort.",
+          ]
+        : []),
     ].join("\n");
 
     const { completion } = await createChatCompletion(openai, {
@@ -681,8 +695,8 @@ Returnér gyldig JSON:
 
       const src = sources[sourceIndex - 1];
 
-      const cleanFront = normalizeFlashcardMathText(front.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
-      const cleanBack = normalizeFlashcardMathText(back.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
+      const cleanFront = normalizeFlashcardCardSafeMath(front.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
+      const cleanBack = normalizeFlashcardCardSafeMath(back.replace(/\bSOURCE\s*\d+\b/gi, "").trim());
       const candidateFingerprint = buildFlashcardFingerprint(cleanFront, cleanBack);
       const isNearDuplicate = seenFingerprints.some((existing) =>
         detectNearDuplicateFlashcard(candidateFingerprint, existing),

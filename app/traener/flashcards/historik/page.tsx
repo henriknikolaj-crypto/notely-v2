@@ -1,5 +1,6 @@
 import "server-only";
 import Link from "next/link";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 import { getHistoryWindowForPlan } from "@/lib/plan/history";
 import { getCanonicalUserPlan } from "@/lib/plan/limits";
 import { getTrainerSession } from "@/lib/auth/trainer-session";
@@ -32,6 +33,7 @@ type SnapshotCard = {
   id?: string | null;
   front?: string | null;
   back?: string | null;
+  explanation?: string | null;
 };
 
 export default async function FlashcardsHistoryPage({
@@ -208,12 +210,28 @@ export default async function FlashcardsHistoryPage({
                           <div className="text-[11px] font-medium uppercase tracking-wide text-zinc-400">
                             Kort {index + 1}
                           </div>
-                          <div className="mt-1 text-sm font-medium text-zinc-900">
-                            {String(card.front ?? "").trim()}
-                          </div>
-                          <div className="mt-2 whitespace-pre-line text-sm text-zinc-700">
-                            {String(card.back ?? "").trim()}
-                          </div>
+                          <MathMarkdown
+                            content={String(card.front ?? "").trim()}
+                            preserveWhitespace
+                            className="mt-1 text-sm font-medium leading-7 text-zinc-900 [&_.katex-display]:my-3 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                          />
+                          <MathMarkdown
+                            content={String(card.back ?? "").trim()}
+                            preserveWhitespace
+                            className="mt-2 text-sm leading-7 text-zinc-700 [&_.katex-display]:my-3 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                          />
+                          {String(card.explanation ?? "").trim() ? (
+                            <div className="mt-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+                              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                                Forklaring
+                              </div>
+                              <MathMarkdown
+                                content={String(card.explanation ?? "").trim()}
+                                preserveWhitespace
+                                className="mt-2 text-sm leading-7 text-zinc-700 [&_.katex-display]:my-3 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                              />
+                            </div>
+                          ) : null}
                         </li>
                       ))}
                     </ul>

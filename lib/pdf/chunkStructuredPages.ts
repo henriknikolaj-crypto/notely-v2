@@ -1,12 +1,26 @@
 import "server-only";
 
-import type { ExtractedPdfPage, PageType } from "@/lib/pdf/extractPdfWithFallback";
+import type {
+  ExtractedPageFormulaCandidate,
+  ExtractedPdfPage,
+  FormulaExtractionOrigin,
+  PageType,
+} from "@/lib/pdf/extractPdfWithFallback";
 
 export type StructuredChunk = {
   pageNumber: number;
   content: string;
   extractionMethod: "text" | "ocr";
   extractionQuality: "high" | "medium" | "low";
+  sourceOrigin?: FormulaExtractionOrigin;
+  formulaCandidates?: Array<{
+    rawFormula: string;
+    normalizedFormula: string;
+    latexFormula?: string;
+    surroundingText?: string;
+    origin: FormulaExtractionOrigin;
+    confidence: number;
+  }>;
 };
 
 type BlockKind = "text" | "table" | "formula";
@@ -131,6 +145,50 @@ function mergeBlocksIntoChunks(blocks: Block[], pageType: PageType) {
   return chunks;
 }
 
+function buildFormulaCandidateChunks(page: ExtractedPdfPage) {
+  const formulas = page.extractionMeta.math_formula_candidates ?? [];
+  if (!formulas.length) return [] as StructuredChunk[];
+
+  const shouldEmitDedicatedChunks =
+    page.extractionMeta.weak_text_for_math ||
+    page.extractionMethod === "ocr" ||
+    formulas.some((formula) => formula.origin === "vision");
+  if (!shouldEmitDedicatedChunks) return [] as StructuredChunk[];
+
+  const seen = new Set<string>();
+  const heading = page.extractionMeta.heading_candidates?.[0] ?? "";
+  return formulas
+    .filter((formula) => {
+      const key = formula.normalizedFormula.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 8)
+    .map((formula) => {
+      const content = [heading, `Formel: ${formula.rawFormula}`, formula.surroundingText ? `Forklaring: ${formula.surroundingText}` : ""]
+        .filter(Boolean)
+        .join("\n");
+      return {
+        pageNumber: page.pageNumber,
+        content,
+        extractionMethod: page.extractionMethod,
+        extractionQuality: page.extractionQuality,
+        sourceOrigin: formula.origin,
+        formulaCandidates: [
+          {
+            rawFormula: formula.rawFormula,
+            normalizedFormula: formula.normalizedFormula,
+            latexFormula: formula.latexFormula,
+            surroundingText: formula.surroundingText,
+            origin: formula.origin,
+            confidence: formula.confidence,
+          },
+        ],
+      } satisfies StructuredChunk;
+    });
+}
+
 export function buildChunksFromExtractedPages(pages: ExtractedPdfPage[]): StructuredChunk[] {
   const out: StructuredChunk[] = [];
 
@@ -146,8 +204,19 @@ export function buildChunksFromExtractedPages(pages: ExtractedPdfPage[]): Struct
         content: trimmed,
         extractionMethod: page.extractionMethod,
         extractionQuality: page.extractionQuality,
+        sourceOrigin: page.extractionMethod === "ocr" ? "ocr" : "text_layer",
+        formulaCandidates: page.extractionMeta.math_formula_candidates?.map((formula: ExtractedPageFormulaCandidate) => ({
+          rawFormula: formula.rawFormula,
+          normalizedFormula: formula.normalizedFormula,
+          latexFormula: formula.latexFormula,
+          surroundingText: formula.surroundingText,
+          origin: formula.origin,
+          confidence: formula.confidence,
+        })),
       });
     }
+
+    out.push(...buildFormulaCandidateChunks(page));
   }
 
   return out;

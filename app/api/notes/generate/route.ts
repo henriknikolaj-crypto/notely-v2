@@ -20,6 +20,38 @@ function pickMode(raw: any): "resume" | "golden" {
   return raw === "golden" ? "golden" : "resume";
 }
 
+function shouldTraceNoteContent() {
+  return process.env.NODE_ENV !== "production" || process.env.NOTELY_DEBUG_MATH_NOTES === "1";
+}
+
+function contentHash(value: string | null | undefined) {
+  const text = String(value ?? "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function contentFingerprint(value: string | null | undefined) {
+  const text = String(value ?? "");
+  return {
+    length: text.length,
+    hash: contentHash(text),
+    first200: text.slice(0, 200).replace(/\r?\n/g, "\\n"),
+  };
+}
+
+function traceResponseContent(label: string, value: string | null | undefined, extra?: Record<string, unknown>) {
+  if (!shouldTraceNoteContent()) return;
+  console.info("[notes/generate-response]", {
+    label,
+    ...contentFingerprint(value),
+    ...extra,
+  });
+}
+
 async function readJsonBody<T>(req: NextRequest) {
   const raw = (await req.text()).trim();
   if (!raw) return { ok: true as const, value: {} as T };
@@ -117,6 +149,13 @@ export async function POST(req: NextRequest) {
       ownerId,
       fileId,
       modes: [mode],
+    });
+    traceResponseContent("responseContentUsed", inserted?.content, {
+      noteId: inserted?.id ?? null,
+      mode,
+      noteType: inserted?.note_type ?? null,
+      hasMetadata: Boolean(inserted?.metadata),
+      hasMathRenderedNote: Boolean(inserted?.mathRenderedNote),
     });
 
     return NextResponse.json({ ok: true, note: inserted }, { status: 200 });

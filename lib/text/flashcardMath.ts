@@ -10,6 +10,24 @@ export function normalizeFlashcardMathText(input: string): string {
     .trim();
 }
 
+function wrapWholeAlignedBlock(input: string): string {
+  const text = normalizeFlashcardMathText(input);
+  if (!/^\\begin\{aligned\}[\s\S]*\\end\{aligned\}$/u.test(text)) return text;
+  return `$$\n${text}\n$$`;
+}
+
+function normalizeDisplayMathSpacing(input: string): string {
+  return input.replace(/\$\$([\s\S]*?)\$\$/g, (_match, body: string) => {
+    const trimmedBody = String(body ?? "").replace(/\n{3,}/g, "\n\n").trim();
+    return `\n\n$$\n${trimmedBody}\n$$\n\n`;
+  });
+}
+
+export function normalizeFlashcardCardSafeMath(input: string): string {
+  const normalized = wrapWholeAlignedBlock(input);
+  return normalizeFlashcardMathText(normalizeDisplayMathSpacing(normalized));
+}
+
 export function hasSuspiciousFlashcardChars(input: string): boolean {
   return /[\uFFFD\uE000-\uF8FF]/u.test(String(input ?? ""));
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { filterVisibleNotes, getNoteEntitlement } from "@/lib/notes/entitlements";
 import { getTrainerSession } from "@/lib/auth/trainer-session";
+import { looksLikeRawNextResponse } from "@/lib/notes/contentSafety";
 
 export const dynamic = "force-dynamic";
 
@@ -40,6 +41,7 @@ function formatDT(iso: string | null | undefined) {
 // lille helper til kort tekst
 function makeSnippet(content: string | null | undefined, maxLen = 260) {
   if (!content) return "";
+  if (looksLikeRawNextResponse(content)) return "Noten kunne ikke vises korrekt.";
   const plain = content.replace(/\s+/g, " ").trim();
   return plain.length > maxLen ? `${plain.slice(0, maxLen)}…` : plain;
 }
@@ -258,12 +260,12 @@ export default async function NotesPage({
                 </p>
 
                 <div className="mt-auto flex items-center justify-between pt-2 text-xs">
-                  <a
+                  <Link
                     href={`/notes/${note.id}?back=${encodeURIComponent(currentListHref)}`}
                     className="font-medium text-zinc-700 underline underline-offset-2 hover:text-zinc-900"
                   >
                     Åbn note
-                  </a>
+                  </Link>
                 </div>
               </article>
             ))}

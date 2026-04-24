@@ -1,6 +1,7 @@
 "use client";
 
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
@@ -80,16 +81,18 @@ type Props = {
 };
 
 const DEFAULT_SESSION_SIZE = 10;
+const INITIAL_BATCH_TARGET = 1;
+const WARM_BUFFER_THRESHOLD = 2;
+const BACKGROUND_BATCH_TARGET = 4;
 const QUOTA_MSG = "Du har nået din grænse for Multiple Choice denne måned.";
 
 type FetchSingleResult =
   | { status: "OK"; question: MCQuestion }
   | { status: "STOP"; question: null };
 
-function clampInt(n: number, min: number, max: number) {
-  const x = Number.isFinite(n) ? Math.round(n) : min;
-  return Math.min(max, Math.max(min, x));
-}
+type FetchBatchResult =
+  | { status: "OK"; questions: MCQuestion[] }
+  | { status: "NOT_FOUND" | "STOP" | "NEEDS_SINGLE"; questions: [] };
 
 function pickQuota(json: any): { used: number; limit: number | null } {
   const used =
@@ -115,8 +118,6 @@ function toApiQuestion(v: GenerateMcItemOk): MCQuestion {
     source: "api",
   };
 }
-
-type BatchResult = "OK" | "NOT_FOUND" | "STOP" | "NEEDS_SINGLE";
 
 function normalizeQuestionKey(value: string) {
   return String(value ?? "")
@@ -155,6 +156,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
   const activeRequestKindRef = useRef<"batch" | "single" | null>(null);
   const batchInFlightRef = useRef(false);
   const pendingQueueAdvanceRef = useRef(false);
+  const singleFallbackCountRef = useRef(0);
 
   const [started, setStarted] = useState(false);
 
@@ -301,9 +303,11 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     });
   }, [scopeKey]);
 
-  const advanceToQueuedQuestion = useCallback(
-    (nextQ: MCQuestion, mode: "queue-next" | "queue-wait-resume") => {
-      setQueue((prev) => prev.slice(1));
+  const activateQuestion = useCallback(
+    (
+      nextQ: MCQuestion,
+      mode: "batch-initial" | "batch-refill" | "queue-next" | "queue-wait-resume" | "single-initial" | "single-next",
+    ) => {
       setCurrentQuestion(nextQ);
       logMcClientDebug("currentQuestion:set", {
         mode,
@@ -312,7 +316,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         questionId: nextQ.id,
         usedFileId: nextQ.usedFileId ?? null,
       });
-      setQuestionNumber((prev) => prev + 1);
+      setQuestionNumber((prev) => (mode === "batch-initial" || mode === "single-initial" ? 1 : prev + 1));
       setSelectedId(null);
       setChecked(false);
       setSaveError(null);
@@ -321,6 +325,14 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       registerAntiRepeat(nextQ);
     },
     [registerAntiRepeat, scopeKey],
+  );
+
+  const advanceToQueuedQuestion = useCallback(
+    (nextQ: MCQuestion, mode: "queue-next" | "queue-wait-resume") => {
+      setQueue((prev) => prev.slice(1));
+      activateQuestion(nextQ, mode);
+    },
+    [activateQuestion],
   );
 
   useEffect(() => {
@@ -347,17 +359,18 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     async (
       count: number,
       opts?: { roundToken?: number; avoidQuestions?: string[]; avoidChunkIds?: string[] },
-    ): Promise<BatchResult> => {
+    ): Promise<FetchBatchResult> => {
       if (effectiveScopeFolderIds.length === 0) {
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] fetchBatch:rejected-empty-scope", { count });
         }
-        return "STOP";
+        return { status: "STOP", questions: [] };
       }
 
       const batchRequestSeq = ++prefetchRequestSeqRef.current;
       const roundToken = opts?.roundToken ?? roundTokenRef.current;
       const isStale = () => batchRequestSeq !== prefetchRequestSeqRef.current || roundToken !== roundTokenRef.current;
+      activeRequestKindRef.current = "batch";
       batchInFlightRef.current = true;
       setBatchInFlight(true);
       logMcClientDebug("fetchBatch:start", {
@@ -418,16 +431,16 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
         if (res.status === 404) {
           batchSupportedRef.current = false;
-          return "NOT_FOUND";
+          return { status: "NOT_FOUND", questions: [] };
         }
         batchSupportedRef.current = true;
 
         if (res.status === 429) {
-          return "STOP";
+          return { status: "STOP", questions: [] };
         }
 
         if (res.status === 401) {
-          return "STOP";
+          return { status: "STOP", questions: [] };
         }
 
         if (!res.ok) {
@@ -439,7 +452,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               error: String(j?.error ?? `Kunne ikke generere MC-batch (${res.status}).`),
             });
           }
-          return "NEEDS_SINGLE";
+          return { status: "NEEDS_SINGLE", questions: [] };
         }
 
         const data = (await readJsonSafe<GenerateMcBatchResponse>(res)) as GenerateMcBatchResponse | null;
@@ -453,7 +466,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           });
         }
         if (!data || (data as any).ok === false) {
-          return "NEEDS_SINGLE";
+          return { status: "NEEDS_SINGLE", questions: [] };
         }
 
         const ok = data as GenerateMcBatchResponseOk;
@@ -471,7 +484,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
               rawItemsLength: items.length,
             });
           }
-          return "NEEDS_SINGLE";
+          return { status: "NEEDS_SINGLE", questions: [] };
         }
 
         const effective =
@@ -489,7 +502,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
             scopeKey,
             questionCount: apiQuestions.length,
           });
-          return "STOP";
+          return { status: "STOP", questions: [] };
         }
 
         if (process.env.NODE_ENV !== "production") {
@@ -504,9 +517,8 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           });
         }
 
-        appendQuestionsToQueue(apiQuestions);
         dispatchQuotaChanged();
-        return "OK";
+        return { status: "OK", questions: apiQuestions };
       } catch (err: any) {
         if (process.env.NODE_ENV !== "production") {
           console.debug("[mc-ui] fetchBatch:catch", {
@@ -516,17 +528,18 @@ export default function ClientMC({ scopeFolderIds }: Props) {
             stale: isStale(),
           });
         }
-        if (err?.name === "AbortError") return "STOP";
-        if (isStale()) return "STOP";
+        if (err?.name === "AbortError") return { status: "STOP", questions: [] };
+        if (isStale()) return { status: "STOP", questions: [] };
         console.error("generate-mc-batch error:", err);
-        return "NEEDS_SINGLE";
+        return { status: "NEEDS_SINGLE", questions: [] };
       } finally {
         batchInFlightRef.current = false;
         setBatchInFlight(false);
+        if (!isStale() && activeRequestKindRef.current === "batch") activeRequestKindRef.current = null;
         if (prefetchAbortRef.current === ac) prefetchAbortRef.current = null;
       }
     },
-    [appendQuestionsToQueue, dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, sessionTotal],
+    [dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, sessionTotal, scopeKey],
   );
 
   const fetchSingle = useCallback(
@@ -633,8 +646,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           return { status: "STOP", question: null };
         }
 
-        setCurrentQuestion(apiQuestion);
-        logMcClientDebug("currentQuestion:set", {
+        logMcClientDebug("fetchSingle:resolved", {
           mode,
           roundToken,
           scopeKey,
@@ -645,10 +657,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
           batchInFlight: batchInFlightRef.current,
         });
         dispatchQuotaChanged();
-        registerAntiRepeat(apiQuestion);
-
-        if (mode === "next") setQuestionNumber((prev) => prev + 1);
-        else setQuestionNumber(1);
+        activateQuestion(apiQuestion, mode === "next" ? "single-next" : "single-initial");
 
         return { status: "OK", question: apiQuestion };
       } catch (err: any) {
@@ -681,7 +690,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         if (foregroundAbortRef.current === ac) foregroundAbortRef.current = null;
       }
     },
-    [applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, registerAntiRepeat, resetRoundToIdle, scopeKey, sessionTotal],
+    [activateQuestion, applyQuotaBlocked, dispatchQuotaChanged, effectiveScopeFolderIds, questionNumber, queue.length, readJsonSafe, resetRoundToIdle, scopeKey, sessionTotal],
   );
 
   const startNewRound = useCallback(async () => {
@@ -730,6 +739,7 @@ export default function ClientMC({ scopeFolderIds }: Props) {
 
     recentQuestionsRef.current = [];
     recentChunkIdsRef.current = [];
+    singleFallbackCountRef.current = 0;
 
     setQueue([]);
 
@@ -745,28 +755,100 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     setSessionTotal(sz);
     setQuestionNumber(1);
 
-    const batchSupported = batchSupportedRef.current;
-
-    if (batchSupported === false) {
-      await fetchSingle("initial", { roundToken });
-      return;
-    }
-
-    const firstResult = await fetchSingle("initial", { roundToken });
-    if (firstResult.status !== "OK" || !firstResult.question) {
-      return;
-    }
-
-    if (sz <= 1) return;
-
-    void fetchBatch(sz - 1, {
+    const initialBatchCount = Math.min(sz, INITIAL_BATCH_TARGET);
+    logMcClientDebug("start:batch-init", {
       roundToken,
-      avoidQuestions: [firstResult.question.question],
-      avoidChunkIds: Array.isArray(firstResult.question.meta?.usedChunkIds)
-        ? firstResult.question.meta.usedChunkIds.map((id) => String(id))
-        : [],
+      scopeKey,
+      requestCount: initialBatchCount,
+      batchSupportedHint: batchSupportedRef.current,
     });
-  }, [applyQuotaBlocked, computeSessionSize, effectiveScopeFolderIds, fetchBatch, fetchSingle]);
+    setLoadingNext(true);
+    setLoadError(null);
+
+    const initialBatch = await fetchBatch(initialBatchCount, { roundToken });
+    if (roundToken !== roundTokenRef.current) return;
+
+    if (initialBatch.status === "OK" && initialBatch.questions.length > 0) {
+      const [firstQuestion, ...bufferedQuestions] = initialBatch.questions;
+      if (!firstQuestion) {
+        setLoadingNext(false);
+        return;
+      }
+      if (bufferedQuestions.length > 0) appendQuestionsToQueue(bufferedQuestions);
+      activateQuestion(firstQuestion, "batch-initial");
+      return;
+    }
+
+    if (initialBatch.status === "STOP") {
+      setLoadingNext(false);
+      return;
+    }
+
+    logMcClientDebug("start:batch-empty-fallback-single", {
+      roundToken,
+      scopeKey,
+      batchStatus: initialBatch.status,
+      requestCount: initialBatchCount,
+    });
+    singleFallbackCountRef.current += 1;
+    await fetchSingle("initial", { roundToken });
+  }, [activateQuestion, appendQuestionsToQueue, applyQuotaBlocked, computeSessionSize, effectiveScopeFolderIds, fetchBatch, fetchSingle, scopeKey]);
+
+  useEffect(() => {
+    if (!started || !currentQuestion || isFinished || quotaBlocked) return;
+    if (batchSupportedRef.current === false) return;
+    if (batchInFlightRef.current) return;
+
+    const roundToken = roundTokenRef.current;
+    const remainingAfterCurrent = Math.max(0, sessionTotal - questionNumber);
+    if (remainingAfterCurrent <= 0) return;
+
+    const desiredBuffer = Math.min(WARM_BUFFER_THRESHOLD, remainingAfterCurrent);
+    if (queue.length >= desiredBuffer) return;
+
+    const missingBuffer = Math.max(0, desiredBuffer - queue.length);
+    const requestCount = Math.min(
+      remainingAfterCurrent - queue.length,
+      Math.max(BACKGROUND_BATCH_TARGET, missingBuffer),
+    );
+    if (requestCount <= 0) return;
+
+    logMcClientDebug("queue:background-refill", {
+      roundToken,
+      scopeKey,
+      queueLength: queue.length,
+      desiredBuffer,
+      requestCount,
+      questionNumber,
+      sessionTotal,
+    });
+
+    void (async () => {
+      const batchResult = await fetchBatch(requestCount, { roundToken });
+      if (roundToken !== roundTokenRef.current) return;
+      if (batchResult.status === "OK" && batchResult.questions.length > 0) {
+        appendQuestionsToQueue(batchResult.questions);
+        return;
+      }
+      logMcClientDebug("queue:background-refill-empty", {
+        roundToken,
+        scopeKey,
+        status: batchResult.status,
+        requestCount,
+      });
+    })();
+  }, [
+    appendQuestionsToQueue,
+    currentQuestion,
+    fetchBatch,
+    isFinished,
+    questionNumber,
+    queue.length,
+    quotaBlocked,
+    scopeKey,
+    sessionTotal,
+    started,
+  ]);
 
   // scope-skift: stop alt og tilbage til “Start”
   useEffect(() => {
@@ -915,6 +997,13 @@ export default function ClientMC({ scopeFolderIds }: Props) {
     if (questionNumber >= sessionTotal) {
       const sz = await computeSessionSize("finishCheck");
       if (sz <= 0) setQuotaBlocked(QUOTA_MSG);
+      logMcClientDebug("round:finished", {
+        roundToken: roundTokenRef.current,
+        scopeKey,
+        correctCount,
+        sessionTotal,
+        singleFallbackCount: singleFallbackCountRef.current,
+      });
       setIsFinished(true);
       setCurrentQuestion(null);
       return;
@@ -945,13 +1034,15 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       return;
     }
 
-    logMcClientDebug("handleNext:queue-empty-fallback-single", {
+    singleFallbackCountRef.current += 1;
+    logMcClientDebug("queue:empty-fallback-single", {
       roundToken: roundTokenRef.current,
       scopeKey,
       queueLength: queue.length,
       batchInFlight: batchInFlightRef.current,
       questionNumber,
       sessionTotal,
+      singleFallbackCount: singleFallbackCountRef.current,
     });
     await fetchSingle("next", { roundToken: roundTokenRef.current });
   }
@@ -1065,7 +1156,11 @@ export default function ClientMC({ scopeFolderIds }: Props) {
         </span>
       </div>
 
-      <div className="text-sm font-medium text-zinc-900">{currentQuestion.question}</div>
+      <MathMarkdown
+        content={currentQuestion.question}
+        preserveWhitespace
+        className="text-sm font-medium leading-7 text-zinc-900 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+      />
 
       <div className="space-y-2">
         {currentQuestion.options.map((opt) => {
@@ -1086,7 +1181,9 @@ export default function ClientMC({ scopeFolderIds }: Props) {
                 showWrong ? "border-red-500 bg-red-50 text-red-900" : "",
               ].filter(Boolean).join(" ")}
             >
-              <span>{opt.text}</span>
+              <div className="min-w-0 flex-1">
+                <MathMarkdown content={opt.text} preserveWhitespace className="text-inherit [&_p]:my-0" />
+              </div>
               {showCorrect && <span className="ml-3 text-xs font-semibold">Korrekt svar</span>}
               {showWrong && <span className="ml-3 text-xs font-semibold">Forkert svar</span>}
             </button>
@@ -1129,7 +1226,13 @@ export default function ClientMC({ scopeFolderIds }: Props) {
       </div>
 
       {checked && currentQuestion.explanation && (
-        <div className="rounded-xl bg-zinc-50 p-3 text-xs text-zinc-700">{currentQuestion.explanation}</div>
+        <div className="rounded-xl bg-zinc-50 p-3 text-xs text-zinc-700">
+          <MathMarkdown
+            content={currentQuestion.explanation}
+            preserveWhitespace
+            className="text-xs leading-6 text-zinc-700 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+          />
+        </div>
       )}
 
       {checked && shownSources.length > 0 && (

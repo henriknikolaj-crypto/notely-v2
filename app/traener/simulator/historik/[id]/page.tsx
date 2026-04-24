@@ -3,6 +3,7 @@ import "server-only";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 
 export const dynamic = "force-dynamic";
 
@@ -189,13 +190,21 @@ export default async function ExamHistoryDetailPage({
         <>
           <section className="rounded-2xl border border-zinc-200 bg-white p-4">
             <h2 className="mb-2 text-sm font-semibold text-zinc-900">Feedback</h2>
-            <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{oralFeedback || "Ingen feedback gemt."}</div>
+            <MathMarkdown
+              content={oralFeedback || "Ingen feedback gemt."}
+              preserveWhitespace
+              className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+            />
           </section>
 
           {oralTranscript ? (
             <section className="rounded-2xl border border-zinc-200 bg-white p-4">
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Samtale</h2>
-              <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{oralTranscript}</div>
+              <MathMarkdown
+                content={oralTranscript}
+                preserveWhitespace
+                className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
             </section>
           ) : null}
         </>
@@ -204,21 +213,33 @@ export default async function ExamHistoryDetailPage({
           {summary || writtenFeedback ? (
             <section className="rounded-2xl border border-zinc-200 bg-white p-4">
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Samlet vurdering</h2>
-              <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{summary || writtenFeedback}</div>
+              <MathMarkdown
+                content={summary || writtenFeedback}
+                preserveWhitespace
+                className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
             </section>
           ) : null}
 
           {writtenQuestions ? (
             <section className="rounded-2xl border border-zinc-200 bg-white p-4">
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Spørgsmål</h2>
-              <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{writtenQuestions}</div>
+              <MathMarkdown
+                content={writtenQuestions}
+                preserveWhitespace
+                className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
             </section>
           ) : null}
 
           {writtenAnswers ? (
             <section className="rounded-2xl border border-zinc-200 bg-white p-4">
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Dine svar</h2>
-              <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{writtenAnswers}</div>
+              <MathMarkdown
+                content={writtenAnswers}
+                preserveWhitespace
+                className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
             </section>
           ) : null}
 
@@ -227,7 +248,9 @@ export default async function ExamHistoryDetailPage({
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Styrker</h2>
               <ul className="space-y-2 text-sm leading-7 text-zinc-800">
                 {strengths.map((item, index) => (
-                  <li key={`${item}-${index}`}>- {item}</li>
+                  <li key={`${item}-${index}`}>
+                    <MathMarkdown content={item} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                  </li>
                 ))}
               </ul>
             </section>
@@ -238,7 +261,9 @@ export default async function ExamHistoryDetailPage({
               <h2 className="mb-2 text-sm font-semibold text-zinc-900">Det kan forbedres</h2>
               <ul className="space-y-2 text-sm leading-7 text-zinc-800">
                 {improvements.map((item, index) => (
-                  <li key={`${item}-${index}`}>- {item}</li>
+                  <li key={`${item}-${index}`}>
+                    <MathMarkdown content={item} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                  </li>
                 ))}
               </ul>
             </section>
@@ -251,9 +276,11 @@ export default async function ExamHistoryDetailPage({
                 {writtenItems.map((item: any, index: number) => (
                   <div key={String(item?.id ?? index)} className="rounded-xl border border-zinc-200 p-3">
                     <div className="text-xs font-medium text-zinc-600">Del {index + 1}{item?.grade ? ` · ${item.grade}` : ""}</div>
-                    <div className="mt-1 whitespace-pre-wrap text-sm leading-7 text-zinc-800">
-                      {String(item?.feedback ?? "").trim() || "Ingen feedback gemt."}
-                    </div>
+                    <MathMarkdown
+                      content={String(item?.feedback ?? "").trim() || "Ingen feedback gemt."}
+                      preserveWhitespace
+                      className="mt-1 text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                    />
                   </div>
                 ))}
               </div>

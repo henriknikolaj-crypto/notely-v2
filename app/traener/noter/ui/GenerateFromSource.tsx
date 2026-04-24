@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import LimitNotice from "@/app/traener/_ui/LimitNotice";
 import FocusNoteContent from "@/app/notes/ui/FocusNoteContent";
 import ResumeNoteContent from "@/app/notes/ui/ResumeNoteContent";
+import { looksLikeRawNextResponse } from "@/lib/notes/contentSafety";
+import { readMathRenderedNoteFromMetadata } from "@/lib/notes/mathRenderedNote";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 
 type FileOption = {
@@ -24,10 +26,50 @@ type GeneratedNote = {
   title: string | null;
   content: string | null;
   created_at?: string | null;
+  metadata?: unknown;
+  mathRenderedNote?: unknown;
 };
 
 const SUMMARY_LIMIT_MSG = "Du har brugt dine gratis resuméer denne måned.";
 const FOCUS_LIMIT_MSG = "Du har brugt dine gratis fokus-noter denne måned.";
+
+async function readJsonResponse(res: Response) {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) return null;
+  return res.json().catch(() => null);
+}
+
+function shouldTracePreviewContent() {
+  return process.env.NODE_ENV !== "production";
+}
+
+function contentHash(value: string | null | undefined) {
+  const text = String(value ?? "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function contentFingerprint(value: string | null | undefined) {
+  const text = String(value ?? "");
+  return {
+    length: text.length,
+    hash: contentHash(text),
+    first200: text.slice(0, 200).replace(/\r?\n/g, "\\n"),
+  };
+}
+
+function tracePreviewContent(label: string, value: string | null | undefined, extra?: Record<string, unknown>) {
+  if (!shouldTracePreviewContent()) return;
+  console.info("[notes/generate-preview]", {
+    label,
+    ...contentFingerprint(value),
+    ...extra,
+  });
+}
 
 function pickNotesQuota(
   json: any,
@@ -178,7 +220,7 @@ export default function GenerateFromSource(props: Props) {
         }),
       });
 
-      const data = await res.json().catch(() => null);
+      const data = await readJsonResponse(res);
 
       if (res.status === 403 && (data?.code === "NOTES_SUMMARY_MONTHLY_LIMIT_REACHED" || data?.code === "NOTES_FOCUS_MONTHLY_LIMIT_REACHED")) {
         const msg = String(data?.error ?? (mode === "golden" ? FOCUS_LIMIT_MSG : SUMMARY_LIMIT_MSG));
@@ -205,12 +247,35 @@ export default function GenerateFromSource(props: Props) {
         setError("API returnerede ingen note.");
         return;
       }
+      if (looksLikeRawNextResponse(n.content)) {
+        setError("Noten kunne ikke vises korrekt. Prøv at generere den igen.");
+        return;
+      }
+
+      const previewContentUsed = n.content ?? null;
+      tracePreviewContent("previewContentUsed", previewContentUsed, {
+        noteId: n.id,
+        mode: apiMode,
+      });
+      const structuredMathNote = readMathRenderedNoteFromMetadata(n.metadata) ?? readMathRenderedNoteFromMetadata(n.mathRenderedNote);
+      if (shouldTracePreviewContent()) {
+        console.info("[notes/generate-preview]", {
+          label: "rendererPathDecision",
+          rendererPath: structuredMathNote ? "structured_math_renderer" : "markdown_fallback",
+          hasMetadata: Boolean(n.metadata),
+          hasMathRenderedNote: Boolean(structuredMathNote),
+          blocks: structuredMathNote?.blocks.length ?? 0,
+          keyFormulas: structuredMathNote?.keyFormulas.length ?? 0,
+        });
+      }
 
       setNote({
         id: n.id,
         title: n.title ?? fileName ?? "Genereret note",
-        content: n.content ?? null,
+        content: previewContentUsed,
         created_at: n.created_at ?? null,
+        metadata: n.metadata ?? null,
+        mathRenderedNote: n.mathRenderedNote ?? null,
       });
 
       setInfo("Noten er gemt i dine noter.");
@@ -343,7 +408,14 @@ export default function GenerateFromSource(props: Props) {
           <div className="max-h-[420px] overflow-auto rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-relaxed text-neutral-900">
             {markdownText.trim() ? (
               mode === "golden" ? (
-                <FocusNoteContent content={markdownText} />
+                <FocusNoteContent
+                  content={markdownText}
+                  metadata={note.metadata ?? null}
+                  mathRenderedNote={note.mathRenderedNote ?? null}
+                  renderContext="generated_preview"
+                  noteId={note.id}
+                  noteType="focus"
+                />
               ) : (
                 <ResumeNoteContent content={markdownText} />
               )

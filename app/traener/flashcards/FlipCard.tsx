@@ -46,9 +46,9 @@ export function FlipCard({
           className="mx-auto flex h-full w-full max-w-[36ch] items-start justify-center"
         >
           <div
-            className="w-full whitespace-pre-wrap text-center text-[15px] leading-7 text-slate-900 [text-wrap:pretty]"
-          style={{ fontFamily: mathFriendlyFontStack }}
-        >
+            className="w-full text-center text-[15px] leading-7 text-slate-900 [text-wrap:pretty] [&_.katex-display]:my-3 [&_li]:my-1.5 [&_ol]:my-3 [&_p+_p]:mt-3 [&_p]:my-0 [&_ul]:my-3"
+            style={{ fontFamily: mathFriendlyFontStack }}
+          >
             {content}
           </div>
         </div>

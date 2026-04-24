@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MicStatusIcon } from "./MicStatusIcon";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 
 type Grade = "-3" | "00" | "02" | "4" | "7" | "10" | "12";
 type Segment = { start: number; end: number; text: string };
@@ -1543,10 +1544,36 @@ async function ensureMicStream() {
               </div>
             </div>
 
-            <div className="mt-3 whitespace-pre-wrap rounded-xl border border-zinc-200 bg-white p-3 text-sm text-zinc-800">
-              {submitted.summary}
-              {submitted.strengths.length > 0 ? `\n\nStyrker:\n- ${submitted.strengths.join("\n- ")}` : ""}
-              {submitted.improvements.length > 0 ? `\n\nForbedringer:\n- ${submitted.improvements.join("\n- ")}` : ""}
+            <div className="mt-3 rounded-xl border border-zinc-200 bg-white p-3 text-sm text-zinc-800">
+              <MathMarkdown
+                content={submitted.summary}
+                preserveWhitespace
+                className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
+              {submitted.strengths.length > 0 ? (
+                <div className="mt-4">
+                  <div className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-400">Styrker</div>
+                  <ul className="mt-2 list-disc space-y-2 pl-5 text-sm text-zinc-800">
+                    {submitted.strengths.map((item, index) => (
+                      <li key={`strength-${index}`}>
+                        <MathMarkdown content={item} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {submitted.improvements.length > 0 ? (
+                <div className="mt-4">
+                  <div className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-400">Forbedringer</div>
+                  <ul className="mt-2 list-disc space-y-2 pl-5 text-sm text-zinc-800">
+                    {submitted.improvements.map((item, index) => (
+                      <li key={`improvement-${index}`}>
+                        <MathMarkdown content={item} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           </section>
 
@@ -1556,7 +1583,11 @@ async function ensureMicStream() {
               {transcriptTurns.length > 0 ? transcriptTurns.map((turn, index) => (
                 <div key={`turn-${index}`} className="rounded-xl border border-zinc-200 bg-zinc-50/70 p-4">
                   {turn.fallback ? (
-                    <div className="whitespace-pre-wrap text-sm leading-7 text-zinc-800">{turn.fallback}</div>
+                    <MathMarkdown
+                      content={turn.fallback}
+                      preserveWhitespace
+                      className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                    />
                   ) : (
                     <div className="space-y-4">
                       {turn.question ? (
@@ -1564,7 +1595,11 @@ async function ensureMicStream() {
                           <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400">
                             Spørgsmål
                           </div>
-                          <div className="mt-1.5 whitespace-pre-wrap text-sm leading-7 text-zinc-800">{turn.question}</div>
+                          <MathMarkdown
+                            content={turn.question}
+                            preserveWhitespace
+                            className="mt-1.5 text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                          />
                         </div>
                       ) : null}
                       {turn.answer ? (
@@ -1572,7 +1607,11 @@ async function ensureMicStream() {
                           <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400">
                             Svar
                           </div>
-                          <div className="mt-1.5 whitespace-pre-wrap text-sm leading-7 text-zinc-800">{turn.answer}</div>
+                          <MathMarkdown
+                            content={turn.answer}
+                            preserveWhitespace
+                            className="mt-1.5 text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+                          />
                         </div>
                       ) : null}
                     </div>

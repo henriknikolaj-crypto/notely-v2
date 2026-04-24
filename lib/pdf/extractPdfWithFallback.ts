@@ -9,6 +9,7 @@ export type ExtractionQuality = "high" | "medium" | "low";
 export type PageType = "text" | "scan" | "table_heavy" | "formula_heavy" | "mixed";
 export type PdfDocumentClass = "text_layer_pdf" | "image_only_pdf" | "mixed_pdf";
 export type PdfExtractionRoute = "text_fast_path" | "ocr_first_path";
+export type FormulaExtractionOrigin = "text_layer" | "ocr" | "vision";
 export type PdfExtractionTimings = {
   pdf_open_ms: number;
   render_ms: number;
@@ -51,6 +52,15 @@ export type PageClassificationSignals = {
   usedOcrFallback: boolean;
 };
 
+export type ExtractedPageFormulaCandidate = {
+  rawFormula: string;
+  normalizedFormula: string;
+  latexFormula?: string;
+  surroundingText: string;
+  origin: FormulaExtractionOrigin;
+  confidence: number;
+};
+
 export type PageExtractionMeta = {
   page_type: PageType;
   ocr_decision: OcrDecision;
@@ -58,6 +68,9 @@ export type PageExtractionMeta = {
   formula_blocks: number;
   structured_preview: string;
   signals: PageClassificationSignals;
+  weak_text_for_math: boolean;
+  heading_candidates: string[];
+  math_formula_candidates: ExtractedPageFormulaCandidate[];
 };
 
 type PageClassificationCore = Pick<PageExtractionMeta, "page_type" | "signals">;
@@ -185,6 +198,7 @@ type OcrDiagnostics = {
 };
 
 const OCR_ENGINE = "openai_pdf_ocr";
+const VISION_ENGINE = "openai_pdf_math_vision";
 const OCR_MODEL = (process.env.OPENAI_MODEL_OCR ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
 const SCAN_HEAVY_PREFLIGHT_PAGE_COUNT = 8;
 const SCAN_HEAVY_OCR_SAMPLE_PAGE_COUNT = 3;
@@ -218,6 +232,141 @@ function normalizePageText(input: string) {
 
 function normalizeLinePreserveColumns(input: string) {
   return String(input ?? "").replace(/\u0000/g, " ").replace(/\t/g, " ").replace(/[ ]{4,}/g, "   ").trimEnd();
+}
+
+const MATH_FORMULA_SIGNAL_RE =
+  /(?:[a-zA-Z]\s*\([^)]*\)\s*=|[a-zA-Z]\s*=\s*[-+]?[\d(]|[=≈<>≤≥]|\^|\\frac|\\sqrt|±|√|\b(?:sin|cos|tan)\s*\()/i;
+const MATH_FORMULA_SNIPPET_RE =
+  /(?:f\(x\)\s*=\s*a\s*x\^?2\s*\+\s*b\s*x\s*\+\s*c|a\s*x\^?2\s*\+\s*b\s*x\s*\+\s*c\s*=\s*0|x[_ ]?[Tt]\s*=\s*-?\s*b\s*\/\s*\(?2\s*·?\s*a\)?|y[_ ]?[Tt]\s*=\s*-?\s*d\s*\/\s*\(?4\s*·?\s*a\)?|d\s*=\s*b\^?2\s*[-+]\s*4\s*·?\s*a\s*·?\s*c|x\s*=\s*\(?-?b\s*[±+\-]\s*√?\s*d\)?\s*\/\s*\(?2\s*·?\s*a\)?|T\s*=\s*1\s*\/\s*2\s*·?\s*a\s*·?\s*b\s*·?\s*sin\(?C\)?|\|[A-Z]{2}\|\s*=\s*√?\([^.;:\n]{4,96}\)|\(x\s*-\s*a\)\^?2\s*\+\s*\(y\s*-\s*b\)\^?2\s*=\s*r\^?2|f['’]\(x\)\s*[<>]=?\s*0|f['’]\(x\)\s*=\s*0|O['’]\(x\)\s*=\s*0|O\(x,h\)\s*=\s*4xh\s*\+\s*x\^?2|O\(x\)\s*=\s*(?:x\^?2\s*\+\s*400\s*\/\s*x|400\s*\/\s*x\s*\+\s*x\^?2)|V\s*=\s*x\s*·?\s*x\s*·?\s*h(?:\s*=\s*100)?|x\^?2h\s*=\s*100|h\s*=\s*(?:V|100)\s*\/\s*x\^?2|c\^?2\s*=\s*a\^?2\s*\+\s*b\^?2\s*-\s*2\s*·?\s*a\s*·?\s*b\s*·?\s*cos\(?C\)?|a\s*\/\s*sin\(?A\)?\s*=\s*b\s*\/\s*sin\(?B\)?\s*=\s*c\s*\/\s*sin\(?C\)?)/gi;
+
+function normalizeMathFormulaText(input: string) {
+  return normalizePageText(input)
+    .replace(/\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/gi, "($1) / ($2)")
+    .replace(/\\sqrt\s*\{([^{}]+)\}/gi, "√($1)")
+    .replace(/\\pm/gi, "±")
+    .replace(/\\cdot/gi, "·")
+    .replace(/\\ge/gi, "≥")
+    .replace(/\\le/gi, "≤")
+    .replace(/\\approx/gi, "≈")
+    .replace(/\\ne/gi, "!=")
+    .replace(/\s+(?:for|hvor|hvis|naar|når|til|saa|så|og|eller|medfører|medfoerer|giver|har|kan|bruges)\b.*$/i, "")
+    .replace(/,\s*(?:for|hvor|hvis|naar|når|til|saa|så|og|eller)\b.*$/i, "")
+    .replace(/,\s*[A-Za-z]\s*[<>]=?\s*.*$/i, "")
+    .replace(/\s*·\s*/g, " · ")
+    .replace(/[{}]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formulaToLatex(input: string) {
+  return normalizeMathFormulaText(input)
+    .replace(/’/g, "'")
+    .replace(/>=/g, "\\ge ")
+    .replace(/<=/g, "\\le ")
+    .replace(/≥/g, "\\ge ")
+    .replace(/≤/g, "\\le ")
+    .replace(/≈/g, "\\approx ")
+    .replace(/!=/g, "\\ne ")
+    .replace(/±/g, "\\pm ")
+    .replace(/·/g, "\\cdot ")
+    .replace(/\b([xy])([0-9])\b/g, "$1_$2")
+    .replace(/\bsin\s*\(/gi, "\\sin(")
+    .replace(/\bcos\s*\(/gi, "\\cos(")
+    .replace(/\btan\s*\(/gi, "\\tan(")
+    .replace(/√\s*\(([^()]+(?:\([^()]*\)[^()]*)*)\)/g, "\\sqrt{$1}")
+    .replace(/√\s*([A-Za-z0-9_]+)/g, "\\sqrt{$1}")
+    .replace(/\(([^()]+)\)\s*\/\s*\(([^()]+)\)/g, "\\frac{$1}{$2}")
+    .replace(/\b([A-Za-z][A-Za-z0-9_']*|\d+)\s*\/\s*([A-Za-z][A-Za-z0-9_]*(?:\^\d+)?|\d+)\b/g, "\\frac{$1}{$2}")
+    .trim();
+}
+
+function extractMathHeadingCandidates(text: string) {
+  return Array.from(
+    new Set(
+      normalizePageText(text)
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter((line) => line.length >= 4 && line.length <= 90)
+        .filter((line) => /[A-Za-zÆØÅæøå]/.test(line))
+        .filter((line) => !/[.!?]$/.test(line))
+        .filter((line) => !MATH_FORMULA_SIGNAL_RE.test(line))
+        .slice(0, 4),
+    ),
+  );
+}
+
+function extractMathFormulaCandidatesFromText(args: {
+  text: string;
+  origin: FormulaExtractionOrigin;
+  quality: ExtractionQuality;
+  pageType: PageType;
+}) {
+  const normalized = normalizePageText(args.text);
+  if (!normalized) return [];
+
+  const lines = normalized.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const sentences = normalized.split(/(?<=[.!?])\s+/).map((line) => line.trim()).filter(Boolean);
+  const contexts = [...lines, ...sentences, normalized];
+  const baseConfidence =
+    args.origin === "vision"
+      ? 0.92
+      : args.origin === "ocr"
+        ? args.quality === "high"
+          ? 0.8
+          : args.quality === "medium"
+            ? 0.72
+            : 0.6
+        : args.quality === "high"
+          ? 0.88
+          : args.quality === "medium"
+            ? 0.8
+            : 0.68;
+  const pageBoost = args.pageType === "formula_heavy" || args.pageType === "mixed" ? 0.05 : 0;
+  const seen = new Set<string>();
+  const candidates: ExtractedPageFormulaCandidate[] = [];
+
+  for (const context of contexts) {
+    const compact = normalizePageText(context);
+    const snippets = Array.from(compact.matchAll(MATH_FORMULA_SNIPPET_RE)).map((match) => match[0] ?? "");
+    if (!snippets.length && MATH_FORMULA_SIGNAL_RE.test(compact) && compact.length <= 96) {
+      snippets.push(compact);
+    }
+
+    for (const rawSnippet of snippets) {
+      const normalizedFormula = normalizeMathFormulaText(rawSnippet);
+      if (!normalizedFormula || normalizedFormula.length < 5 || normalizedFormula.length > 120) continue;
+      const key = normalizedFormula.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        rawFormula: normalizedFormula,
+        normalizedFormula,
+        latexFormula: formulaToLatex(normalizedFormula),
+        surroundingText: compact.slice(0, 220),
+        origin: args.origin,
+        confidence: Math.min(0.99, Number((baseConfidence + pageBoost).toFixed(2))),
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function isWeakMathPage(args: {
+  charCount: number;
+  wordCount: number;
+  pageType: PageType;
+  signals: PageClassificationSignals;
+  formulaBlocks: number;
+}) {
+  const lowText = args.charCount < 110 || args.wordCount < 18;
+  const formulaDense =
+    args.pageType === "formula_heavy" ||
+    args.pageType === "mixed" ||
+    args.formulaBlocks > 0 ||
+    args.signals.formulaLineRatio >= 0.18 ||
+    args.signals.symbolRatio >= 0.05;
+  return args.charCount === 0 || (lowText && formulaDense);
 }
 
 function analyzeText(input: string): TextAnalysis {
@@ -700,9 +849,37 @@ function applyOcrTextToPage(page: ExtractedPdfPage, ocrText: string) {
     table_blocks: ocrStructured.tableBlocks,
     formula_blocks: ocrStructured.formulaBlocks,
     structured_preview: ocrAnalysis.normalizedText.slice(0, 220),
+    weak_text_for_math: isWeakMathPage({
+      charCount: ocrAnalysis.charCount,
+      wordCount: ocrAnalysis.wordCount,
+      pageType: ocrClassification.page_type,
+      signals: ocrClassification.signals,
+      formulaBlocks: ocrStructured.formulaBlocks,
+    }),
+    heading_candidates: extractMathHeadingCandidates(ocrAnalysis.normalizedText),
+    math_formula_candidates: extractMathFormulaCandidatesFromText({
+      text: ocrAnalysis.normalizedText,
+      origin: "ocr",
+      quality: ocrAnalysis.quality,
+      pageType: ocrClassification.page_type,
+    }),
   };
 
   return { applied: true, readable: ocrLooksReadable };
+}
+
+function selectMathVisionCandidates(pages: ExtractedPdfPage[]) {
+  return pages.filter((page) => {
+    const formulaDense =
+      page.extractionMeta.page_type === "formula_heavy" ||
+      page.extractionMeta.page_type === "mixed" ||
+      page.extractionMeta.signals.formulaLineRatio >= 0.18 ||
+      page.extractionMeta.signals.symbolRatio >= 0.05 ||
+      page.extractionMeta.formula_blocks > 0;
+    const weakText = page.extractionMeta.weak_text_for_math || page.textCharCount < 120 || page.wordCount < 18;
+    const missingStructuredMath = (page.extractionMeta.math_formula_candidates?.length ?? 0) < 2;
+    return formulaDense && weakText && missingStructuredMath;
+  });
 }
 
 async function runScanHeavyOcrSample(args: {
@@ -927,6 +1104,68 @@ function getResponseText(response: any): string {
   return "";
 }
 
+type MathVisionFormulaPayload = {
+  rawFormula?: string;
+  latexFormula?: string;
+  surroundingText?: string;
+  confidence?: number;
+};
+
+type MathVisionPagePayload = {
+  pageNumber?: number;
+  headings?: string[];
+  explanations?: string[];
+  formulas?: MathVisionFormulaPayload[];
+};
+
+function safeParseJsonObject(value: string): Record<string, unknown> | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  const normalized = trimmed
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const match = normalized.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMathVisionPayload(payload: Record<string, unknown> | null): MathVisionPagePayload | null {
+  if (!payload) return null;
+  const headings = Array.isArray(payload.headings) ? payload.headings.map((item) => normalizePageText(String(item ?? ""))).filter(Boolean) : [];
+  const explanations = Array.isArray(payload.explanations)
+    ? payload.explanations.map((item) => normalizePageText(String(item ?? ""))).filter(Boolean)
+    : [];
+  const formulas: MathVisionFormulaPayload[] = [];
+  if (Array.isArray(payload.formulas)) {
+    for (const item of payload.formulas) {
+      const formula = item && typeof item === "object" ? (item as Record<string, unknown>) : null;
+      const rawFormula = normalizeMathFormulaText(String(formula?.rawFormula ?? ""));
+      if (!rawFormula) continue;
+      formulas.push({
+        rawFormula,
+        latexFormula: normalizePageText(String(formula?.latexFormula ?? "")) || formulaToLatex(rawFormula),
+        surroundingText: normalizePageText(String(formula?.surroundingText ?? "")),
+        confidence: Number(formula?.confidence ?? 0.92) || 0.92,
+      });
+    }
+  }
+
+  if (!headings.length && !explanations.length && !formulas.length) return null;
+  return {
+    pageNumber: Number(payload.pageNumber ?? 0) || undefined,
+    headings: headings.slice(0, 5),
+    explanations: explanations.slice(0, 6),
+    formulas: formulas.slice(0, 8),
+  };
+}
+
 async function extractSinglePagePdf(buffer: Buffer, pageIndexZeroBased: number) {
   const source = await PDFDocument.load(buffer);
   const single = await PDFDocument.create();
@@ -1012,6 +1251,155 @@ async function runOpenAIOcrForPage(args: {
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+async function runOpenAIMathVisionForPage(args: {
+  fileName: string;
+  pageNumber: number;
+  timeoutMs: number;
+  pagePdfBuffer: Buffer;
+}): Promise<MathVisionPagePayload | null> {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: args.timeoutMs });
+  const abortController = new AbortController();
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const content = [
+    {
+      type: "input_file",
+      filename: `${args.fileName.replace(/\.pdf$/i, "")}-page-${args.pageNumber}.pdf`,
+      file_data: `data:application/pdf;base64,${args.pagePdfBuffer.toString("base64")}`,
+    },
+    {
+      type: "input_text",
+      text:
+        "Læs denne ene PDF-side som matematikside. Returnér kun JSON på formen " +
+        '{"pageNumber":number,"headings":["..."],"formulas":[{"rawFormula":"...","latexFormula":"...","surroundingText":"...","confidence":0.0}],"explanations":["..."]}. ' +
+        "Udtræk kun sikre overskrifter, korte forklaringer og rigtige formellinjer. Ingen ekstra tekst uden for JSON.",
+    },
+  ];
+
+  try {
+    const response: any = await Promise.race([
+      (openai as any).responses.create(
+        {
+          model: OCR_MODEL,
+          input: [
+            {
+              role: "user",
+              content,
+            },
+          ],
+        },
+        { signal: abortController.signal },
+      ),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          abortController.abort();
+          const error: any = new Error(`Math vision request timed out after ${args.timeoutMs}ms`);
+          error.code = "MATH_VISION_TIMEOUT";
+          reject(error);
+        }, args.timeoutMs);
+      }),
+    ]);
+
+    return normalizeMathVisionPayload(safeParseJsonObject(getResponseText(response)));
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+function applyMathVisionPayloadToPage(page: ExtractedPdfPage, payload: MathVisionPagePayload | null) {
+  if (!payload) return false;
+
+  const incomingFormulas = (payload.formulas ?? [])
+    .map((item) => ({
+      rawFormula: normalizeMathFormulaText(item.rawFormula ?? ""),
+      normalizedFormula: normalizeMathFormulaText(item.rawFormula ?? ""),
+      latexFormula: normalizePageText(item.latexFormula ?? "") || formulaToLatex(item.rawFormula ?? ""),
+      surroundingText: normalizePageText(item.surroundingText ?? ""),
+      origin: "vision" as const,
+      confidence: Math.min(0.99, Math.max(0.5, Number(item.confidence ?? 0.92))),
+    }))
+    .filter((item) => item.rawFormula);
+  const existingByKey = new Map(
+    (page.extractionMeta.math_formula_candidates ?? []).map((item) => [item.normalizedFormula.toLowerCase(), item]),
+  );
+  for (const formula of incomingFormulas) {
+    existingByKey.set(formula.normalizedFormula.toLowerCase(), formula);
+  }
+
+  const mergedHeadings = Array.from(new Set([...(page.extractionMeta.heading_candidates ?? []), ...(payload.headings ?? [])])).slice(0, 6);
+  const structuredVisionText = normalizePageText(
+    [
+      ...mergedHeadings,
+      ...(incomingFormulas.map((item) => item.rawFormula)),
+      ...((payload.explanations ?? []).slice(0, 6)),
+    ].join("\n"),
+  );
+
+  if (structuredVisionText && (page.textCharCount < 120 || page.extractionMeta.math_formula_candidates.length === 0)) {
+    const combinedText = normalizePageText([structuredVisionText, page.text].filter(Boolean).join("\n\n"));
+    const analysis = analyzeText(combinedText);
+    const structured = structurePageText({
+      pageType: page.extractionMeta.page_type,
+      text: analysis.normalizedText,
+    });
+    const structuredAnalysis = analyzeText(structured.text || analysis.normalizedText);
+    const classification = classifyPage({
+      text: structuredAnalysis.normalizedText,
+      extractionMethod: "ocr",
+      quality: structuredAnalysis.quality,
+      charCount: structuredAnalysis.charCount,
+      wordCount: structuredAnalysis.wordCount,
+      alphaNumRatio: structuredAnalysis.alphaNumRatio,
+      brokenTokenRatio: structuredAnalysis.brokenTokenRatio,
+    });
+    page.text = structuredAnalysis.normalizedText;
+    page.extractionMethod = "ocr";
+    page.extractionQuality = structuredAnalysis.quality;
+    page.textCharCount = structuredAnalysis.charCount;
+    page.wordCount = structuredAnalysis.wordCount;
+    page.alphaNumRatio = structuredAnalysis.alphaNumRatio;
+    page.brokenTokenRatio = structuredAnalysis.brokenTokenRatio;
+    page.extractionMeta = {
+      ...classification,
+      ocr_decision: classifyOcrDecision({
+        ...page,
+        extractionMeta: {
+          ...page.extractionMeta,
+          ...classification,
+        },
+      }),
+      table_blocks: structured.tableBlocks,
+      formula_blocks: structured.formulaBlocks,
+      structured_preview: structuredAnalysis.normalizedText.slice(0, 220),
+      weak_text_for_math: isWeakMathPage({
+        charCount: structuredAnalysis.charCount,
+        wordCount: structuredAnalysis.wordCount,
+        pageType: classification.page_type,
+        signals: classification.signals,
+        formulaBlocks: structured.formulaBlocks,
+      }),
+      heading_candidates: mergedHeadings,
+      math_formula_candidates: Array.from(existingByKey.values()),
+    };
+    return true;
+  }
+
+  page.extractionMeta = {
+    ...page.extractionMeta,
+    weak_text_for_math:
+      page.extractionMeta.weak_text_for_math ||
+      isWeakMathPage({
+        charCount: page.textCharCount,
+        wordCount: page.wordCount,
+        pageType: page.extractionMeta.page_type,
+        signals: page.extractionMeta.signals,
+        formulaBlocks: page.extractionMeta.formula_blocks,
+      }),
+    heading_candidates: mergedHeadings,
+    math_formula_candidates: Array.from(existingByKey.values()),
+  };
+  return incomingFormulas.length > 0 || mergedHeadings.length > 0;
 }
 
 async function runSingleOcrAttempt(args: {
@@ -1233,6 +1621,20 @@ export async function extractPdfWithFallback(
         table_blocks: structured.tableBlocks,
         formula_blocks: structured.formulaBlocks,
         structured_preview: structuredAnalysis.normalizedText.slice(0, 220),
+        weak_text_for_math: isWeakMathPage({
+          charCount: structuredAnalysis.charCount,
+          wordCount: structuredAnalysis.wordCount,
+          pageType: structuredClassification.page_type,
+          signals: structuredClassification.signals,
+          formulaBlocks: structured.formulaBlocks,
+        }),
+        heading_candidates: extractMathHeadingCandidates(structuredAnalysis.normalizedText),
+        math_formula_candidates: extractMathFormulaCandidatesFromText({
+          text: structuredAnalysis.normalizedText,
+          origin: "text_layer",
+          quality: structuredAnalysis.quality,
+          pageType: structuredClassification.page_type,
+        }),
       },
     };
   });
@@ -1434,6 +1836,43 @@ export async function extractPdfWithFallback(
       documentClass,
       ocrStrategy,
     });
+  }
+
+  if (raw.pageCount > 0 && !diagnostics.failureReason && allowOcr && canRunOcr()) {
+    const visionCandidates = selectMathVisionCandidates(pages);
+    if (visionCandidates.length > 0) {
+      const visionStartedAt = nowMs();
+      for (let index = 0; index < visionCandidates.length; index += 2) {
+        const batch = visionCandidates.slice(index, index + 2);
+        const results = await Promise.all(
+          batch.map(async (page) => {
+            try {
+              const pagePdfBuffer = await extractSinglePagePdf(buf, page.pageNumber - 1);
+              const payload = await runOpenAIMathVisionForPage({
+                fileName,
+                pageNumber: page.pageNumber,
+                timeoutMs: OCR_TIMEOUT_MS,
+                pagePdfBuffer,
+              });
+              return { page, payload, error: null as unknown };
+            } catch (error) {
+              return { page, payload: null, error };
+            }
+          }),
+        );
+
+        for (const result of results) {
+          if (result.error) {
+            console.warn(`[pdf/extract] Math vision enrichment failed for page ${result.page.pageNumber}:`, result.error);
+            continue;
+          }
+          if (applyMathVisionPayloadToPage(result.page, result.payload)) {
+            ocrTexts.push({ page: result.page.pageNumber, text: result.page.text, engine: VISION_ENGINE });
+          }
+        }
+      }
+      ocrMs += elapsedMs(visionStartedAt);
+    }
   }
 
   const finalReadable = summarizeReadableText(pages);

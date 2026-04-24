@@ -1,5 +1,6 @@
 ﻿/* app/globals.css */
 @import "tailwindcss";
+@import "katex/dist/katex.min.css";
 @plugin "@tailwindcss/typography";
 
 /* Peg på alle TS/TSX/MDX-filer */
@@ -14,6 +15,37 @@
 html,
 body {
   background-color: var(--bg);
+}
+
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
+
+.notely-math-markdown {
+  text-wrap: pretty;
+}
+
+.notely-math-markdown .katex-display {
+  margin: 0.65em 0;
+  padding: 0.35rem 0.1rem;
+}
+
+.notely-math-markdown :not(.katex-display) > .katex {
+  margin-inline: 0.04em;
+  line-height: 1.15;
+  vertical-align: -0.08em;
+  text-wrap: nowrap;
+}
+
+.notely-math-markdown :not(.katex-display) > .katex .base {
+  line-height: 1.15;
+}
+
+.notely-math-markdown p,
+.notely-math-markdown li {
+  line-height: 1.7;
 }
 
 /* Logo-font (bruges sammen med --font-logo fra layout.tsx) */

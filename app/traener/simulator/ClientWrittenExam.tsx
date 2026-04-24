@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 
 type ApiQuestion = { id: string; prompt: string };
 
@@ -673,7 +674,11 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId, trai
       {questions.map((q, idx) => (
         <section key={q.cid} className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
           <div className="text-xs font-semibold text-zinc-600">Spørgsmål {idx + 1}</div>
-          <div className="mt-1 text-sm font-semibold text-zinc-900">{q.prompt}</div>
+          <MathMarkdown
+            content={q.prompt}
+            preserveWhitespace
+            className="mt-1 text-sm font-semibold leading-7 text-zinc-900 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+          />
 
           <label className="mt-4 block text-sm font-medium text-zinc-900">Dit svar</label>
           <textarea
@@ -712,14 +717,20 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId, trai
             </div>
           </div>
 
-          <div className="mt-3 whitespace-pre-wrap text-sm text-zinc-700">{overall.summary}</div>
+          <MathMarkdown
+            content={overall.summary}
+            preserveWhitespace
+            className="mt-3 text-sm leading-7 text-zinc-700 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+          />
 
           {(overall.strengths?.length ?? 0) > 0 && (
             <div className="mt-4">
               <div className="text-xs font-semibold text-zinc-600">Styrker</div>
               <ul className="mt-2 list-disc pl-5 text-sm text-zinc-700">
                 {overall.strengths.slice(0, 6).map((s, i) => (
-                  <li key={`s-${i}`}>{s}</li>
+                  <li key={`s-${i}`}>
+                    <MathMarkdown content={s} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                  </li>
                 ))}
               </ul>
             </div>
@@ -730,7 +741,9 @@ export default function ClientWrittenExam({ scopeFolderIds, activeFolderId, trai
               <div className="text-xs font-semibold text-zinc-600">Forbedringer</div>
               <ul className="mt-2 list-disc pl-5 text-sm text-zinc-700">
                 {overall.improvements.slice(0, 6).map((s, i) => (
-                  <li key={`i-${i}`}>{s}</li>
+                  <li key={`i-${i}`}>
+                    <MathMarkdown content={s} preserveWhitespace className="text-inherit [&_p]:my-0" />
+                  </li>
                 ))}
               </ul>
             </div>

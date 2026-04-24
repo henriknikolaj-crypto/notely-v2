@@ -3,9 +3,9 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeSanitize from "rehype-sanitize";
+import FocusNoteContent from "@/app/notes/ui/FocusNoteContent";
+import ResumeNoteContent from "@/app/notes/ui/ResumeNoteContent";
+import { looksLikeRawNextResponse } from "@/lib/notes/contentSafety";
 
 type FolderOption = {
   id: string;
@@ -29,6 +29,12 @@ type Props = {
   selectedFolderId: string | null;
   files: FileOption[];
 };
+
+async function readJsonResponse(res: Response) {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) return null;
+  return res.json().catch(() => null);
+}
 
 export default function MobileNotesFlow({ folders, selectedFolderId, files }: Props) {
   const router = useRouter();
@@ -88,7 +94,7 @@ export default function MobileNotesFlow({ folders, selectedFolderId, files }: Pr
         }),
       });
 
-      const data = await res.json().catch(() => null);
+      const data = await readJsonResponse(res);
       if (!res.ok || !data?.ok) {
         setStatusTone("error");
         setStatus(data?.error || "Der opstod en fejl under genereringen. Prøv igen.");
@@ -99,6 +105,11 @@ export default function MobileNotesFlow({ folders, selectedFolderId, files }: Pr
       if (!generated) {
         setStatusTone("error");
         setStatus("API returnerede ingen note.");
+        return;
+      }
+      if (looksLikeRawNextResponse(generated.content)) {
+        setStatusTone("error");
+        setStatus("Noten kunne ikke vises korrekt. Prøv at generere den igen.");
         return;
       }
 
@@ -279,22 +290,7 @@ export default function MobileNotesFlow({ folders, selectedFolderId, files }: Pr
 
           <div className="max-h-[420px] overflow-auto rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm leading-relaxed text-zinc-900">
             {markdownText.trim() ? (
-              <div className="prose prose-sm max-w-none break-words prose-headings:mt-3 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 prose-strong:font-semibold prose-code:before:content-[''] prose-code:after:content-['']">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeSanitize]}
-                  components={{
-                    pre: ({ children }) => (
-                      <pre className="overflow-auto rounded-lg border border-zinc-200 bg-white px-3 py-2 text-[12px] leading-relaxed">
-                        {children}
-                      </pre>
-                    ),
-                    code: ({ children }) => <code className="rounded bg-white px-1 py-0.5 text-[12px]">{children}</code>,
-                  }}
-                >
-                  {markdownText}
-                </ReactMarkdown>
-              </div>
+              mode === "golden" ? <FocusNoteContent content={markdownText} /> : <ResumeNoteContent content={markdownText} />
             ) : (
               <span className="text-xs text-zinc-500">(Ingen indhold returneret fra API’et.)</span>
             )}

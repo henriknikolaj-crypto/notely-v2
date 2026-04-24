@@ -1030,6 +1030,7 @@ export async function POST(req: NextRequest) {
           )
         : null;
     const evaluator = trainerEvaluatorResolution?.evaluator ?? resolveEvaluatorDefinition(flow);
+    const isTrainerMathFeedback = trainerEvaluatorResolution?.resolvedSubjectFamily === "matematik";
     const trainerPromptAddendum =
       flow === "trainer"
         ? [
@@ -1045,8 +1046,12 @@ export async function POST(req: NextRequest) {
             "- Ingen ellipser.",
             "- Ingen afbrudte saetninger.",
             "- Alle tekstfelter skal vaere hele, afsluttede saetninger.",
-            "- Brug plain tekst til matematik og formler. Ingen LaTeX, ingen markdown-bullets og ingen fancy formattering.",
-            "- Skriv fx: d_B - d_A = 0,027 * 1500 = 40,5 m.",
+            isTrainerMathFeedback
+              ? "- Naar feedbacken indeholder matematik, saa brug KaTeX-venlig LaTeX med inline $...$ og blokke $$...$$."
+              : "- Brug plain tekst til matematik og formler. Ingen LaTeX, ingen markdown-bullets og ingen fancy formattering.",
+            isTrainerMathFeedback
+              ? "- Ved flere regnetrin skal du foretraekke $$\\begin{aligned}...\\end{aligned}$$ og holde den omgivende tekst kort."
+              : "- Skriv fx: d_B - d_A = 0,027 * 1500 = 40,5 m.",
             trainerTopicHints.length > 0
               ? `- Behandl valgte mappenavne som topic/context-hints, ikke som sikker fagrouting: ${trainerTopicHints.join(" / ")}.`
               : "",

@@ -10,6 +10,7 @@ import TrainingScopeCard from "../_ui/TrainingScopeCard";
 import { buildTrainerFeedbackText } from "@/lib/trainer/feedback";
 import { fetchQuotaCurrent } from "@/lib/quota/current-client";
 import FeatureScopePicker from "@/components/training/FeatureScopePicker";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 
 type Folder = { id: string; name: string };
 
@@ -829,17 +830,30 @@ export default function ClientTrainer({
           </div>
         ) : null}
 
-        <textarea
-          ref={questionTextareaRef}
-          readOnly={!questionEditable}
-          className="mt-1 w-full min-h-[96px] rounded-xl border border-zinc-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-zinc-900/5 read-only:bg-zinc-50"
-          value={question}
-          onChange={(e) => {
-            clearMessages();
-            setQuestion(preserveDanishText(e.target.value));
-          }}
-          placeholder="Dit spørgsmål vises her."
-        />
+        {questionEditable ? (
+          <textarea
+            ref={questionTextareaRef}
+            className="mt-1 w-full min-h-[96px] rounded-xl border border-zinc-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-zinc-900/5"
+            value={question}
+            onChange={(e) => {
+              clearMessages();
+              setQuestion(preserveDanishText(e.target.value));
+            }}
+            placeholder="Dit spørgsmål vises her."
+          />
+        ) : question ? (
+          <div className="mt-1 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-900">
+            <MathMarkdown
+              content={question}
+              preserveWhitespace
+              className="text-sm leading-7 text-zinc-900 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+            />
+          </div>
+        ) : (
+          <div className="mt-1 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-500">
+            Dit spørgsmål vises her.
+          </div>
+        )}
 
         <p className="text-[10px] text-zinc-500">
           {demoMode
@@ -886,7 +900,11 @@ export default function ClientTrainer({
           {evalResult ? (
             <>
               <div className="font-medium">Score: {evalResult.score ?? 0}/100</div>
-              <p className="mt-1 whitespace-pre-wrap">{evalResult.feedback}</p>
+              <MathMarkdown
+                content={evalResult.feedback}
+                preserveWhitespace
+                className="mt-1 text-sm leading-7 text-zinc-700 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+              />
 
               {evalResult.citations.length > 0 && (
                 <div className="mt-2 text-[10px] text-zinc-500">

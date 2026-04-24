@@ -5,6 +5,7 @@ import { supabaseServerRSC } from "@/lib/supabase/server-rsc";
 import { getCanonicalUserPlan } from "@/lib/plan/limits";
 import { getTrainerSession } from "@/lib/auth/trainer-session";
 import { sanitizeTrainerPlainText } from "@/lib/trainer/plain-text";
+import MathMarkdown from "@/components/ui/MathMarkdown";
 
 export const dynamic = "force-dynamic";
 
@@ -142,17 +143,29 @@ export default async function TraenerEvalueringDetailPage({ params, searchParams
 
       <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <h2 className="mb-2 text-sm font-semibold text-zinc-900">Spørgsmål</h2>
-        <div className="whitespace-pre-wrap text-sm text-zinc-800">{question || "—"}</div>
+        <MathMarkdown
+          content={question || "—"}
+          preserveWhitespace
+          className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+        />
       </section>
 
       <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <h2 className="mb-2 text-sm font-semibold text-zinc-900">Dit svar</h2>
-        <div className="whitespace-pre-wrap text-sm text-zinc-800">{answer || "—"}</div>
+        <MathMarkdown
+          content={answer || "—"}
+          preserveWhitespace
+          className="text-sm leading-7 text-zinc-800 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0"
+        />
       </section>
 
       <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
         <h2 className="mb-2 text-sm font-semibold text-zinc-900">Feedback</h2>
-        <div className="prose prose-sm max-w-none whitespace-pre-wrap">{feedback || "—"}</div>
+        <MathMarkdown
+          content={feedback || "—"}
+          preserveWhitespace
+          className="prose prose-sm max-w-none text-zinc-800"
+        />
       </section>
     </main>
   );
