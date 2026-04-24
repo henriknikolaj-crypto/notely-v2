@@ -56,20 +56,28 @@ async function loadNoteWithOptionalMetadata(sb: any, ownerId: string, noteId: st
   ];
 
   let lastError: any = null;
+
   for (const select of attempts) {
     const { data, error } = await sb
       .from("notes")
       .select(select)
       .eq("owner_id", ownerId)
       .eq("id", noteId)
-      .maybeSingle<NoteRow>();
+      .maybeSingle();
 
     if (!error) {
+      if (!data) return null;
+
+      const row = data as Partial<NoteRow> & {
+        metadata?: unknown;
+      };
+
       return {
-        ...(data ?? null),
-        metadata: data?.metadata ?? null,
-      } as NoteRow | null;
+        ...row,
+        metadata: row.metadata ?? null,
+      } as NoteRow;
     }
+
     lastError = error;
   }
 
